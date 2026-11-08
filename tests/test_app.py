@@ -423,5 +423,41 @@ class PictureTests(unittest.TestCase):
         self.assertEqual([m.get("picture") for m in history.messages if m.get("picture")], [name])
 
 
+class PhoneTests(unittest.TestCase):
+    """Phone access has its own token, and only answers to an address, never a domain name."""
+
+    def setUp(self):
+        self.saved = {name: getattr(app, name) for name in ("MONITOR_DIR", "set_phone_listening")}
+        app.MONITOR_DIR = tempfile.mkdtemp(dir=CONFIG)
+        self.listening = []
+        app.set_phone_listening = lambda on: self.listening.append(on) or ""
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+
+    def test_hosts(self):
+        port = app.PHONE_PORT
+        for host in (f"192.168.0.11:{port}", f"10.0.0.2:{port}", f"[fe80::1]:{port}", f"{app.socket.gethostname()}.local:{port}"):
+            self.assertTrue(app.phone_host_ok(host), host)
+        for host in (f"evil.example:{port}", "192.168.0.11:80", f"192.168.0.11:{port + 1}", "", None, f":{port}"):
+            self.assertFalse(app.phone_host_ok(host), host)
+
+    def test_on_off_and_new_link(self):
+        self.assertFalse(app.phone_settings()["enabled"])
+        self.assertTrue(app.set_phone(None, {"action": "on"})[0])
+        first = app.phone_settings()
+        self.assertTrue(first["enabled"])
+        self.assertGreaterEqual(len(first["token"]), 32)
+        if not WINDOWS:
+            self.assertEqual(os.stat(os.path.join(app.MONITOR_DIR, "phone.json")).st_mode & 0o777, 0o600)
+        app.set_phone(None, {"action": "renew"})
+        self.assertNotEqual(app.phone_settings()["token"], first["token"])
+        app.set_phone(None, {"action": "off"})
+        self.assertFalse(app.phone_settings()["enabled"])
+        self.assertEqual(self.listening, [True, True, False])
+        self.assertFalse(app.set_phone(None, {"action": "explode"})[0])
+
+
 if __name__ == "__main__":
     unittest.main()
