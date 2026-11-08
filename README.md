@@ -65,3 +65,7 @@ own config folder, tmux socket and port, so they don't touch your sessions.
 
 To release, push a tag such as `v1.2.3`. The **Build** workflow tests on Linux and Windows, writes the
 version into the app, builds the Windows program with PyInstaller and publishes the release.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

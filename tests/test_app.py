@@ -221,5 +221,66 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(settings["hooks"]["Stop"][0]["hooks"][0]["command"], "other --thing")
 
 
+class BackgroundTaskTests(unittest.TestCase):
+    """Background commands are found in the transcript and end when Claude Code reports back."""
+
+    def transcript(self, *entries):
+        path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "session.jsonl")
+        with open(path, "w") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry) + "\n")
+        transcript = app.Transcript("session", path)
+        transcript.poll()
+        return transcript
+
+    @staticmethod
+    def started(use_id, task, description, at="2026-11-08T14:08:15Z"):
+        return [
+            {"type": "assistant", "timestamp": at, "message": {"content": [
+                {"type": "tool_use", "id": use_id, "name": "Bash",
+                 "input": {"command": "sleep 600", "description": description, "run_in_background": True}}]}},
+            {"type": "user", "timestamp": at, "toolUseResult": {"backgroundTaskId": task},
+             "message": {"content": [{"type": "tool_result", "tool_use_id": use_id,
+                                      "content": f"Command running in background with ID: {task}."}]}},
+        ]
+
+    @staticmethod
+    def notification(task, status="completed"):
+        return (f"<task-notification>\n<task-id>{task}</task-id>\n<status>{status}</status>\n"
+                f"<summary>Background command finished</summary>\n</task-notification>")
+
+    def test_running_until_notified(self):
+        t = self.transcript(*self.started("u1", "b1", "Run the evaluation"), *self.started("u2", "b2", "Start the emulator"))
+        self.assertEqual([x["description"] for x in t.background_tasks(None)], ["Run the evaluation", "Start the emulator"])
+        with open(t.path, "a") as handle:
+            handle.write(json.dumps({"type": "queue-operation", "operation": "enqueue", "content": self.notification("b1")}) + "\n")
+            handle.write(json.dumps({"type": "user", "message": {"content": self.notification("b2", "running")}}) + "\n")
+        t.poll()
+        self.assertEqual([x["id"] for x in t.background_tasks(None)], ["b2"])
+
+    def test_stopped_by_claude(self):
+        t = self.transcript(*self.started("u1", "b1", "Watch CI"), {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "u3", "name": "TaskStop", "input": {"task_id": "b1"}}]}})
+        self.assertEqual(t.background_tasks(None), [])
+
+    def test_open_files_confirm_tasks(self):
+        t = self.transcript(*self.started("u1", "b1", "Run the evaluation"))
+        self.assertEqual(t.background_tasks(set()), [])  # Its process has gone.
+        # A foreground command's file is open too, but the transcript doesn't call it a background task.
+        self.assertEqual([x["id"] for x in t.background_tasks({"b1", "f1"})], ["b1"])
+
+    def test_found_by_id_when_its_start_was_not_read(self):
+        t = self.transcript(*self.started("u1", "b1", "Run the evaluation"))
+        t.background.clear()
+        t.read_whole = False
+        found = t.background_tasks({"b1", "f1"})
+        self.assertEqual([(x["id"], x["description"]) for x in found], [("b1", "Run the evaluation")])
+        self.assertIn("f1", t.not_background)
+
+    def test_dropped_when_older_than_the_process(self):
+        t = self.transcript(*self.started("u1", "b1", "Old task", at="2026-11-08T10:00:00Z"))
+        self.assertEqual(t.background_tasks(None, started_at=app.entry_time({"timestamp": "2026-11-08T11:00:00Z"})), [])
+
+
 if __name__ == "__main__":
     unittest.main()

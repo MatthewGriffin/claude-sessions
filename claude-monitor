@@ -202,6 +202,13 @@ TRUST_MENU_STEPS = 4
 EMULATOR_SERIAL = re.compile(r"\bemulator-\d{1,5}\b")
 BROWSER_PORT_ARG = re.compile(rb"--remote-debugging-port=(\d{1,5})")
 # How a shell command names a browser's debugging port: in the flag, or in an address.
+# Claude Code tells a session a background task is over with one of these.
+TASK_NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
+TASK_ID = re.compile(r"<task-id>([A-Za-z0-9_-]{1,40})</task-id>")
+TASK_STATUS = re.compile(r"<status>(\w+)</status>")
+# A background task writes to <temp>/claude-<uid>/<project>/<session id>/tasks/<task id>.output while it runs.
+TASK_OUTPUT_FILE = re.compile(r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/tasks/([A-Za-z0-9_-]{1,40})\.output$")
+TASK_SCAN_SECONDS = 5
 BROWSER_PORT_USE = re.compile(r"(?:remote-debugging-port[= ]|(?:127\.0\.0\.1|localhost):)(\d{2,5})\b")
 BROWSER_NAMES = (b"chrome", b"chromium", b"msedge", b"brave", b"headless_shell")
 CDP_TIMEOUT_SECONDS = 3
@@ -328,6 +335,10 @@ class Transcript:
         self.failure = None  # The API error that ended the last turn, until something follows it.
         self.human_messages = 0
         self.device_uses = {}  # Emulator serial -> when a shell command last named it.
+        self.background = {}  # Background task id -> what it is and when it started, until it reports back.
+        self.background_ended = set()
+        self.not_background = set()  # Open task files that turned out to be ordinary, foreground commands.
+        self.read_whole = False
 
     def poll(self):
         if self.path is None:
@@ -347,6 +358,7 @@ class Transcript:
                 while True:
                     start = max(0, stat.st_size - window)
                     self._read(start, start > 0)
+                    self.read_whole = start == 0
                     if start == 0 or (self.actions and self.title):
                         break
                     window *= 4
@@ -377,7 +389,10 @@ class Transcript:
         elif kind == "attachment":
             attachment = entry.get("attachment") or {}
             if attachment.get("type") == "queued_command":
+                self._note_task_ends(attachment.get("prompt"))
                 self.human_messages += 1
+        elif kind == "queue-operation":
+            self._note_task_ends(entry.get("content"))
         elif kind == "permission-mode":
             self.permission_mode = str(entry.get("permissionMode", ""))
         elif kind == "last-prompt":
@@ -394,9 +409,20 @@ class Transcript:
             if kind == "assistant":
                 self._ingest_assistant(message, blocks, entry.get("timestamp"))
             else:
+                self._note_task_ends(content)
+                result = entry.get("toolUseResult") if isinstance(entry.get("toolUseResult"), dict) else {}
                 for block in blocks:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
-                        self.pending.pop(block.get("tool_use_id"), None)
+                        call = self.pending.pop(block.get("tool_use_id"), None)
+                        task = result.get("backgroundTaskId")
+                        if task and isinstance(task, str) and task not in self.background_ended:
+                            self.background[task] = {
+                                "id": task,
+                                "description": (call or "Background command").removeprefix("Bash: ")[:MAX_TEXT],
+                                "started": entry_time(entry),
+                            }
+                    elif isinstance(block, dict) and block.get("type") == "text":
+                        self._note_task_ends(block.get("text"))
 
     def _note_outcome(self, entry, kind, content, blocks):
         if self.is_subagent or entry.get("isMeta"):
@@ -435,6 +461,79 @@ class Transcript:
                 self.actions.append(description)
                 self.pending[block.get("id")] = description
                 self._note_device_uses(block, timestamp)
+                if block.get("name") in ("TaskStop", "KillShell", "KillBash"):
+                    tool_input = block.get("input") or {}
+                    self._end_task(tool_input.get("task_id") or tool_input.get("shell_id"))
+
+    def _note_task_ends(self, text):
+        """A task notification that isn't a progress update means that background task is over."""
+        if not isinstance(text, str) or "<task-notification>" not in text:
+            return
+        for note in TASK_NOTIFICATION.findall(text):
+            task = TASK_ID.search(note)
+            status = TASK_STATUS.search(note)
+            if task and not (status and status.group(1) == "running"):
+                self._end_task(task.group(1))
+
+    def _end_task(self, task):
+        if not isinstance(task, str) or not task:
+            return
+        self.background.pop(task, None)
+        if len(self.background_ended) > 500:
+            self.background_ended.clear()
+        self.background_ended.add(task)
+
+    def background_tasks(self, live, started_at=None):
+        """Background tasks still running. live is the set of task ids whose output file is open, or None if unknown.
+
+        Foreground commands write to the same kind of file, so the transcript decides what is a
+        background task. With live known, a task whose start lies before the part of the transcript
+        that was read is looked up by its id. Without it, tasks from before this Claude Code
+        process started are dropped, because ending the process ends them.
+        """
+        if live is not None:
+            for task in live - self.background.keys() - self.background_ended - self.not_background:
+                found = None if self.read_whole else self._find_task_start(task)
+                if found:
+                    self.background[task] = found
+                else:
+                    self.not_background.add(task)
+            tasks = [t for i, t in self.background.items() if i in live]
+        else:
+            tasks = [t for t in self.background.values() if not started_at or not t["started"] or t["started"] >= started_at]
+        return sorted(tasks, key=lambda t: t["started"] or 0)
+
+    def _find_task_start(self, task):
+        if not self.path or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", task):
+            return None
+        marker = f'"backgroundTaskId": "{task}"'.encode()
+        marker_compact = f'"backgroundTaskId":"{task}"'.encode()
+        try:
+            with open(self.path, "rb") as handle:
+                for line in handle:
+                    if marker not in line and marker_compact not in line:
+                        continue
+                    entry = json.loads(line)
+                    found = {"id": task, "description": "Background command", "started": entry_time(entry)}
+                    blocks = (entry.get("message") or {}).get("content")
+                    use_id = next((b.get("tool_use_id") for b in blocks if isinstance(b, dict) and b.get("tool_use_id")), None) if isinstance(blocks, list) else None
+                    if use_id:
+                        found["description"] = self._find_tool_description(use_id) or found["description"]
+                    return found
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return None
+
+    def _find_tool_description(self, use_id):
+        marker = use_id.encode()
+        with open(self.path, "rb") as handle:
+            for line in handle:
+                if marker in line and b'"tool_use"' in line:
+                    entry = json.loads(line)
+                    for block in (entry.get("message") or {}).get("content") or []:
+                        if isinstance(block, dict) and block.get("id") == use_id:
+                            return describe_tool(block.get("name", "?"), block.get("input")).removeprefix("Bash: ")[:MAX_TEXT]
+        return None
 
     def _note_device_uses(self, block, timestamp):
         command = (block.get("input") or {}).get("command") if block.get("name") == "Bash" else None
@@ -648,11 +747,22 @@ class Monitor:
             "now": list(transcript.pending.values())[-1][:MAX_TEXT] if busy and transcript.pending else "",
             "actions": [a[:MAX_TEXT] for a in reversed(transcript.actions)],
             "subagents": transcript.subagent_states(),
+            "background": self.background_state(session, transcript),
             "job": session.get("id", ""),
             "hosted": session.get("pid") in self.panes,
             "tmux": self.panes.get(session.get("pid")),
             "attention": read_attention(session),
         }
+
+    def background_state(self, session, transcript):
+        open_tasks = open_background_tasks()
+        live = None if open_tasks is None else open_tasks.get(session["sessionId"], set())
+        started = session.get("startedAt")
+        now = time.time()
+        return [
+            {"id": t["id"], "description": t["description"], "running": int(now - t["started"]) if t["started"] else None}
+            for t in transcript.background_tasks(live, started / 1000 if started else None)
+        ]
 
     def linked_devices(self, sessions):
         """Devices for the web view, each with every session that started it or named it since it booted.
@@ -1239,6 +1349,38 @@ def tool_result_parts(content):
 
 def preview(text):
     return history_text(text, HISTORY_TOOL_TEXT)
+
+
+_open_tasks = {"at": 0, "found": None}
+
+
+def open_background_tasks():
+    """Session id -> ids of background tasks whose output file some process still has open.
+
+    None where /proc can't tell (Windows), so callers fall back to the transcript alone.
+    """
+    if WINDOWS or not os.path.isdir("/proc/self/fd"):
+        return None
+    if time.time() - _open_tasks["at"] < TASK_SCAN_SECONDS:
+        return _open_tasks["found"]
+    found = {}
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            match = TASK_OUTPUT_FILE.search(target)
+            if match:
+                found.setdefault(match.group(1), set()).add(match.group(2))
+    _open_tasks.update(at=time.time(), found=found)
+    return found
 
 
 def entry_time(entry):
@@ -3185,6 +3327,7 @@ canvas{display:block;image-rendering:pixelated;width:100%}
 .sub i{width:10px;height:10px;margin-top:4px;display:block}
 .sub small{grid-column:2;color:var(--dim);font-size:12px;overflow-wrap:anywhere}
 .sub span{overflow-wrap:anywhere}
+.sub.bgtask i{border:2px solid var(--busy);border-radius:50%;box-sizing:border-box}
 .done{color:var(--dim);font-size:12px;overflow-wrap:anywhere}
 details{border-top:1px solid var(--line);padding:6px 12px}
 summary{cursor:pointer;color:var(--dim);font-size:12px}
@@ -3424,9 +3567,10 @@ class Office{
  }
  sync(s){
   const main=this.chars.get('main')||this.add('main',true,false);
-  const busy=s.status==='busy',stale=busy&&s.quiet!==null&&s.quiet>STALE;
+  const waiting=waitsOnTasks(s);
+  const busy=s.status==='busy',stale=busy&&!waiting&&s.quiet!==null&&s.quiet>STALE;
   const blocked=s.attention&&s.attention.kind!=='done';
-  main.mood=blocked?'alert':s.status==='idle'?'idle':(!busy||stale)?'ask':'work';
+  main.mood=blocked?'alert':waiting?'work':s.status==='idle'?'idle':(!busy||stale)?'ask':'work';
   main.icon=main.mood==='work'?iconFor(s.now||s.actions[0]):null;
   const working=s.subagents.filter(a=>a.state==='working'),seen=new Set(working.map(a=>a.id));
   for(const a of s.subagents)this.color(a.id);
@@ -3593,7 +3737,8 @@ function makeCard(s){
  return c;
 }
 function update(c,s){
- const cls=s.status==='busy'?'busy':s.status==='idle'?'idle':'other';
+ const bg=s.background||[],waiting=waitsOnTasks(s);
+ const cls=s.status==='busy'||waiting?'busy':s.status==='idle'?'idle':'other';
  c.session=s;
  c.hbtn.textContent=s.hosted?'Reply':'History';
  if(histSession===s.id)updateFoot(s);
@@ -3606,8 +3751,9 @@ function update(c,s){
  }
  c.fail.hidden=!s.failure;
  if(s.failure)c.fail.textContent='Message failed: '+s.failure.message+(s.retryAt?' · retrying at '+clockText(s.retryAt):'');
- c.name.textContent=s.name;c.name.title=s.name;c.pill.textContent=s.status;
- const stale=s.status==='busy'&&s.quiet!==null&&s.quiet>STALE;
+ c.name.textContent=s.name;c.name.title=s.name;c.pill.textContent=waiting?'background':s.status;
+ c.pill.title=waiting?'Claude has finished its turn and is waiting for background tasks':'';
+ const stale=s.status==='busy'&&!waiting&&s.quiet!==null&&s.quiet>STALE;
  c.meta.replaceChildren();
  c.meta.append([s.project,s.branch,s.model,contextText(s),'up '+s.up].filter(Boolean).join(' · ')+' · ');
  if(s.queue&&s.queue.length)el('span','quiet',c.meta,s.queue.length+' queued · ');
@@ -3615,10 +3761,17 @@ function update(c,s){
  c.title.textContent=s.title;c.title.hidden=!s.title;
  c.now.replaceChildren();
  if(s.now){el('b','',c.now,'running ');c.now.append(s.now)}
+ else if(waiting){el('b','',c.now,'waiting for ');c.now.append(bg.length===1?bg[0].description:bg.length+' background tasks')}
  else el('span','idle-now',c.now,s.actions[0]?'last: '+s.actions[0]:'no activity yet');
  c.office.sync(s);
  c.canvas.setAttribute('aria-label',s.name+' office: lead agent '+s.status+', '+s.subagents.filter(a=>a.state==='working').length+' subagents working');
  c.subs.replaceChildren();
+ for(const t of bg){
+  const row=el('div','sub bgtask',c.subs);
+  el('i','',row);
+  el('span','',row,'Background: '+t.description);
+  el('small','',row,t.running!==null?'running for '+age(t.running):'running');
+ }
  const done=[];
  for(const a of s.subagents){
   if(a.state!=='working'){done.unshift(a);continue}
@@ -3636,6 +3789,8 @@ function update(c,s){
  c.actions.replaceChildren(...s.actions.map(a=>el('li','',null,a)));
  c.where.textContent=s.cwd+' · pid '+s.pid+' · '+s.kind;
 }
+// Claude has ended its turn and is only waiting for background commands. Claude Code may still call that busy.
+function waitsOnTasks(s){return (s.background||[]).length>0&&(s.status==='idle'||(s.status==='busy'&&!s.now))}
 // The browser keeps showing the old frame until the new one has loaded, so there is no flicker.
 // interval is the time between the starts of requests, so slow captures don't lower the rate further.
 function feed(img,serial,interval,paused,onStatus){
@@ -3915,7 +4070,8 @@ async function refresh(){
   const busy=d.sessions.filter(s=>s.status==='busy').length;
   const subs=d.sessions.reduce((n,s)=>n+s.subagents.filter(a=>a.state==='working').length,0);
   const blocked=d.sessions.filter(s=>s.attention&&s.attention.kind!=='done').length;
-  $('summary').textContent=d.sessions.length+' live · '+busy+' busy · '+(blocked?blocked+' need you · ':'')+subs+' subagents working';
+  const tasks=d.sessions.reduce((n,s)=>n+(s.background||[]).length,0);
+  $('summary').textContent=d.sessions.length+' live · '+busy+' busy · '+(blocked?blocked+' need you · ':'')+subs+' subagents working'+(tasks?' · '+tasks+' background task'+(tasks>1?'s':''):'');
   document.title=(blocked?'('+blocked+' need you) ':busy?'('+busy+' busy) ':'')+'Claude Sessions';
   sessionFolders=d.sessions.map(s=>s.cwd);renderFolders();
   document.getElementById('empty').hidden=d.sessions.length>0;
@@ -4083,17 +4239,20 @@ function toolRow(m,open,agent){
 }
 // What's happening right now, which the transcript doesn't record until it's finished.
 function renderLive(s,live){
- const box=$('histLive'),agents=s?s.subagents.filter(a=>a.state==='working'):[],busy=s&&s.status==='busy';
- box.hidden=!busy&&!agents.length;
+ const box=$('histLive'),agents=s?s.subagents.filter(a=>a.state==='working'):[],busy=s&&s.status==='busy',tasks=s&&s.background||[];
+ box.hidden=!busy&&!agents.length&&!tasks.length;
  if(box.hidden)return;
  const output=$('liveText'),atEnd=output.scrollHeight-output.scrollTop-output.clientHeight<24;
  const quiet=s.quiet!==null&&s.quiet>=5?' · last activity '+s.quiet+'s ago':'';
- const head=(live&&live.head)||(busy?(s.now||'Working')+quiet:'Claude has finished, but subagents are still working');
+ const waitingOn=[agents.length&&'subagents',tasks.length&&'background tasks'].filter(Boolean).join(' and ');
+ const head=(live&&live.head)||(busy&&!waitsOnTasks(s)?(s.now||'Working')+quiet:'Claude has finished its turn, but '+waitingOn+' are still running');
  if($('liveHead').textContent!==head)$('liveHead').textContent=head;
  const text=live?live.lines.join('\n'):'';
  if(output.textContent!==text)output.textContent=text;
  output.hidden=!text;
- $('liveAgents').replaceChildren(...agents.map(a=>el('div','',null,'Subagent '+(a.description||a.type)+': '+(a.now||a.last||'working'))));
+ $('liveAgents').replaceChildren(
+  ...agents.map(a=>el('div','',null,'Subagent '+(a.description||a.type)+': '+(a.now||a.last||'working'))),
+  ...tasks.map(t=>el('div','',null,'Background: '+t.description+(t.running!==null?' · running for '+age(t.running):''))));
  if(atEnd)output.scrollTop=output.scrollHeight;
 }
 function messageRow(m,open,agent){
