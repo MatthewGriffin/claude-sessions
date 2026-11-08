@@ -6,6 +6,7 @@ They never touch real sessions: each run gets its own config folder, tmux socket
 On Windows, CLAUDE_SESSIONS_TEST_PROGRAM can name a built claude-sessions-windows.exe, whose
 session host is then the one tested.
 """
+import contextlib
 import hashlib
 import http.server
 import importlib.machinery
@@ -458,6 +459,81 @@ class PhoneTests(unittest.TestCase):
         self.assertEqual(self.listening, [True, True, False])
         self.assertFalse(app.set_phone(None, {"action": "explode"})[0])
 
+
+class PrinterTests(unittest.TestCase):
+    """3D printer cameras: the printer's login, which addresses are allowed, and which sessions show it."""
+
+    def setUp(self):
+        with contextlib.suppress(OSError):
+            os.remove(app.PRINTERS_FILE)
+
+    def test_aes_matches_the_standard(self):
+        # NIST SP 800-38A, F.2.2 (CBC-AES128 decrypt), first two blocks.
+        key = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
+        iv = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+        cipher = bytes.fromhex("7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2")
+        plain = bytes.fromhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+        self.assertEqual(app.aes128_cbc_decrypt(cipher, key, iv, unpad=False), plain)
+        with self.assertRaises(ValueError):
+            app.aes128_cbc_decrypt(cipher, key, iv)  # Not padded.
+
+    def test_only_local_network_addresses(self):
+        for good in ("192.168.0.66", " 10.1.2.3 ", "172.16.0.9"):
+            self.assertEqual(app.printer_address(good), good.strip())
+        for bad in ("8.8.8.8", "127.0.0.1", "0.0.0.0", "192.168.0.66:80", "printer.local", "fd00::1", "", None):
+            self.assertIsNone(app.printer_address(bad), bad)
+
+    def test_stream_only_from_the_printer_itself(self):
+        camera = app.PrinterCamera("192.168.0.66")
+        self.assertEqual(camera._checked_stream("http://192.168.0.66:18088/live/Ab12"), "http://192.168.0.66:18088/live/Ab12")
+        for bad in ("http://192.168.0.67:18088/live/x", "file:///etc/passwd", "rtmp://192.168.0.66/live", "http://192.168.0.66/x", None):
+            self.assertIsNone(camera._checked_stream(bad), bad)
+
+    def test_frames_split_from_ffmpeg(self):
+        first, second = b"\xff\xd8" + b"one" + b"\xff\xd9", b"\xff\xd8" + b"two" + b"\xff\xd9"
+        class Output:
+            chunks = [first[:4], first[4:] + second[:3], second[3:], b""]
+            def read1(self, size):
+                return self.chunks.pop(0)
+        camera = app.PrinterCamera("192.168.0.66")
+        camera._read_frames(type("Process", (), {"stdout": Output()})())
+        self.assertEqual(camera.image, second)
+
+    def test_settings(self):
+        self.assertFalse(app.printer_settings(None, {"action": "add", "host": "8.8.8.8"})[0])
+        original = app.printer_info
+        try:
+            app.printer_info = lambda host, timeout=3: None
+            self.assertFalse(app.printer_settings(None, {"action": "add", "host": "192.168.0.66"})[0])
+            app.printer_info = lambda host, timeout=3: {"token": "x" * 32, "modelName": "Anycubic Kobra X"}
+            self.assertEqual(app.printer_settings(None, {"action": "add", "host": "192.168.0.66"}), (True, {"printers": ["192.168.0.66"]}))
+            self.assertEqual(app.read_printers(), ["192.168.0.66"])
+            self.assertEqual(app.printer_settings(None, {"action": "remove", "host": "192.168.0.66"}), (True, {"printers": []}))
+        finally:
+            app.printer_info = original
+
+    def uses(self, *entries):
+        return BackgroundTaskTests.transcript(self, *entries).device_uses
+
+    @staticmethod
+    def tool(name, tool_input, at="2026-11-08T18:00:00Z"):
+        return {"type": "assistant", "timestamp": at, "message": {"content": [{"type": "tool_use", "id": "t1", "name": name, "input": tool_input}]}}
+
+    def test_linked_by_printing_work(self):
+        self.assertIn("printer", self.uses(self.tool("Write", {"file_path": "/home/me/models/clip.3mf", "content": ""})))
+        self.assertIn("printer", self.uses(self.tool("Bash", {"command": "prusa-slicer --export-gcode part.stl"})))
+        self.assertIn("printer", self.uses({"type": "user", "timestamp": "2026-11-08T18:00:00Z", "message": {"content": "Can you help me 3D print a hook?"}}))
+        self.assertIn("printer", self.uses(self.tool("Bash", {"command": "cat /media/SSD3/Printables/spacer/HANDOFF.md"})))
+        self.assertIn("printer-192.168.0.66", self.uses(self.tool("Bash", {"command": "curl http://192.168.0.66:18910/info"})))
+        self.assertEqual(self.uses(self.tool("Bash", {"command": "npm test"}), self.tool("Read", {"file_path": "/src/app.py"})), {})
+
+
+    def test_session_named_for_printing(self):
+        monitor = app.Monitor()
+        monitor.devices = [{"serial": "printer-192.168.0.66", "label": "Kobra X camera", "state": "device", "kind": "printer",
+                            "starter": "", "starter_pid": None, "started": 0}]
+        sessions = [{"id": "a", "name": "3D Printing", "pid": 1}, {"id": "b", "name": "Meal Planner", "pid": 2}]
+        self.assertEqual([l["id"] for l in monitor.linked_devices(sessions)[0]["sessions"]], ["a"])
 
 if __name__ == "__main__":
     unittest.main()

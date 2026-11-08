@@ -40,6 +40,8 @@ import secrets
 import socket
 import socketserver
 import shutil
+import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -221,6 +223,13 @@ TASK_STATUS = re.compile(r"<status>(\w+)</status>")
 TASK_OUTPUT_FILE = re.compile(r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/tasks/([A-Za-z0-9_-]{1,40})\.output$")
 TASK_SCAN_SECONDS = 5
 BROWSER_PORT_USE = re.compile(r"(?:remote-debugging-port[= ]|(?:127\.0\.0\.1|localhost):)(\d{2,5})\b")
+# 3D printing work, in a shell command, a file's name or the user's own words. Links printer cameras.
+PRINTING_WORK = re.compile(
+    r"\.(?:gcode|bgcode|3mf|stl|scad)\b|\b(?:orca-?slicer|prusa-?slicer|superslicer|cura|bambu ?studio|slicer ?next|openscad|anycubic|kobra|printables|thingiverse|makerworld)\b",
+    re.I,
+)
+PRINTING_WORDS = re.compile(r"\b3d[- ]?print|\bfilament\b|\bslic(?:er|ing)\b|\bprint bed\b|\bnozzle\b|\bkobra\b|\banycubic\b", re.I)
+IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 BROWSER_NAMES = (b"chrome", b"chromium", b"msedge", b"brave", b"headless_shell")
 CDP_TIMEOUT_SECONDS = 3
 CDP_LIST_TIMEOUT_SECONDS = 0.5
@@ -345,7 +354,7 @@ class Transcript:
         self.permission_mode = ""
         self.failure = None  # The API error that ended the last turn, until something follows it.
         self.human_messages = 0
-        self.device_uses = {}  # Emulator serial -> when a shell command last named it.
+        self.device_uses = {}  # Device serial, or "printer" for 3D printing work -> when it was last named.
         self.background = {}  # Background task id -> what it is and when it started, until it reports back.
         self.background_ended = set()
         self.not_background = set()  # Open task files that turned out to be ordinary, foreground commands.
@@ -458,6 +467,9 @@ class Transcript:
         has_text = isinstance(content, str) or any(isinstance(b, dict) and b.get("type") == "text" for b in blocks)
         if kind == "user" and has_text and origin.get("kind", "human") == "human":
             self.human_messages += 1
+            text = content if isinstance(content, str) else " ".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+            if PRINTING_WORDS.search(text) and entry_time(entry):
+                self.device_uses["printer"] = entry_time(entry)
 
     def _ingest_assistant(self, message, blocks, timestamp=None):
         model = message.get("model")
@@ -551,13 +563,21 @@ class Transcript:
         return None
 
     def _note_device_uses(self, block, timestamp):
-        command = (block.get("input") or {}).get("command") if block.get("name") == "Bash" else None
-        if not command or not timestamp:
+        tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+        command = tool_input.get("command") if block.get("name") == "Bash" else None
+        path = tool_input.get("file_path") or tool_input.get("notebook_path")
+        if not (command or isinstance(path, str)) or not timestamp:
             return
         try:
             used_at = datetime.datetime.fromisoformat(timestamp).timestamp()
         except ValueError:
             return
+        if PRINTING_WORK.search(str(command or path)):
+            self.device_uses["printer"] = used_at  # Any printer: the work doesn't say which one.
+        if not command:
+            return
+        for address in IPV4.findall(str(command)):
+            self.device_uses[f"printer-{address}"] = used_at
         for serial in EMULATOR_SERIAL.findall(str(command)):
             self.device_uses[serial] = used_at
         for port in BROWSER_PORT_USE.findall(str(command)):
@@ -796,15 +816,20 @@ class Monitor:
                 if transcript:
                     for source in (transcript, *transcript.subagents.values()):
                         used_at = source.device_uses.get(device["serial"], 0)
+                        if device.get("kind") == "printer":
+                            used_at = max(used_at, source.device_uses.get("printer", 0))
                         if used_at and used_at >= device["started"]:
                             used[sid] = max(used.get(sid, 0), used_at)
+                if device.get("kind") == "printer" and PRINTING_WORDS.search(names[sid]) and sid not in used:
+                    used[sid] = 1  # Named for printing, such as "3D Printing", and listed after the ones that used it.
             linked = []
             if starter:
                 linked.append({"id": starter, "name": names[starter], "how": "started"})
             for sid in sorted(used, key=used.get, reverse=True):
                 if sid != starter:
                     linked.append({"id": sid, "name": names[sid], "how": "command"})
-            result.append({"serial": device["serial"], "label": device["label"], "state": device["state"], "sessions": linked})
+            result.append({"serial": device["serial"], "label": device["label"], "state": device["state"], "sessions": linked,
+                           "kind": device.get("kind", ""), "problem": device.get("problem", "")})
         return result
 
     def device_frame(self, serial):
@@ -818,9 +843,11 @@ class Monitor:
         with frame["lock"]:
             if time.time() - frame["at"] >= frame["gap"]:
                 started, previous = time.time(), frame["image"]
-                browser = serial.startswith("browser-")
+                browser = serial.startswith(("browser-", "printer-"))
                 # JPEG is several times faster, but only newer system images have it.
-                if browser:
+                if serial.startswith("printer-"):
+                    frame["image"] = printer_camera(serial[len("printer-"):]).frame()
+                elif browser:
                     frame["image"] = capture_browser(int(serial[len("browser-"):]))
                 else:
                     frame["image"] = capture_screen(adb, serial, "-j") if frame["jpeg"] else None
@@ -1084,9 +1111,9 @@ def find_adb(emulators):
 
 
 def find_devices():
-    """Emulators, adb devices and browsers with a debugging port. Returns (devices, adb path)."""
+    """Emulators, adb devices, browsers with a debugging port and printer cameras. Returns (devices, adb path)."""
     devices, adb = find_android_devices()
-    return sorted(devices + browser_devices(), key=lambda d: d["serial"]), adb
+    return sorted(devices + browser_devices(), key=lambda d: d["serial"]) + printer_devices(), adb
 
 
 def session_ancestor(pid):
@@ -1318,6 +1345,417 @@ def capture_screen(adb, serial, image_flag):
         if result.stdout.startswith(signature):
             return content_type, result.stdout
     return None
+
+
+# 3D printer cameras. Anycubic printers in LAN mode (tested on a Kobra X) only stream after a
+# handshake on port 18910 hands out login details for their own MQTT broker, and a startCapture
+# message is sent there. The stream is then HTTP-FLV, which ffmpeg turns into JPEG frames.
+PRINTERS_FILE = os.path.join(MONITOR_DIR, "printers.json")
+PRINTER_INFO_PORT = 18910
+PRINTER_INFO_SECONDS = 15  # How often a printer is asked whether it's there.
+PRINTER_IDLE_SECONDS = 20  # The camera is turned off this long after the last viewer.
+PRINTER_FRAME_STALE_SECONDS = 5
+MAX_PRINTERS = 8
+
+
+def aes_sbox():
+    """The AES S-box and its inverse, computed rather than typed out."""
+    box, p, q = [0] * 256, 1, 1
+    while True:
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        rotated = [((q << n) | (q >> (8 - n))) & 0xFF for n in range(5)]
+        box[p] = rotated[0] ^ rotated[1] ^ rotated[2] ^ rotated[3] ^ rotated[4] ^ 0x63
+        if p == 1:
+            break
+    box[0] = 0x63
+    inverse = [0] * 256
+    for index, value in enumerate(box):
+        inverse[value] = index
+    return box, inverse
+
+
+AES_SBOX, AES_INVERSE = aes_sbox()
+
+
+def aes_times(a, b):
+    result = 0
+    while b:
+        if b & 1:
+            result ^= a
+        a = ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+        b >>= 1
+    return result
+
+
+def aes128_cbc_decrypt(data, key, iv, unpad=True):
+    """AES-128-CBC with PKCS#7 padding, in plain Python so the app needs no extra library.
+
+    Slow, but it only ever decrypts one short message per camera start.
+    """
+    if len(key) != 16 or len(iv) != 16 or not data or len(data) % 16:
+        raise ValueError("bad AES input")
+    words, rcon = [list(key[i:i + 4]) for i in range(0, 16, 4)], 1
+    for i in range(4, 44):
+        word = list(words[i - 1])
+        if i % 4 == 0:
+            word = [AES_SBOX[b] for b in word[1:] + word[:1]]
+            word[0] ^= rcon
+            rcon = aes_times(rcon, 2)
+        words.append([a ^ b for a, b in zip(words[i - 4], word)])
+    round_keys = [sum(words[r * 4:r * 4 + 4], []) for r in range(11)]
+    output, previous = bytearray(), iv
+    for start in range(0, len(data), 16):
+        block = data[start:start + 16]
+        state = [a ^ b for a, b in zip(block, round_keys[10])]
+        for r in range(9, -1, -1):
+            state = [state[((column - row) % 4) * 4 + row] for column in range(4) for row in range(4)]
+            state = [AES_INVERSE[b] ^ k for b, k in zip(state, round_keys[r])]
+            if r:
+                mixed = []
+                for column in range(4):
+                    a = state[column * 4:column * 4 + 4]
+                    for row in range(4):
+                        factors = (14, 11, 13, 9)[-row:] + (14, 11, 13, 9)[:-row] if row else (14, 11, 13, 9)
+                        mixed.append(aes_times(a[0], factors[0]) ^ aes_times(a[1], factors[1]) ^ aes_times(a[2], factors[2]) ^ aes_times(a[3], factors[3]))
+                state = mixed
+        output += bytes(a ^ b for a, b in zip(state, previous))
+        previous = block
+    if not unpad:
+        return bytes(output)
+    pad = output[-1]
+    if not 1 <= pad <= 16 or output[-pad:] != bytes([pad]) * pad:
+        raise ValueError("bad padding")
+    return bytes(output[:-pad])
+
+
+def printer_address(text):
+    """A printer address the user typed, if it is an IP address on a local network."""
+    with contextlib.suppress(ValueError):
+        address = ipaddress.ip_address(str(text).strip())
+        if address.version == 4 and address.is_private and not address.is_loopback and not address.is_unspecified:
+            return str(address)
+    return None
+
+
+def read_printers():
+    try:
+        with open(PRINTERS_FILE) as handle:
+            hosts = json.load(handle).get("printers", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    return [h for h in (printer_address(h) for h in hosts if isinstance(h, str)) if h][:MAX_PRINTERS]
+
+
+def save_printers(hosts):
+    os.makedirs(MONITOR_DIR, exist_ok=True)
+    temporary = f"{PRINTERS_FILE}.{os.getpid()}"
+    with open(temporary, "w") as handle:
+        json.dump({"printers": hosts}, handle)
+    os.replace(temporary, PRINTERS_FILE)
+
+
+def printer_info(host, timeout=3):
+    """What the printer says about itself on its LAN port, or None."""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{PRINTER_INFO_PORT}/info", timeout=timeout) as response:
+            info = json.loads(response.read(65536))
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    return info if isinstance(info, dict) and isinstance(info.get("token"), str) else None
+
+
+def find_printers():
+    """Anycubic printers on this computer's own /24 network. Asks each address once, in parallel."""
+    own = network_address()
+    if not own:
+        return []
+    network = ipaddress.ip_network(own + "/24", strict=False)
+    found, lock = [], threading.Lock()
+
+    def check(address):
+        with contextlib.suppress(OSError):
+            socket.create_connection((address, PRINTER_INFO_PORT), timeout=0.5).close()
+            info = printer_info(address, timeout=2)
+            if info:
+                with lock:
+                    found.append({"host": address, "name": clean(str(info.get("deviceName") or info.get("modelName") or "3D printer"))[:60]})
+
+    workers = [threading.Thread(target=check, args=(str(a),), daemon=True) for a in network.hosts() if str(a) != own]
+    for index in range(0, len(workers), 64):
+        batch = workers[index:index + 64]
+        for worker in batch:
+            worker.start()
+        for worker in batch:
+            worker.join(3)
+    return sorted(found, key=lambda p: ipaddress.ip_address(p["host"]))
+
+
+def mqtt_string(value):
+    data = value.encode() if isinstance(value, str) else value
+    return struct.pack("!H", len(data)) + data
+
+
+def mqtt_packet(kind, body):
+    length, size = b"", len(body)
+    while True:
+        digit, size = size % 128, size // 128
+        length += bytes([digit | (0x80 if size else 0)])
+        if not size:
+            return bytes([kind]) + length + body
+
+
+def mqtt_read(sock):
+    """One (packet type, body) from the broker."""
+    def exactly(count):
+        data = b""
+        while len(data) < count:
+            chunk = sock.recv(count - len(data))
+            if not chunk:
+                raise OSError("connection closed")
+            data += chunk
+        return data
+    kind, multiplier, size = exactly(1)[0], 1, 0
+    for _ in range(4):
+        digit = exactly(1)[0]
+        size += (digit & 127) * multiplier
+        multiplier *= 128
+        if not digit & 128:
+            break
+    if size > 1024 * 1024:
+        raise OSError("message too large")
+    return kind, exactly(size)
+
+
+class PrinterCamera:
+    """One printer's camera, on while anyone looks at it. Viewers share the latest frame."""
+
+    def __init__(self, host):
+        self.host = host
+        self.lock = threading.Lock()
+        self.wanted_at = 0
+        self.thread = None
+        self.image = None
+        self.image_at = 0
+        self.problem = ""
+        self.process = None
+
+    def frame(self):
+        with self.lock:
+            self.wanted_at = time.monotonic()
+            if not self.thread or not self.thread.is_alive():
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+            if self.image and time.monotonic() - self.image_at < PRINTER_FRAME_STALE_SECONDS:
+                return "image/jpeg", self.image
+        return None
+
+    def _wanted(self):
+        return time.monotonic() - self.wanted_at < PRINTER_IDLE_SECONDS
+
+    def _run(self):
+        while self._wanted():
+            try:
+                self._stream_once()
+            except (OSError, ValueError, KeyError, TypeError, ssl.SSLError, subprocess.SubprocessError) as exc:
+                self.problem = clean(str(exc))[:200]
+            if self._wanted():
+                time.sleep(3)
+        with self.lock:
+            self.image = None
+
+    def _login(self):
+        """The printer's MQTT login details, from its LAN handshake."""
+        info = printer_info(self.host)
+        if not info or not isinstance(info.get("ctrlInfoUrl"), str):
+            raise OSError("the printer didn't answer; is LAN mode on?")
+        token = info["token"]
+        control = urllib.parse.urlsplit(info["ctrlInfoUrl"])
+        if control.hostname != self.host or control.port != PRINTER_INFO_PORT:
+            raise ValueError("the printer gave an unexpected address")  # Only ever talk to the printer itself.
+        stamp = str(int(time.time() * 1000))
+        nonce = secrets.token_hex(3)
+        md5 = lambda text: hashlib.md5(text.encode()).hexdigest()  # noqa: E731 - the printer's own scheme.
+        query = urllib.parse.urlencode({"ts": stamp, "nonce": nonce, "sign": md5(md5(token[:16]) + stamp + nonce), "did": secrets.token_hex(16).upper()})
+        request = urllib.request.Request(f"http://{self.host}:{PRINTER_INFO_PORT}{control.path}?{query}", method="POST")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            answer = json.loads(response.read(65536))
+        if answer.get("code") != 200:
+            raise OSError("the printer refused the connection")
+        data = answer["data"]
+        login = json.loads(aes128_cbc_decrypt(base64.b64decode(data["info"]), token[16:32].encode(), data["token"].encode()))
+        broker = urllib.parse.urlsplit(str(login.get("broker", "")))
+        return login, broker.port or 9883
+
+    def _stream_once(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise OSError("ffmpeg isn't installed, and it's needed to show the camera")
+        login, port = self._login()
+        mode, device = str(login.get("modeId") or login.get("modelId")), str(login["deviceId"])
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE  # The printer's own certificate; there's nothing to check it against.
+        with context.wrap_socket(socket.create_connection((self.host, port), timeout=10)) as sock:
+            sock.sendall(mqtt_packet(0x10, mqtt_string("MQTT") + bytes([4, 0xC2]) + struct.pack("!H", 60)
+                                     + mqtt_string("claude-sessions-" + secrets.token_hex(4))
+                                     + mqtt_string(str(login["username"])) + mqtt_string(str(login["password"]))))
+            kind, body = mqtt_read(sock)
+            if kind != 0x20 or len(body) < 2 or body[1]:
+                raise OSError("the printer refused the login")
+            sock.sendall(mqtt_packet(0x82, struct.pack("!H", 1) + mqtt_string(f"anycubic/anycubicCloud/v1/printer/+/{mode}/{device}/#") + b"\0"))
+
+            def send(kind, action):
+                message = {"type": kind, "action": action, "timestamp": int(time.time() * 1000), "msgid": str(uuid.uuid4()), "data": None}
+                topic = f"anycubic/anycubicCloud/v1/web/printer/{mode}/{device}/{kind}"
+                sock.sendall(mqtt_packet(0x30, mqtt_string(topic) + json.dumps(message, separators=(",", ":")).encode()))
+
+            send("info", "query")
+            send("video", "startCapture")
+            sock.settimeout(1)
+            stream_url, pinged, started = None, time.monotonic(), time.monotonic()
+            try:
+                while self._wanted():
+                    try:
+                        kind, body = mqtt_read(sock)
+                    except (socket.timeout, TimeoutError):
+                        kind = None
+                    if kind is not None and kind & 0xF0 == 0x30:
+                        size = struct.unpack("!H", body[:2])[0]
+                        if body[2:2 + size].endswith(b"/info/report"):
+                            with contextlib.suppress(ValueError, AttributeError):
+                                urls = (json.loads(body[2 + size:]).get("data") or {}).get("urls") or {}
+                                stream_url = self._checked_stream(urls.get("rtspUrl"))
+                    if time.monotonic() - pinged > 30:
+                        sock.sendall(b"\xc0\x00")
+                        pinged = time.monotonic()
+                    if self.process and self.process.poll() is not None:
+                        raise OSError("the camera stream stopped")
+                    if not self.process and stream_url and time.monotonic() - started > 1:
+                        self._start_ffmpeg(ffmpeg, stream_url)
+                    if not stream_url and time.monotonic() - started > 15:
+                        raise OSError("the printer didn't say where its camera stream is")
+            finally:
+                self._stop_ffmpeg()
+                with contextlib.suppress(OSError):
+                    send("video", "stopCapture")
+                    sock.sendall(b"\xe0\x00")
+
+    def _checked_stream(self, url):
+        """The printer's stream address, only if it's plain HTTP on the printer itself."""
+        parts = urllib.parse.urlsplit(str(url or ""))
+        if parts.scheme == "http" and parts.hostname == self.host and parts.port:
+            return f"http://{self.host}:{parts.port}{urllib.parse.quote(parts.path)}"
+        return None
+
+    def _start_ffmpeg(self, ffmpeg, url):
+        self.process = subprocess.Popen(
+            # Every frame the camera sends: its timestamps are too odd for ffmpeg's frame rate filter.
+            [ffmpeg, "-nostdin", "-v", "error", "-protocol_whitelist", "http,tcp",
+             # Without these, ffmpeg spends about 10 seconds studying the stream before the first frame.
+             "-fflags", "nobuffer", "-probesize", "65536", "-analyzeduration", "500000", "-f", "flv", "-i", url,
+             "-an", "-c:v", "mjpeg", "-q:v", "5", "-f", "image2pipe", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        )
+        threading.Thread(target=self._read_frames, args=(self.process,), daemon=True).start()
+
+    def _read_frames(self, process):
+        buffer = b""
+        while True:
+            chunk = process.stdout.read1(65536) if hasattr(process.stdout, "read1") else process.stdout.read(65536)
+            if not chunk:
+                return
+            buffer += chunk
+            # A JPEG's data never contains FF D9 except as its end marker.
+            while True:
+                start = buffer.find(b"\xff\xd8")
+                end = buffer.find(b"\xff\xd9", start + 2) if start >= 0 else -1
+                if end < 0:
+                    buffer = buffer[start:] if start >= 0 else b""
+                    if len(buffer) > 8 * 1024 * 1024:
+                        buffer = b""
+                    break
+                with self.lock:
+                    self.image, self.image_at, self.problem = buffer[start:end + 2], time.monotonic(), ""
+                buffer = buffer[end + 2:]
+
+    def _stop_ffmpeg(self):
+        process, self.process = self.process, None
+        if process:
+            process.terminate()
+            with contextlib.suppress(subprocess.SubprocessError):
+                process.wait(5)
+            if process.poll() is None:
+                process.kill()
+
+
+printer_state = {"cameras": {}, "info": {}, "lock": threading.Lock()}
+
+
+def printer_camera(host):
+    with printer_state["lock"]:
+        return printer_state["cameras"].setdefault(host, PrinterCamera(host))
+
+
+def check_printer(host):
+    info = printer_info(host, timeout=2)
+    with printer_state["lock"]:
+        printer_state["info"][host] = {"at": time.monotonic(), "info": info, "checking": False}
+
+
+def printer_devices():
+    """The saved printers as devices. Asking them happens in the background, so a switched-off
+    printer never holds up the page."""
+    devices = []
+    for host in read_printers():
+        with printer_state["lock"]:
+            known = printer_state["info"].get(host)
+            if not known or (not known["checking"] and time.monotonic() - known["at"] > PRINTER_INFO_SECONDS):
+                printer_state["info"][host] = {**(known or {"info": None, "at": 0}), "checking": True}
+                threading.Thread(target=check_printer, args=(host,), daemon=True).start()
+            info = (known or {}).get("info")
+            camera = printer_state["cameras"].get(host)
+        name = clean(str(info.get("deviceName") or info.get("modelName") or "")) if info else ""
+        state = "device" if info else "checking" if not known else "printer offline"
+        if info and not shutil.which("ffmpeg"):
+            state = "no ffmpeg"
+        devices.append({
+            "serial": f"printer-{host}", "label": (name or "3D printer") + " camera", "state": state,
+            "starter": "", "starter_pid": None, "started": 0, "kind": "printer",
+            "problem": camera.problem if camera else "",
+        })
+    return devices
+
+
+def printer_settings(monitor, request):
+    """Add, remove or look for printers. Answers with the saved list."""
+    action, hosts = request.get("action"), read_printers()
+    if action == "find":
+        if not network_address():
+            return False, "This computer doesn't seem to be on a network right now."
+        return True, {"printers": hosts, "found": [p for p in find_printers() if p["host"] not in hosts]}
+    host = printer_address(request.get("host", ""))
+    if not host:
+        return False, "Type the printer's IP address on your network, such as 192.168.0.50."
+    if action == "add" and host not in hosts:
+        if len(hosts) >= MAX_PRINTERS:
+            return False, "That's as many printers as the app keeps."
+        if not printer_info(host):
+            return False, f"No Anycubic printer answered at {host}. Check it's on, and that LAN mode is turned on in its network settings."
+        hosts.append(host)
+    elif action == "remove":
+        hosts = [h for h in hosts if h != host]
+        with printer_state["lock"]:
+            printer_state["info"].pop(host, None)
+    elif action != "add":
+        return False, "Unknown action."
+    save_printers(hosts)
+    return True, {"printers": hosts}
 
 
 def read_attention(session):
@@ -3133,6 +3571,7 @@ POST_ROUTES = {
     "/api/sessions/remember": set_remember,
     "/api/sessions/key": press_key,
     "/api/sessions/end": end_session,
+    "/api/sessions/printers": printer_settings,
     "/api/sessions/terminal": open_terminal,
 }
 
@@ -3634,6 +4073,10 @@ button.update svg{flex:none}
 #devGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,190px),1fr));gap:12px;padding:16px}
 #devGrid .dev{flex-direction:column}#devGrid .dev img{width:100%}
 #devEmpty{padding:24px 16px;color:var(--dim)}
+#printerBox{padding:0 16px 16px;border-top:1px solid var(--line,#8884)}#printerBox h3{margin:12px 0 4px;font-size:14px}
+#printerList{list-style:none;padding:0;margin:8px 0}#printerList li,#printerFound div{display:flex;gap:8px;align-items:center;margin:4px 0}
+#printerForm{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}#printerHost{flex:1 1 220px;min-width:0}
+#printerErr{color:var(--bad)}#printerErr:empty{display:none}
 #viewDlg{max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:hidden}
 #viewDlg .dhead button{margin-left:auto}
 #viewInfo{padding:6px 16px;color:var(--dim);font-size:12px;overflow-wrap:anywhere}
@@ -3793,7 +4236,9 @@ textarea{min-height:110px;resize:vertical}
 <dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="reqBox" aria-label="Requests to this computer" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replyNote"></div><div id="queue" hidden></div>
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" hidden><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
-<dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div></dialog>
+<dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
+<section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
+<ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p></section></dialog>
 <dialog id="viewDlg" aria-labelledby="viewName"><div class="dhead"><h2 id="viewName"></h2><button id="viewClose">Close</button></div><div id="viewInfo"></div><img id="viewImg" alt="Live screen of the device"></dialog>
 <dialog id="phoneDlg" aria-labelledby="phoneTitle"><div class="dhead"><h2 id="phoneTitle">Phone access</h2><button id="phoneClose" style="margin-left:auto">Close</button></div><div id="phoneBody">
 <p>Use this app from your phone while it's on the same Wi-Fi as this computer, including taking photos for Claude with its camera.</p>
@@ -4103,7 +4548,7 @@ function feed(img,serial,interval,paused,onStatus){
  tick();
  return ()=>{live=false;clearTimeout(timer);img.onload=img.onerror=null;img.removeAttribute('src')};
 }
-const STATES={device:'running',offline:'offline, may still be booting',starting:'starting',unauthorized:'not authorized for adb','no adb':'adb not found; set ANDROID_HOME to see its screen'};
+const STATES={'printer offline':'printer not answering; is it on, with LAN mode turned on?',checking:'looking for the printer','no ffmpeg':'ffmpeg is needed to show this camera; install it, then restart the app',device:'running',offline:'offline, may still be booting',starting:'starting',unauthorized:'not authorized for adb','no adb':'adb not found; set ANDROID_HOME to see its screen'};
 function linkText(d){
  if(!d.sessions.length)return'no session linked';
  return d.sessions.map(l=>(l.how==='started'?'started by ':'used by ')+l.name).join(', ');
@@ -4129,7 +4574,7 @@ function updateTile(t,d){
   t.note.textContent=STATES[d.state]||d.state;
   if(d.state==='device')t.stop=feed(t.img,d.serial,t.delay,t.paused,ok=>{
    t.root.classList.toggle('nopic',!ok);
-   t.note.textContent=ok?'view only':'no picture yet; it may still be booting';
+   t.note.textContent=ok?'view only':t.device.kind==='printer'?(t.device.problem||'starting the camera\u2026 this takes a few seconds'):'no picture yet; it may still be booting';
   });
  }
 }
@@ -4163,7 +4608,44 @@ function openViewer(serial){
 }
 $('viewClose').addEventListener('click',()=>$('viewDlg').close());
 $('viewDlg').addEventListener('close',()=>{if(viewStop)viewStop();viewStop=null;viewSerial=null});
-$('devices').addEventListener('click',()=>$('devDlg').showModal());
+$('devices').addEventListener('click',()=>{$('devDlg').showModal();loadPrinters()});
+// 3D printer cameras: saved by IP address, or found by asking every address on this network.
+function showPrinters(list){
+ const ul=$('printerList');ul.textContent='';
+ if(!list.length)el('li','note',ul,'No printers added yet.');
+ for(const host of list){
+  const li=el('li','',ul);el('span','',li,host);
+  const b=el('button','',li,'Remove');b.type='button';b.addEventListener('click',()=>printerAction('remove',host));
+ }
+}
+async function loadPrinters(){
+ try{const r=await fetch('/api/printers',{cache:'no-store'});if(r.ok)showPrinters((await r.json()).printers)}
+ catch(e){$('printerErr').textContent='Lost connection to claude-monitor.'}
+}
+async function printerAction(action,host){
+ $('printerErr').textContent='';
+ const d=await post('printers',{action,host}).catch(()=>({error:'Lost connection to claude-monitor.'}));
+ if(d.error){$('printerErr').textContent=d.error;return null}
+ showPrinters(d.message.printers);
+ return d.message;
+}
+$('printerForm').addEventListener('submit',async e=>{
+ e.preventDefault();
+ const b=e.submitter||$('printerForm').querySelector('button[type=submit]');b.disabled=true;
+ if(await printerAction('add',$('printerHost').value)){$('printerHost').value='';$('printerFound').textContent=''}
+ b.disabled=false;
+});
+$('printerFind').addEventListener('click',async()=>{
+ const b=$('printerFind'),box=$('printerFound');b.disabled=true;box.textContent='Looking\u2026';
+ const d=await printerAction('find','');b.disabled=false;box.textContent='';
+ if(!d)return;
+ if(!d.found.length){el('p','note',box,'No new Anycubic printers found. Check the printer is on, with LAN mode turned on, or type its address.');return}
+ for(const p of d.found){
+  const row=el('div','',box);el('span','',row,p.name+' at '+p.host);
+  const add=el('button','primary',row,'Add');add.type='button';
+  add.addEventListener('click',async()=>{if(await printerAction('add',p.host))row.remove()});
+ }
+});
 $('devClose').addEventListener('click',()=>$('devDlg').close());
 function renderDevices(sessions){
  $('devices').textContent='Devices ('+devices.length+')';
@@ -5260,6 +5742,8 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                 self.respond(200, "text/html; charset=utf-8", PAGE.encode())
             elif parts.path == "/api/sessions":
                 self.send_json(200, monitor.snapshot())
+            elif parts.path == "/api/printers":
+                self.send_json(200, {"printers": read_printers()})
             elif parts.path == "/api/commands":
                 commands = monitor.commands(query.get("id", [""])[0])
                 if commands is None:

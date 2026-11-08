@@ -36,6 +36,15 @@ Windows has no tmux, so sessions started from the app run in a small background 
 It exits on its own once it has no sessions left. Sessions started from the app can only be used
 from the app; **Open in terminal** isn't available for them. Desktop notifications aren't built yet.
 
+## 3D printer cameras
+
+An Anycubic printer's built-in camera (tested on a Kobra X) can show beside sessions doing 3D printing
+work. Turn on LAN mode in the printer's network settings, then add it under **Devices**, by its IP
+address or with **Find on my network**. The camera is only on while you're watching it, and needs
+`ffmpeg` installed. A session gets the camera when its commands or files involve slicing or printing
+(`.gcode`, `.3mf`, `.stl`, slicers, the printer's address), when you mention 3D printing to it, or
+when its name is about printing.
+
 ## Updates
 
 When a newer release is out, an **Update to x.y.z** button appears at the top of the app. It downloads
