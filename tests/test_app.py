@@ -282,5 +282,79 @@ class BackgroundTaskTests(unittest.TestCase):
         self.assertEqual(t.background_tasks(None, started_at=app.entry_time({"timestamp": "2026-11-08T11:00:00Z"})), [])
 
 
+RULE = "─" * 60
+BOX = "\n".join(["● Working on it", "", "✻ Running the tests… (1m 2s)", "", RULE + " Meal Planner ─", "❯\xa0{text}", RULE,
+                  "  Opus 5.5 | Ctx 16%", "  ⏵⏵ auto mode on · 1 shell"])
+MENU = "\n".join(["● Bash(rm -rf build)", "", " Do you want to proceed?", " ❯ 1. Yes", "   2. No", "", " Esc to cancel"])
+
+
+class SendNowTests(unittest.TestCase):
+    """Send now types a queued message into a busy session only while its input box is showing."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(dir=CONFIG)
+        self.saved = {name: getattr(app, name) for name in
+                      ("QUEUE_FILE", "MONITOR_DIR", "hosted_session", "session_screen", "paste_text", "send_keys")}
+        app.MONITOR_DIR = self.folder
+        app.QUEUE_FILE = os.path.join(self.folder, "queue.json")
+        self.session = {"id": "s1", "tmux": "s1", "status": "busy", "failure": None}
+        app.hosted_session = lambda monitor, request: self.session
+        self.screens = [BOX.format(text=""), BOX.format(text="check the logs too")]
+        app.session_screen = lambda name: self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
+        self.typed = []
+        app.paste_text = lambda name, text: self.typed.append(text) or True
+        app.send_keys = lambda name, *keys: self.typed.extend(keys) or True
+        self.monitor = type("M", (), {"human_messages": lambda self, sid: 3})()
+        with app.queue_locked() as state:
+            state["messages"]["s1"] = [{"id": "a", "text": "check the logs too"}, {"id": "b", "text": "/clear"}]
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+
+    def queued(self):
+        return app.read_queue()["messages"].get("s1", [])
+
+    def test_input_box(self):
+        self.assertEqual(app.input_box(BOX.format(text="")), "")
+        self.assertEqual(app.input_box(BOX.format(text="shut down the emulator")), "shut down the emulator")
+        self.assertIsNone(app.input_box(MENU))
+        self.assertIsNone(app.input_box("● Just output\nno box here"))
+
+    def test_types_it_and_presses_enter(self):
+        ok, message = app.send_queued_now(self.monitor, {"id": "s1", "item": "a"})
+        self.assertTrue(ok, message)
+        self.assertEqual(self.typed, ["check the logs too", "Enter", "C-x", "C-s"])
+        self.assertEqual([i["id"] for i in self.queued()], ["b"])
+        self.assertEqual(app.read_queue()["checks"]["s1"]["count"], 3)
+
+    def test_no_enter_if_a_menu_appears_while_typing(self):
+        self.screens = [BOX.format(text=""), MENU]
+        ok, _ = app.send_queued_now(self.monitor, {"id": "s1", "item": "a"})
+        self.assertFalse(ok)
+        self.assertEqual(self.typed, ["check the logs too"])
+        self.assertIn("error", self.queued()[0])
+
+    def test_nothing_typed_while_a_menu_shows(self):
+        self.screens = [MENU]
+        ok, _ = app.send_queued_now(self.monitor, {"id": "s1", "item": "a"})
+        self.assertFalse(ok)
+        self.assertEqual(self.typed, [])
+
+    def test_refuses_commands_and_prompts(self):
+        self.assertFalse(app.send_queued_now(self.monitor, {"id": "s1", "item": "b"})[0])
+        self.session["status"] = "waiting"
+        self.assertFalse(app.send_queued_now(self.monitor, {"id": "s1", "item": "a"})[0])
+        self.assertEqual(self.typed, [])
+
+    def test_queued_mid_turn_counts_as_arrived(self):
+        path = os.path.join(self.folder, "t.jsonl")
+        with open(path, "w") as handle:
+            handle.write(json.dumps({"type": "queue-operation", "operation": "enqueue", "content": "check the logs too"}) + "\n")
+        transcript = app.Transcript("t", path)
+        transcript.poll()
+        self.assertEqual(transcript.human_messages, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

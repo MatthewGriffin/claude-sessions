@@ -113,6 +113,8 @@ MAX_QUEUED = 50
 QUEUE_POLL_SECONDS = 2
 # After sending, the session can still report idle for a moment before it shows as busy.
 QUEUE_GAP_SECONDS = 5
+INPUT_BOX_SEARCH_LINES = 40  # How far up from the bottom the input box can start, for a long message.
+INPUT_BOX_BELOW = 4  # Status and hint lines Claude Code shows under the input box.
 MAX_NAME = 80
 SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 HISTORY_LIMIT = 400
@@ -392,7 +394,11 @@ class Transcript:
                 self._note_task_ends(attachment.get("prompt"))
                 self.human_messages += 1
         elif kind == "queue-operation":
-            self._note_task_ends(entry.get("content"))
+            content = entry.get("content")
+            self._note_task_ends(content)
+            # A message typed while Claude works is recorded here at once, and only reaches the chat later.
+            if entry.get("operation") == "enqueue" and isinstance(content, str) and "<task-notification>" not in content:
+                self.human_messages += 1
         elif kind == "permission-mode":
             self.permission_mode = str(entry.get("permissionMode", ""))
         elif kind == "last-prompt":
@@ -1905,7 +1911,7 @@ def kill_terminal(session_id):
 HOST_TOKEN_FILE = os.path.join(MONITOR_DIR, "host-token")
 TERMINAL_KEYS = {
     "Enter": "\r", "Escape": "\x1b", "Up": "\x1b[A", "Down": "\x1b[B", "Right": "\x1b[C", "Left": "\x1b[D",
-    "Tab": "\t", "BSpace": "\x7f", "Space": " ",
+    "Tab": "\t", "BSpace": "\x7f", "Space": " ", "C-x": "\x18", "C-s": "\x13",
 }
 
 
@@ -2491,6 +2497,78 @@ def type_message(session, text):
     return True, "Sent."
 
 
+def input_box(screen):
+    """The text in Claude Code's input box, or None unless the box is showing and no menu is.
+
+    The box is a "❯" line with a divider right above it and another below it, near the bottom.
+    A suggestion Claude Code shows there in grey reads as text too, and is replaced by typing.
+    """
+    if menu_options(screen):
+        return None
+    lines = [line.rstrip() for line in screen.split("\n")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for i in range(len(lines) - 1, max(0, len(lines) - INPUT_BOX_SEARCH_LINES), -1):
+        if lines[i].lstrip().startswith("❯") and LIVE_RULE.match(lines[i - 1]):
+            end = next((j for j in range(i + 1, len(lines)) if LIVE_RULE.match(lines[j])), None)
+            if end is None or sum(1 for line in lines[end + 1:] if line.strip()) > INPUT_BOX_BELOW:
+                return None
+            return "\n".join(line.strip() for line in lines[i:end]).lstrip("❯").strip()
+    return None
+
+
+def send_queued_now(monitor, request):
+    """Type a queued message into a working session's own input box, as typing in its terminal would.
+
+    That puts it in Claude Code's own queue, then Ctrl+X Ctrl+S sends it straight away, as Claude
+    Code's own "send now" does, interrupting what Claude is doing. A busy session can raise a menu
+    at any moment, where Enter would pick an answer, so the box is checked just before typing and
+    again before each key.
+    """
+    with queue_locked() as state:
+        session = hosted_session(monitor, request)
+        if not session:
+            return False, NOT_HOSTED
+        items = state["messages"].get(session["id"], [])
+        item = next((i for i in items if i["id"] == request.get("item")), None)
+        if not item:
+            return False, "That message has already been sent."
+        if item.get("refresh") or item.get("retry") or item.get("guard"):
+            return False, "That step only runs once the session is idle."
+        if item["text"].startswith("/"):
+            return False, "Commands only run once the session is idle, so it stays queued."
+        if session["status"] == "waiting":
+            return False, "It's waiting for an answer. Answer it first, then send this."
+        if session["status"] == "busy":
+            before = input_box(session_screen(session["tmux"]))
+            if before is None:
+                return False, "Its input box isn't showing right now, so nothing was typed. Try again in a moment."
+            if not paste_text(session["tmux"], item["text"]):
+                return False, "Could not type into the session."
+            time.sleep(0.3)
+            after = input_box(session_screen(session["tmux"]))
+            if after is None or after == before:
+                items.remove(item)
+                items.insert(0, {**item, "error": "Something appeared on its screen while typing, so Enter wasn't pressed. "
+                                 "The text may still be in its input box, so check the terminal before retrying."})
+                return False, "It wasn't sent. Check the session's terminal."
+            send_keys(session["tmux"], "Enter")
+            # Now in Claude Code's queue, where Claude would get it at its next step. Send it now instead,
+            # unless something has taken the screen, in which case it's left in that queue.
+            time.sleep(0.3)
+            if input_box(session_screen(session["tmux"])) is not None:
+                send_keys(session["tmux"], "C-x")
+                send_keys(session["tmux"], "C-s")
+            state["sent"][session["id"]] = time.time()
+            state["checks"][session["id"]] = {"text": item["text"], "count": monitor.human_messages(session["id"]), "at": time.time()}
+        else:
+            succeeded, message = send_tracked(monitor, session, item["text"], state)
+            if not succeeded:
+                return False, message
+        items.remove(item)
+        return True, "Sent."
+
+
 def may_type_now(session, state):
     # A stray Enter on a permission menu approves it, and a busy session could raise one at
     # any moment, so text is only ever typed into a session that is idle.
@@ -2950,6 +3028,7 @@ POST_ROUTES = {
     "/api/sessions/new": start_session,
     "/api/sessions/send": send_reply,
     "/api/sessions/unqueue": remove_queued,
+    "/api/sessions/sendnow": send_queued_now,
     "/api/sessions/retry": retry_failed,
     "/api/sessions/resend": resend_queued,
     "/api/sessions/refresh": save_and_refresh,
@@ -4112,14 +4191,14 @@ function setRenaming(on){
 }
 let queueShown=null;
 function renderQueue(s){
- const items=s.queue||[],key=s.id+JSON.stringify(items);
+ const items=s.queue||[],key=s.id+s.status+JSON.stringify(items);
  if(key===queueShown)return;  // Rebuilding on every poll would lose a click in progress.
  queueShown=key;
  const box=$('queue');
  box.hidden=!items.length;
  box.replaceChildren();
  if(!items.length)return;
- el('div','',box,items.length+' queued. Sent one at a time when the session is idle, while this app is open.').id='queueTitle';
+ el('div','',box,items.length+' queued. Sent one at a time when the session is idle, while this app is open.'+(s.status==='busy'?' Send now interrupts Claude and sends that message straight away, like Claude Code\u2019s own send now.':'')).id='queueTitle';
  for(const item of items){
   const row=el('div','queued',box),text=el('span','',row);
   if(item.label)el('b','',text,item.label);else text.append(item.text);
@@ -4135,6 +4214,11 @@ function renderQueue(s){
   if(item.error&&!item.refresh){
    const b=el('button','primary',row,'Retry');b.type='button';
    b.addEventListener('click',()=>act('resend',{id:s.id,item:item.id}));
+  }
+  if(s.status==='busy'&&!item.refresh&&!item.retry&&!item.error&&!item.text.startsWith('/')){
+   const b=el('button','primary',row,'Send now');b.type='button';
+   b.title='Interrupt Claude and send this now, like Ctrl+X Ctrl+S in Claude Code';
+   b.addEventListener('click',()=>{b.disabled=true;act('sendnow',{id:s.id,item:item.id})});
   }
   if(!item.refresh)button('Remove');
   else if(!items.slice(0,items.indexOf(item)).some(i=>i.refresh))button('Cancel');
