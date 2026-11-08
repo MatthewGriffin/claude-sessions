@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+build_claude_sessions.py
+HANDOFF.md
