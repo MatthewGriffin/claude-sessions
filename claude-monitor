@@ -1922,7 +1922,7 @@ def run_session_host():
                 last_busy[0] = time.time()
             return dict(terminals)
 
-    def handle(request):
+    def answer(request):
         op, name = request.get("op"), str(request.get("name", ""))
         if op == "ping":
             return {"ok": True, "version": APP_VERSION}
@@ -1985,7 +1985,7 @@ def run_session_host():
                 if not isinstance(request, dict) or not hmac.compare_digest(str(request.get("token", "")).encode(), token.encode()):
                     reply = {"denied": True}
                 else:
-                    reply = handle(request)
+                    reply = answer(request)
             except Exception as exc:
                 reply = {"ok": False, "error": clean(exc)}
             self.wfile.write(json.dumps(reply).encode() + b"\n")
