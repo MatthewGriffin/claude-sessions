@@ -74,7 +74,7 @@ APP_VERSION = "dev"
 GITHUB_REPO = "MatthewGriffin/claude-sessions"
 RELEASES_URL = os.environ.get("CLAUDE_SESSIONS_RELEASES_URL") or f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RELEASE_ASSET = "claude-sessions-windows.exe" if WINDOWS else "claude-monitor"
-RELEASE_CHECK_SECONDS = 6 * 3600
+RELEASE_CHECK_SECONDS = 30 * 60  # GitHub allows 60 unauthenticated requests an hour.
 RELEASE_RETRY_SECONDS = 15 * 60
 MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
 
