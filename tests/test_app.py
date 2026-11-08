@@ -356,5 +356,72 @@ class SendNowTests(unittest.TestCase):
         self.assertEqual(transcript.human_messages, 1)
 
 
+PNG = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108020000009077"
+                    "53de0000000c4944415408d763f8cfc000000301010018dd8db40000000049454e44ae426082")
+
+
+class PictureTests(unittest.TestCase):
+    """Pictures are kept by the app, then each path is pasted on its own so Claude Code attaches it."""
+
+    def setUp(self):
+        self.saved = {name: getattr(app, name) for name in ("MONITOR_DIR", "QUEUE_FILE", "paste_text", "send_keys", "hosted_session")}
+        app.MONITOR_DIR = tempfile.mkdtemp(dir=CONFIG)
+        app.QUEUE_FILE = os.path.join(app.MONITOR_DIR, "queue.json")
+        self.typed = []
+        app.paste_text = lambda name, text: self.typed.append(text) or True
+        app.send_keys = lambda name, *keys: self.typed.extend(keys) or True
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+
+    def upload(self, data=PNG):
+        import base64
+        return app.save_upload(None, {"data": base64.b64encode(data).decode()})
+
+    def test_keeps_only_pictures(self):
+        ok, saved = self.upload()
+        self.assertTrue(ok, saved)
+        self.assertRegex(saved["name"], r"^[0-9a-f]{32}\.png$")
+        self.assertTrue(app.upload_path(saved["name"]))
+        self.assertFalse(self.upload(b"#!/bin/sh\necho hi\n")[0])
+        self.assertFalse(app.save_upload(None, {"data": "not base64!"})[0])
+        for bad in ("../queue.json", "x.png", saved["name"].replace(".png", ".sh")):
+            self.assertIsNone(app.upload_path(bad))
+
+    def test_text_then_each_path_on_its_own(self):
+        names = [self.upload()[1]["name"], self.upload()[1]["name"]]
+        ok, _ = app.type_message({"tmux": "s1"}, "What is this?", names)
+        self.assertTrue(ok)
+        folder = app.uploads_dir()
+        self.assertEqual(self.typed, ["What is this?\n", os.path.join(folder, names[0]), os.path.join(folder, names[1]), "Enter"])
+
+    def test_picture_alone(self):
+        name = self.upload()[1]["name"]
+        app.type_message({"tmux": "s1"}, "", [name])
+        self.assertEqual(self.typed, [os.path.join(app.uploads_dir(), name), "Enter"])
+
+    def test_queued_with_its_pictures(self):
+        name = self.upload()[1]["name"]
+        app.hosted_session = lambda monitor, request: {"id": "s1", "tmux": "s1", "status": "busy"}
+        ok, _ = app.send_reply(None, {"id": "s1", "text": "", "images": [name]})
+        self.assertTrue(ok)
+        self.assertEqual(app.read_queue()["messages"]["s1"][0]["images"], [name])
+        self.assertFalse(app.send_reply(None, {"id": "s1", "text": "hi", "images": ["../../etc/passwd"]})[0])
+        self.assertFalse(app.send_reply(None, {"id": "s1", "text": "/clear", "images": [name]})[0])
+
+    def test_shown_in_the_chat(self):
+        name = self.upload()[1]["name"]
+        path = os.path.join(app.MONITOR_DIR, "t.jsonl")
+        with open(path, "w") as handle:
+            handle.write(json.dumps({"type": "user", "uuid": "1", "message": {"content": [
+                {"type": "text", "text": "What is this?\n[Image #1]"}, {"type": "image", "source": {}}]}}) + "\n")
+            handle.write(json.dumps({"type": "user", "uuid": "2", "isMeta": True, "message": {"content": [
+                {"type": "text", "text": f"[Image: source: {os.path.join(app.uploads_dir(), name)}]"}]}}) + "\n")
+        history = app.HistoryReader(path)
+        history.poll()
+        self.assertEqual([m.get("picture") for m in history.messages if m.get("picture")], [name])
+
+
 if __name__ == "__main__":
     unittest.main()

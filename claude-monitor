@@ -189,6 +189,13 @@ HOST_IDLE_SECONDS = 120  # How long the session host waits with no sessions befo
 TERM_COLUMNS, TERM_ROWS = 120, 40
 START_TIMEOUT_SECONDS = 20
 MAX_REPLY_BYTES = 32768
+MAX_IMAGES = 5  # Pictures in one message.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # One picture, after the page has shrunk it.
+UPLOAD_REQUEST_BYTES = MAX_UPLOAD_BYTES * 4 // 3 + 4096
+UPLOAD_KEEP_DAYS = 30
+UPLOAD_NAME = re.compile(r"^[0-9a-f]{32}\.(?:jpg|png|gif|webp)$")
+IMAGE_SOURCE = re.compile(r"^\[Image: source: (.+)\]$")
+UPLOAD_TYPES = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
 DONE_BANNER_SECONDS = 600
 # bypassPermissions and dontAsk are deliberately not offered from the browser.
 NEW_SESSION_MODES = {"manual", "acceptEdits", "plan", "auto"}
@@ -1616,6 +1623,8 @@ class HistoryReader:
             self._ingest_message(entry, kind, position)
 
     def _ingest_message(self, entry, kind, position):
+        if entry.get("isMeta") and kind == "user":
+            self._note_image_source(entry)
         if (entry.get("isSidechain") and not self.is_subagent) or entry.get("isMeta") or entry.get("uuid") in self.seen:
             return
         if entry.get("uuid"):
@@ -1646,6 +1655,19 @@ class HistoryReader:
                 self._ingest_tool_use(block, position)
             elif block_kind == "tool_result" and block.get("tool_use_id") in self.tools:
                 self._ingest_tool_result(block, entry, position)
+
+    def _note_image_source(self, entry):
+        """Claude Code follows an attached picture with where it came from. One sent from this app can be shown."""
+        content = (entry.get("message") or {}).get("content")
+        texts = [content] if isinstance(content, str) else [b.get("text", "") for b in content or [] if isinstance(b, dict)]
+        for text in texts:
+            match = IMAGE_SOURCE.match(str(text).strip())
+            if not match or os.path.dirname(match.group(1)) != uploads_dir():
+                continue
+            name = os.path.basename(match.group(1))
+            note = next((m for m in reversed(self.messages) if m.get("picture") is None and m["text"] == "[An image was attached here]"), None)
+            if note is not None and UPLOAD_NAME.match(name):
+                note["picture"] = name
 
     def _stated_reason(self):
         """What Claude said just before starting a subagent, unless other work came between."""
@@ -2488,11 +2510,73 @@ def queue_locked():
             os.replace(temporary, QUEUE_FILE)
 
 
-def type_message(session, text):
+def uploads_dir():
+    return os.path.join(MONITOR_DIR, "uploads")
+
+
+def image_type(data):
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def save_upload(monitor, request):
+    """Keep a picture the page sent, for a message to attach. Returns its name."""
+    try:
+        data = base64.b64decode(str(request.get("data", "")), validate=True)
+    except ValueError:
+        return False, "That picture couldn't be read."
+    kind = image_type(data)
+    if not kind:
+        return False, "Only JPEG, PNG, GIF and WebP pictures can be sent."
+    if len(data) > MAX_UPLOAD_BYTES:
+        return False, "That picture is too large."
+    folder = uploads_dir()
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    cutoff = time.time() - UPLOAD_KEEP_DAYS * 86400
+    for old in os.listdir(folder):
+        path = os.path.join(folder, old)
+        with contextlib.suppress(OSError):
+            if UPLOAD_NAME.match(old) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    name = f"{secrets.token_hex(16)}.{kind}"
+    descriptor = os.open(os.path.join(folder, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+    return True, {"name": name}
+
+
+def upload_path(name):
+    """The file of an uploaded picture, or None if the name isn't one."""
+    if not isinstance(name, str) or not UPLOAD_NAME.match(name):
+        return None
+    path = os.path.join(uploads_dir(), name)
+    return path if os.path.isfile(path) else None
+
+
+def type_into(session, text, images=()):
+    """Type a message into the input box without sending it. Each picture's path is pasted on
+    its own, which is what makes Claude Code attach it as an image rather than leave it as text."""
+    if text and not paste_text(session["tmux"], text + ("\n" if images else "")):
+        return False
+    for name in images:
+        time.sleep(0.2)
+        if not paste_text(session["tmux"], os.path.join(uploads_dir(), name)):
+            return False
+    time.sleep(0.5 if images else 0.2)  # Claude Code reads each picture before Enter counts.
+    return True
+
+
+def type_message(session, text, images=()):
     """Paste a message into a session and submit it. Returns (succeeded, message)."""
-    if not paste_text(session["tmux"], text):
+    if not type_into(session, text, images):
         return False, "Could not type into the session."
-    time.sleep(0.2)
     send_keys(session["tmux"], "Enter")
     return True, "Sent."
 
@@ -2543,9 +2627,9 @@ def send_queued_now(monitor, request):
             before = input_box(session_screen(session["tmux"]))
             if before is None:
                 return False, "Its input box isn't showing right now, so nothing was typed. Try again in a moment."
-            if not paste_text(session["tmux"], item["text"]):
+            if not type_into(session, item["text"], item.get("images", [])):
                 return False, "Could not type into the session."
-            time.sleep(0.3)
+            time.sleep(0.1)
             after = input_box(session_screen(session["tmux"]))
             if after is None or after == before:
                 items.remove(item)
@@ -2560,9 +2644,9 @@ def send_queued_now(monitor, request):
                 send_keys(session["tmux"], "C-x")
                 send_keys(session["tmux"], "C-s")
             state["sent"][session["id"]] = time.time()
-            state["checks"][session["id"]] = {"text": item["text"], "count": monitor.human_messages(session["id"]), "at": time.time()}
+            state["checks"][session["id"]] = {"text": item["text"], "images": item.get("images", []), "count": monitor.human_messages(session["id"]), "at": time.time()}
         else:
-            succeeded, message = send_tracked(monitor, session, item["text"], state)
+            succeeded, message = send_tracked(monitor, session, item["text"], state, item.get("images", []))
             if not succeeded:
                 return False, message
         items.remove(item)
@@ -2575,22 +2659,29 @@ def may_type_now(session, state):
     return session["status"] == "idle" and time.time() - state["sent"].get(session["id"], 0) >= QUEUE_GAP_SECONDS
 
 
-def send_tracked(monitor, session, text, state):
+def send_tracked(monitor, session, text, state, images=()):
     """Type a message and note what's needed to tell later whether it arrived."""
     before = monitor.human_messages(session["id"])
-    succeeded, message = type_message(session, text)
+    succeeded, message = type_message(session, text, images)
     if succeeded:
         state["sent"][session["id"]] = time.time()
         if not text.startswith("/"):  # Slash commands aren't recorded as messages.
-            state["checks"][session["id"]] = {"text": text, "count": before, "at": time.time()}
+            state["checks"][session["id"]] = {"text": text, "images": list(images), "count": before, "at": time.time()}
     return succeeded, message
 
 
 def send_reply(monitor, request):
     """Send a message now if the session is free, otherwise add it to the end of its queue."""
     text = HISTORY_CONTROL_CHARS.sub(" ", str(request.get("text", ""))).strip()
-    if not text:
+    images = request.get("images") or []
+    if not isinstance(images, list) or len(images) > MAX_IMAGES:
+        return False, f"Up to {MAX_IMAGES} pictures can go in one message."
+    if not all(upload_path(name) for name in images):
+        return False, "A picture is no longer available. Remove it and add it again."
+    if not text and not images:
         return False, "Type a message first."
+    if text.startswith("/") and images:
+        return False, "Pictures can't go with a command."
     if len(text.encode()) > MAX_REPLY_BYTES:
         return False, "That message is too long."
     with queue_locked() as state:
@@ -2598,16 +2689,17 @@ def send_reply(monitor, request):
         if not session:
             return False, NOT_HOSTED
         items = state["messages"].setdefault(session["id"], [])
+        item = {"id": secrets.token_hex(8), "text": text, **({"images": images} if images else {})}
         if not items and may_type_now(session, state):
-            succeeded, message = send_tracked(monitor, session, text, state)
+            succeeded, message = send_tracked(monitor, session, text, state, images)
             if succeeded:
                 return True, message
             # Keep it, where it can be retried, instead of leaving it to be lost from the box.
-            items.append({"id": secrets.token_hex(8), "text": text, "error": message})
+            items.append({**item, "error": message})
             return True, "Couldn't send it, so it's kept in the queue."
         if len(items) >= MAX_QUEUED:
             return False, "Too many messages are already queued for this session."
-        items.append({"id": secrets.token_hex(8), "text": text})
+        items.append(item)
         return True, "Queued."
 
 
@@ -2721,6 +2813,7 @@ def settle_retries_and_checks(state, sessions, monitor):
             del state["checks"][session_id]
             state["messages"].setdefault(session_id, []).insert(0, {
                 "id": secrets.token_hex(8), "text": check["text"], "error": "It was typed in, but never reached the session.",
+                **({"images": check["images"]} if check.get("images") else {}),
             })
     state["dismissed"] = {sid: at for sid, at in state["dismissed"].items() if sid in sessions}
 
@@ -2770,7 +2863,7 @@ def deliver_queued(monitor):
             if guard and guard not in monitor.last_said(session_id):
                 items[0]["error"] = "It didn't confirm that its progress was saved, so the chat wasn't cleared."
                 continue
-            succeeded, message = send_tracked(monitor, session, items[0]["text"], state)
+            succeeded, message = send_tracked(monitor, session, items[0]["text"], state, items[0].get("images", []))
             if succeeded:
                 items.pop(0)
             else:
@@ -3029,6 +3122,7 @@ POST_ROUTES = {
     "/api/sessions/send": send_reply,
     "/api/sessions/unqueue": remove_queued,
     "/api/sessions/sendnow": send_queued_now,
+    "/api/sessions/upload": save_upload,
     "/api/sessions/retry": retry_failed,
     "/api/sessions/resend": resend_queued,
     "/api/sessions/refresh": save_and_refresh,
@@ -3564,6 +3658,14 @@ button.deny{color:var(--bad)}
 .prevtext{flex:1 1 240px;min-width:0;display:grid;overflow-wrap:anywhere}
 .prevtext b{font-weight:700}.prevtext small{color:var(--dim);font-size:12px}
 .queued span b{font-weight:700}
+#replyImages{display:flex;flex-wrap:wrap;gap:6px}
+.pimg{position:relative;width:64px;height:64px}
+.pimg img{width:64px;height:64px;object-fit:cover;border-radius:4px;display:block;border:1px solid var(--line)}
+.pimg button{position:absolute;top:-6px;right:-6px;width:22px;height:22px;padding:0;border-radius:50%;font-size:14px;line-height:1}
+#replyAttach{flex:none;align-self:stretch;padding:0 10px}
+.qimgs{display:flex;gap:4px;margin-top:4px}.qimgs img{width:36px;height:36px;object-fit:cover;border-radius:3px}
+.msg.system a.picture img{max-width:min(320px,100%);max-height:240px;border-radius:4px;display:block;margin-top:2px}
+.msg.system:has(a.picture){max-height:none}
 #newDlg{width:min(560px,calc(100vw - 32px))}
 #newForm{padding:16px;display:grid;gap:12px}
 #newForm h2{font-size:15px;margin:0}
@@ -3581,7 +3683,7 @@ textarea{min-height:110px;resize:vertical}
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
 <dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="reqBox" aria-label="Requests to this computer" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replyNote"></div><div id="queue" hidden></div>
-<form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" hidden><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
+<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" hidden><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div></dialog>
 <dialog id="viewDlg" aria-labelledby="viewName"><div class="dhead"><h2 id="viewName"></h2><button id="viewClose">Close</button></div><div id="viewInfo"></div><img id="viewImg" alt="Live screen of the device"></dialog>
 <dialog id="newDlg" aria-labelledby="newTitle"><form id="newForm"><h2 id="newTitle">New session</h2>
@@ -4162,7 +4264,7 @@ let histPid=null,histSession=null,histRev=null,keysFor=null,histFollow=true,hist
 async function post(path,body){
  const r=await fetch('/api/sessions/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  const d=await r.json().catch(()=>({error:'Unexpected response (HTTP '+r.status+').'}));
- return r.ok?{}:{error:d.error||'That did not work.'};
+ return r.ok?d:{error:d.error||'That did not work.'};
 }
 async function act(path,body){
  $('replyErr').textContent='';
@@ -4202,6 +4304,10 @@ function renderQueue(s){
  for(const item of items){
   const row=el('div','queued',box),text=el('span','',row);
   if(item.label)el('b','',text,item.label);else text.append(item.text);
+  if(item.images&&item.images.length){
+   const strip=el('div','qimgs',text);
+   for(const name of item.images){const i=el('img','',strip);i.src=uploadUrl(name);i.alt='Picture'}
+  }
   if(item.error)el('small','',text,'Not sent: '+item.error);
   const button=(label,onDone)=>{
    const b=el('button','',row,label);b.type='button';
@@ -4209,6 +4315,8 @@ function renderQueue(s){
   };
   if(!item.refresh&&!item.retry)button('Edit',()=>{
    const t=$('replyText');t.value=t.value.trim()?t.value+'\n'+item.text:item.text;t.focus();
+   for(const name of item.images||[])if(pendingImages.length<5)pendingImages.push({name,url:uploadUrl(name)});
+   renderPending();
   });
   // The steps of a refresh are cancelled together, so one button is enough.
   if(item.error&&!item.refresh){
@@ -4346,6 +4454,12 @@ function messageRow(m,open,agent){
   el('summary','',d,'Thinking');el('div','',d,m.text);return d;
  }
  const r=el('div','msg '+m.role);
+ if(m.picture){
+  el('b','',r,'Picture');
+  const a=el('a','picture',r);a.href=uploadUrl(m.picture);a.target='_blank';a.rel='noopener';
+  const i=el('img','',a);i.src=uploadUrl(m.picture);i.alt='Picture you sent';i.loading='lazy';
+  return r;
+ }
  el('b','',r,{you:agent?'Sent to it':'You',claude:agent?'Subagent':'Claude',system:'System'}[m.role]);r.append(m.text);
  return r;
 }
@@ -4538,7 +4652,7 @@ function openHistory(s,fromUrl){
  setRenaming(false);
  $('histBody').replaceChildren();$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
- $('replyErr').textContent='';$('replyText').value='';keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;
+ $('replyErr').textContent='';$('replyText').value='';pendingImages=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;
  updateFoot(s);
  let saved=null;try{saved=localStorage.getItem('filesOpen')}catch(e){}
  setFilesOpen(saved?saved==='1':innerWidth>=1100,false);
@@ -4589,9 +4703,55 @@ $('histEnd').addEventListener('click',async()=>{
 });
 $('replyForm').addEventListener('submit',async e=>{
  e.preventDefault();
- const text=$('replyText').value;
- if(text.trim()&&await act('send',{id:histSession,text}))$('replyText').value='';
+ const text=$('replyText').value,images=pendingImages.map(p=>p.name);
+ if(imagesLoading){$('replyErr').textContent='Still adding a picture. Send again in a moment.';return}
+ if((text.trim()||images.length)&&await act('send',{id:histSession,text,images})){$('replyText').value='';pendingImages=[];renderPending()}
 });
+// Pictures to send with the next message. Each is shrunk here, then kept by the app until it's sent.
+var pendingImages=[],imagesLoading=0;
+const uploadUrl=name=>'/api/upload?name='+encodeURIComponent(name);
+function renderPending(){
+ const box=$('replyImages');
+ box.hidden=!pendingImages.length;
+ box.replaceChildren(...pendingImages.map((p,i)=>{
+  const d=el('div','pimg'),img=el('img','',d);img.src=p.url;img.alt='Picture '+(i+1)+' to send';
+  const b=el('button','',d,'×');b.type='button';b.title='Remove';b.setAttribute('aria-label','Remove picture '+(i+1));
+  b.addEventListener('click',()=>{pendingImages.splice(i,1);renderPending()});
+  return d;
+ }));
+}
+async function shrinkImage(file){
+ // Phones take very large photos. Claude scales them down anyway, so this saves the upload.
+ const bitmap=await createImageBitmap(file,{imageOrientation:'from-image'}).catch(()=>null);
+ if(!bitmap)throw new Error('That file isn\u2019t a picture this browser can open.');
+ const scale=Math.min(1,2000/Math.max(bitmap.width,bitmap.height));
+ const c=document.createElement('canvas');c.width=Math.max(1,Math.round(bitmap.width*scale));c.height=Math.max(1,Math.round(bitmap.height*scale));
+ const g=c.getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,c.width,c.height);g.drawImage(bitmap,0,0,c.width,c.height);
+ return c.toDataURL('image/jpeg',0.88);
+}
+async function addImages(files){
+ $('replyErr').textContent='';
+ for(const file of [...files].filter(f=>f.type.startsWith('image/'))){
+  if(pendingImages.length+imagesLoading>=5){$('replyErr').textContent='Up to 5 pictures can go in one message.';break}
+  imagesLoading++;
+  try{
+   const url=await shrinkImage(file),d=await post('upload',{data:url.slice(url.indexOf(',')+1)});
+   if(d.error)throw new Error(d.error);
+   pendingImages.push({name:d.message.name,url});renderPending();
+  }catch(e){$('replyErr').textContent=e.message||'Could not add that picture.'}
+  finally{imagesLoading--}
+ }
+}
+$('replyAttach').addEventListener('click',()=>$('replyFile').click());
+$('replyFile').addEventListener('change',()=>{addImages($('replyFile').files);$('replyFile').value=''});
+$('replyText').addEventListener('paste',e=>{
+ const files=[...(e.clipboardData&&e.clipboardData.files||[])].filter(f=>f.type.startsWith('image/'));
+ if(files.length){e.preventDefault();addImages(files)}
+});
+for(const id of ['replyForm','replyImages']){
+ $(id).addEventListener('dragover',e=>{if([...e.dataTransfer.types].includes('Files'))e.preventDefault()});
+ $(id).addEventListener('drop',e=>{if(e.dataTransfer.files.length){e.preventDefault();addImages(e.dataTransfer.files)}});
+}
 // Slash command suggestions, while the first word of the reply is a command being typed.
 let commandList=[],commandsFor=null,commandMatches=[],commandPick=0;
 async function loadCommands(){
@@ -4853,6 +5013,14 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                     self.send_json(404, {"error": "That session is no longer running."})
                 else:
                     self.send_json(200, history)
+            elif parts.path == "/api/upload":
+                name = query.get("name", [""])[0]
+                path = upload_path(name)
+                if not path:
+                    self.respond(404, "text/plain", b"not found")
+                else:
+                    with open(path, "rb") as handle:
+                        self.respond(200, UPLOAD_TYPES[name.rsplit(".", 1)[1]], handle.read())
             elif parts.path == "/api/tool":
                 details = monitor.tool_details(query.get("id", [""])[0], query.get("tool", [""])[0], query.get("agent", [None])[0])
                 if details is None:
@@ -4890,7 +5058,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                 return
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                if not 0 < length <= 65536:
+                if not 0 < length <= (UPLOAD_REQUEST_BYTES if action is save_upload else 65536):
                     raise ValueError
                 request = json.loads(self.rfile.read(length))
                 if not isinstance(request, dict):
