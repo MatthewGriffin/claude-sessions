@@ -767,6 +767,34 @@ class PictureTests(unittest.TestCase):
         self.assertFalse(app.send_reply(None, {"id": "s1", "text": "hi", "images": ["../../etc/passwd"]})[0])
         self.assertFalse(app.send_reply(None, {"id": "s1", "text": "/clear", "images": [name]})[0])
 
+    def test_times_each_step_of_sending(self):
+        app.hosted_session = lambda monitor, request: {"id": "s1", "tmux": "s1", "status": "idle"}
+        monitor = type("M", (), {"human_messages": lambda self, sid: 0})()
+        app.send_timing.steps = []
+        try:
+            ok, message = app.send_reply(monitor, {"id": "s1", "text": "hello"})
+            steps = [name for name, _ in app.send_timing.steps]
+        finally:
+            app.send_timing.steps = None
+        self.assertEqual((ok, message), (True, "Sent."))
+        self.assertEqual(steps, ["waiting for the queue", "waiting for the queue", "typing", "pressing Enter"])
+
+    def test_queue_lock_is_handed_over_quickly(self):
+        held = threading.Event()
+
+        def hold():
+            with app.queue_locked():
+                held.set()
+                time.sleep(0.3)
+
+        threading.Thread(target=hold).start()
+        held.wait(5)
+        started = time.monotonic()
+        with app.queue_locked():
+            waited = time.monotonic() - started
+        self.assertGreater(waited, 0.1)  # It did wait for the other thread...
+        self.assertLess(waited, 0.6)  # ...but not in whole seconds, as Windows' own retries would.
+
     def test_heic_converted_or_explained(self):
         import base64
         heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 64
