@@ -92,9 +92,9 @@ jobs:
         working-directory: release
         run: |
           chmod +x claude-monitor
-          # Downloads carry their version. The plain name stays for the update button of 0.1.20 and older.
+          # The Windows download carries its version (the update button looks for that name since 0.1.21).
           versioned="claude-sessions-windows-${GITHUB_REF_NAME#v}.exe"
-          cp claude-sessions-windows.exe "$versioned"
-          sha256sum claude-monitor "$versioned" claude-sessions-windows.exe > SHA256SUMS
+          mv claude-sessions-windows.exe "$versioned"
+          sha256sum claude-monitor "$versioned" > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes \
-            "$versioned" claude-monitor claude-sessions-windows.exe SHA256SUMS
+            "$versioned" claude-monitor SHA256SUMS
