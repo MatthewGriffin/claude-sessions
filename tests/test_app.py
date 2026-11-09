@@ -418,6 +418,34 @@ class WindowsVersionTests(unittest.TestCase):
                                         "claude-sessions-windows-1.2.0.exe.1a2b.download", "claude-sessions.exe", "claude-sessions.exe.old"]))
 
 
+class WindowLifetimeTests(unittest.TestCase):
+    """The app keeps serving after its browser process ends, while the window's page still calls."""
+
+    def test_no_window_calling_means_stop(self):
+        app.page_seen["at"] = 0.0
+        started = time.monotonic()
+        app.wait_while_page_open(handover=1, idle=0.5)
+        self.assertLess(time.monotonic() - started, 4)
+
+    def test_a_handed_over_window_keeps_it_going(self):
+        app.page_seen["at"] = 0.0
+        stop = threading.Event()
+
+        def page():  # Starts calling a moment after the browser process ended, then the window closes.
+            time.sleep(0.5)
+            end = time.monotonic() + 3
+            while time.monotonic() < end:
+                app.page_seen["at"] = time.monotonic()
+                time.sleep(0.2)
+            stop.set()
+
+        threading.Thread(target=page, daemon=True).start()
+        started = time.monotonic()
+        app.wait_while_page_open(handover=2, idle=1)
+        self.assertTrue(stop.is_set(), "it stopped while the page was still calling")
+        self.assertLess(time.monotonic() - started, 7)
+
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.settings = os.path.join(CONFIG, "settings.json")

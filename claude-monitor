@@ -6106,7 +6106,7 @@ async function refresh(){
  const err=document.getElementById('error');
  try{
   const r=await fetch('/api/sessions',{cache:'no-store'});
-  if(!r.ok)throw new Error('HTTP '+r.status);
+  if(!r.ok)throw Object.assign(new Error('HTTP '+r.status),{signedOut:r.status===403});
   const d=await r.json();
   err.textContent=d.error||'';
   const ids=new Set(d.sessions.map(s=>s.id));
@@ -6139,7 +6139,7 @@ async function refresh(){
   document.title=(blocked?'('+blocked+' need you) ':busy?'('+busy+' busy) ':'')+'Claude Sessions';
   sessionFolders=d.sessions.map(s=>s.cwd);renderFolders();
   document.getElementById('empty').hidden=d.sessions.length>0;
- }catch(e){err.textContent='lost connection to claude-monitor; retrying…'}
+ }catch(e){err.textContent=e.signedOut?'This window isn\u2019t signed in to Claude Sessions. Close it and open the app again.':'lost connection to claude-monitor; retrying…'}
 }
 let urlChecked=false;
 async function poll(){await refresh();if(!urlChecked&&cards.size){urlChecked=true;openFromUrl()}setTimeout(poll,2000)}
@@ -6984,6 +6984,31 @@ def wait_for_window():
         return 0
 
 
+page_seen = {"at": 0.0}  # When the app's page last asked for the session list.
+WINDOW_HANDOVER_SECONDS = 30  # For a window handed to a browser that was already running to first call.
+WINDOW_IDLE_SECONDS = 150  # Longer than a minimised window's slowed-down timers.
+
+
+def wait_while_page_open(handover=None, idle=None):
+    """Keep serving after the browser process ends, for as long as the page still calls.
+
+    If a browser using the app's profile is still running (it can take a while to close after the
+    window does, and Edge often stays), the newly started one hands the window over to it and exits
+    at once. Stopping then left a window that couldn't connect.
+    """
+    handover = WINDOW_HANDOVER_SECONDS if handover is None else handover
+    idle = WINDOW_IDLE_SECONDS if idle is None else idle
+    ended = time.monotonic()
+    while True:
+        seen = page_seen["at"]
+        if seen > ended:
+            if time.monotonic() - seen > idle:
+                return
+        elif time.monotonic() - ended > handover and time.monotonic() - seen > idle:
+            return
+        time.sleep(1)
+
+
 def run_app(monitor, port, browser_pid=None, fixed_port=False):
     browser = app_browser()
     if not browser:
@@ -7110,6 +7135,8 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
             elif parts.path == "/":
                 self.respond(200, "text/html; charset=utf-8", PAGE.encode())
             elif parts.path == "/api/sessions":
+                if not self.on_phone:
+                    page_seen["at"] = time.monotonic()
                 self.send_json(200, monitor.snapshot())
             elif parts.path == "/api/printers":
                 self.send_json(200, printers_view())
@@ -7245,6 +7272,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
         threading.Thread(target=server.serve_forever, daemon=True).start()
         attached_browser_pid = browser_pid or start_app_window(app_browser_command, app_url).pid
         code = wait_for_window()
+        wait_while_page_open()
         server.shutdown()
         return code
     print(f"Claude sessions monitor: {url}   (Ctrl+C to stop)", flush=True)
