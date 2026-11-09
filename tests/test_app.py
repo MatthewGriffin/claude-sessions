@@ -524,11 +524,50 @@ class PrinterTests(unittest.TestCase):
             app.printer_info = lambda host, timeout=3: None
             self.assertFalse(app.printer_settings(None, {"action": "add", "host": "192.168.0.66"})[0])
             app.printer_info = lambda host, timeout=3: {"token": "x" * 32, "modelName": "Anycubic Kobra X"}
-            self.assertEqual(app.printer_settings(None, {"action": "add", "host": "192.168.0.66"}), (True, {"printers": ["192.168.0.66"]}))
+            self.assertEqual(app.printer_settings(None, {"action": "add", "host": "192.168.0.66"}), (True, {"printers": ["192.168.0.66"], "shares": {}}))
             self.assertEqual(app.read_printers(), ["192.168.0.66"])
-            self.assertEqual(app.printer_settings(None, {"action": "remove", "host": "192.168.0.66"}), (True, {"printers": []}))
+            self.assertEqual(app.printer_settings(None, {"action": "remove", "host": "192.168.0.66"}), (True, {"printers": [], "shares": {}}))
         finally:
             app.printer_info = original
+
+    def test_print_details(self):
+        # As the Kobra X reported a real print on 2026-11-09.
+        report = {"state": "busy", "temp": {"curr_hotbed_temp": 100, "curr_nozzle_temp": 260, "target_hotbed_temp": 100, "target_nozzle_temp": 260},
+                  "project": {"curr_layer": 2, "filename": "water-tray_plate(01)_ASA_0.2_11h54m32s.gcode", "pause": 0, "print_status": 1,
+                              "print_time": 69, "progress": 9, "remain_time": 645, "total_layers": 500}}
+        self.assertEqual(app.printer_status(report), {
+            "state": "printing", "file": "water-tray_plate(01)_ASA_0.2_11h54m32s", "progress": 9, "layer": 2, "layers": 500,
+            "elapsed": 69, "remaining": 645, "nozzle": 260, "nozzle_target": 260, "bed": 100, "bed_target": 100})
+        self.assertEqual(app.printer_status({"state": "free", "temp": {"curr_nozzle_temp": 25}})["state"], "idle")
+        self.assertEqual(app.printer_status({"state": "busy", "project": {**report["project"], "pause": 1}})["state"], "paused")
+
+    def test_shared_page_only_under_its_secret(self):
+        import urllib.request, urllib.error
+        server = app.http.server.ThreadingHTTPServer(("127.0.0.1", 0), app.ShareHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        camera = app.printer_camera("192.168.0.77")
+        camera.status, camera.status_at = {"state": "printing", "progress": 40}, time.monotonic()
+        with app.share_state["lock"]:
+            app.share_state["shares"]["192.168.0.77"] = "secret-token"
+        self.addCleanup(lambda: app.share_state["shares"].pop("192.168.0.77", None))
+        def get(path):
+            try:
+                with urllib.request.urlopen(base + path, timeout=5) as response:
+                    return response.status, response.read()
+            except urllib.error.HTTPError as error:
+                return error.code, error.read()
+        status, page = get("/secret-token/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"printSummary", page)
+        status, body = get("/secret-token/status")
+        self.assertEqual(json.loads(body)["print"]["progress"], 40)
+        for path in ("/", "/wrong-token/", "/secret-token/../api/sessions", "/api/sessions", "/secret-token/status/x"):
+            self.assertEqual(get(path)[0], 404, path)
+        app.stop_share("192.168.0.77")
+        self.assertEqual(get("/secret-token/")[0], 404)
 
     def uses(self, *entries):
         return BackgroundTaskTests.transcript(self, *entries).device_uses

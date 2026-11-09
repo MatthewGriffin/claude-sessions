@@ -21,6 +21,7 @@ On Windows there is no tmux, so sessions the app starts run in a small backgroun
 while the app restarts or updates, and exits once it has no sessions left.
 """
 import argparse
+import atexit
 import base64
 import collections
 import contextlib
@@ -35,6 +36,7 @@ import http.server
 import ipaddress
 import json
 import os
+import platform
 import re
 import secrets
 import socket
@@ -836,7 +838,8 @@ class Monitor:
                 if sid != starter:
                     linked.append({"id": sid, "name": names[sid], "how": "command"})
             result.append({"serial": device["serial"], "label": device["label"], "state": device["state"], "sessions": linked,
-                           "kind": device.get("kind", ""), "problem": device.get("problem", "")})
+                           "kind": device.get("kind", ""), "problem": device.get("problem", ""),
+                           "print": device.get("print"), "shared": device.get("shared", False)})
         return result
 
     def device_frame(self, serial):
@@ -1362,6 +1365,8 @@ PRINTER_INFO_PORT = 18910
 PRINTER_INFO_SECONDS = 15  # How often a printer is asked whether it's there.
 PRINTER_IDLE_SECONDS = 20  # The camera is turned off this long after the last viewer.
 PRINTER_FRAME_STALE_SECONDS = 5
+PRINTER_STATUS_SECONDS = 10  # How often to ask for progress and temperatures while the camera is on.
+PRINTER_STATUS_STALE_SECONDS = 45
 MAX_PRINTERS = 8
 
 
@@ -1539,6 +1544,32 @@ def mqtt_read(sock):
     return kind, exactly(size)
 
 
+def printer_temperatures(data):
+    number = lambda value: round(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None  # noqa: E731
+    return {name: number(data.get(key)) for name, key in (("nozzle", "curr_nozzle_temp"), ("nozzle_target", "target_nozzle_temp"),
+                                                          ("bed", "curr_hotbed_temp"), ("bed_target", "target_hotbed_temp"))}
+
+
+def printer_status(data):
+    """The print details from an Anycubic info report: state, file, progress, layers, minutes, temperatures."""
+    number = lambda value: value if isinstance(value, (int, float)) and not isinstance(value, bool) else None  # noqa: E731
+    project = data.get("project") if isinstance(data.get("project"), dict) else {}
+    state = str(data.get("state") or "")
+    status = {"state": "idle", **printer_temperatures(data.get("temp") if isinstance(data.get("temp"), dict) else {})}
+    if project and state == "busy":
+        name = clean(str(project.get("filename") or ""))
+        status.update({
+            "state": "paused" if project.get("pause") else "printing",
+            "file": re.sub(r"\.(gcode|bgcode|3mf)$", "", name, flags=re.I)[:200],
+            "progress": number(project.get("progress")),
+            "layer": number(project.get("curr_layer")), "layers": number(project.get("total_layers")),
+            "elapsed": number(project.get("print_time")), "remaining": number(project.get("remain_time")),
+        })
+    elif state == "busy":
+        status["state"] = "busy"
+    return status
+
+
 class PrinterCamera:
     """One printer's camera, on while anyone looks at it. Viewers share the latest frame."""
 
@@ -1551,6 +1582,8 @@ class PrinterCamera:
         self.image_at = 0
         self.problem = ""
         self.process = None
+        self.status = None  # What the printer last said about its print, from printer_status().
+        self.status_at = 0
 
     def frame(self):
         with self.lock:
@@ -1564,6 +1597,23 @@ class PrinterCamera:
 
     def _wanted(self):
         return time.monotonic() - self.wanted_at < PRINTER_IDLE_SECONDS
+
+    def current_status(self):
+        return self.status if self.status and time.monotonic() - self.status_at < PRINTER_STATUS_STALE_SECONDS else None
+
+    def _take_report(self, topic, payload):
+        """Keep the print details from the printer's info and temperature reports."""
+        try:
+            data = json.loads(payload).get("data")
+        except (ValueError, AttributeError):
+            return
+        if not isinstance(data, dict):
+            return
+        if topic.endswith(b"/info/report"):
+            self.status = printer_status(data)
+            self.status_at = time.monotonic()
+        elif topic.endswith(b"/tempature/report") and self.status:  # The printer's own spelling.
+            self.status = {**self.status, **printer_temperatures(data)}
 
     def _run(self):
         while self._wanted():
@@ -1602,7 +1652,7 @@ class PrinterCamera:
     def _stream_once(self):
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
-            raise OSError("ffmpeg isn't installed, and it's needed to show the camera")
+            self.problem = "ffmpeg isn't installed, and it's needed to show the camera"  # The print details still come.
         login, port = self._login()
         mode, device = str(login.get("modeId") or login.get("modelId")), str(login["deviceId"])
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -1626,6 +1676,7 @@ class PrinterCamera:
             send("video", "startCapture")
             sock.settimeout(1)
             stream_url, pinged, started = None, time.monotonic(), time.monotonic()
+            asked = started
             try:
                 while self._wanted():
                     try:
@@ -1634,6 +1685,7 @@ class PrinterCamera:
                         kind = None
                     if kind is not None and kind & 0xF0 == 0x30:
                         size = struct.unpack("!H", body[:2])[0]
+                        self._take_report(body[2:2 + size], body[2 + size:])
                         if body[2:2 + size].endswith(b"/info/report"):
                             with contextlib.suppress(ValueError, AttributeError):
                                 urls = (json.loads(body[2 + size:]).get("data") or {}).get("urls") or {}
@@ -1641,9 +1693,12 @@ class PrinterCamera:
                     if time.monotonic() - pinged > 30:
                         sock.sendall(b"\xc0\x00")
                         pinged = time.monotonic()
+                    if time.monotonic() - asked > PRINTER_STATUS_SECONDS:
+                        send("info", "query")  # Progress and temperatures, for the tile and shared page.
+                        asked = time.monotonic()
                     if self.process and self.process.poll() is not None:
                         raise OSError("the camera stream stopped")
-                    if not self.process and stream_url and time.monotonic() - started > 1:
+                    if ffmpeg and not self.process and stream_url and time.monotonic() - started > 1:
                         self._start_ffmpeg(ffmpeg, stream_url)
                     if not stream_url and time.monotonic() - started > 15:
                         raise OSError("the printer didn't say where its camera stream is")
@@ -1735,6 +1790,8 @@ def printer_devices():
             "serial": f"printer-{host}", "label": (name or "3D printer") + " camera", "state": state,
             "starter": "", "starter_pid": None, "started": 0, "kind": "printer",
             "problem": camera.problem if camera else "",
+            "print": camera.current_status() if camera else None,
+            "shared": bool(share_link(host)),
         })
     return devices
 
@@ -1759,10 +1816,218 @@ def printer_settings(monitor, request):
         hosts = [h for h in hosts if h != host]
         with printer_state["lock"]:
             printer_state["info"].pop(host, None)
+        stop_share(host)
+    elif action == "share":
+        if host not in hosts:
+            return False, "Add that printer first."
+        start_share(host)
+        return True, printers_view()
+    elif action == "unshare":
+        stop_share(host)
+        return True, printers_view()
     elif action != "add":
         return False, "Unknown action."
     save_printers(hosts)
-    return True, {"printers": hosts}
+    return True, printers_view()
+
+
+def printers_view():
+    return {"printers": read_printers(), "shares": share_view()}
+
+
+# ---- Sharing a printer camera on the internet ----
+#
+# A separate server on 127.0.0.1, with nothing on it but a view-only camera page per shared printer,
+# each under its own secret path. Cloudflare's free "quick tunnel" (cloudflared) gives it a public
+# https://<random>.trycloudflare.com address while sharing is on. Nothing of the app itself is reachable.
+
+CLOUDFLARED_RELEASE = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest"
+CLOUDFLARED_MAX_BYTES = 150 * 1024 * 1024
+TUNNEL_URL = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+share_state = {"lock": threading.RLock(), "shares": {}, "server": None, "tunnel": None, "url": "", "step": "", "error": ""}
+
+
+def share_link(host):
+    with share_state["lock"]:
+        token = share_state["shares"].get(host)
+        return f"{share_state['url']}/{token}/" if token and share_state["url"] else ""
+
+
+def share_view():
+    with share_state["lock"]:
+        return {host: {"url": share_link(host), "step": share_state["step"], "error": share_state["error"]}
+                for host in share_state["shares"]}
+
+
+def start_share(host):
+    with share_state["lock"]:
+        share_state["shares"].setdefault(host, secrets.token_urlsafe(24))
+        share_state["error"] = ""
+        if share_state["tunnel"] is None and not share_state["step"]:
+            share_state["step"] = "Starting\u2026"
+            threading.Thread(target=open_tunnel, daemon=True).start()
+
+
+def stop_share(host=None):
+    """Stop sharing one printer, or all of them. The tunnel closes once nothing is shared."""
+    with share_state["lock"]:
+        if host is None:
+            share_state["shares"].clear()
+        else:
+            share_state["shares"].pop(host, None)
+        if share_state["shares"]:
+            return
+        tunnel, server = share_state["tunnel"], share_state["server"]
+        share_state.update(tunnel=None, server=None, url="", step="", error="")
+    if tunnel:
+        with contextlib.suppress(OSError):
+            tunnel.terminate()
+    if server:
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+
+def end_with_parent():
+    """In the tunnel's process, before it starts: end it if this app is killed, so no link is left open."""
+    import ctypes
+    with contextlib.suppress(Exception):
+        ctypes.CDLL(None).prctl(1, 15)  # PR_SET_PDEATHSIG, SIGTERM
+
+
+def cloudflared_path():
+    local = os.path.join(MONITOR_DIR, "bin", "cloudflared.exe" if WINDOWS else "cloudflared")
+    return shutil.which("cloudflared") or (local if os.path.isfile(local) else None)
+
+
+def download_cloudflared():
+    """Fetch Cloudflare's own cloudflared release for this computer, checked against its SHA-256."""
+    arch = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "amd64"
+    name = f"cloudflared-windows-{arch}.exe" if WINDOWS else f"cloudflared-linux-{arch}"
+    headers = {"User-Agent": "claude-sessions", "Accept": "application/vnd.github+json"}
+    with urllib.request.urlopen(urllib.request.Request(CLOUDFLARED_RELEASE, headers=headers), timeout=20) as response:
+        release = json.loads(response.read(1024 * 1024))
+    asset = next((a for a in release.get("assets", []) if a.get("name") == name), None)
+    digest = str((asset or {}).get("digest") or "")
+    if not asset or not digest.startswith("sha256:"):
+        raise OSError("Cloudflare's release has no checked download for this computer")
+    folder = os.path.join(MONITOR_DIR, "bin")
+    os.makedirs(folder, exist_ok=True)
+    target = os.path.join(folder, "cloudflared.exe" if WINDOWS else "cloudflared")
+    temporary, sha = f"{target}.{os.getpid()}.part", hashlib.sha256()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": "claude-sessions"}), timeout=60) as response, \
+                open(temporary, "wb") as handle:
+            size = 0
+            while chunk := response.read(1024 * 1024):
+                size += len(chunk)
+                if size > CLOUDFLARED_MAX_BYTES:
+                    raise OSError("the download was larger than expected")
+                sha.update(chunk)
+                handle.write(chunk)
+        if not hmac.compare_digest(sha.hexdigest(), digest.split(":", 1)[1].lower()):
+            raise OSError("the download didn't match Cloudflare's checksum")
+        os.chmod(temporary, 0o755)
+        os.replace(temporary, target)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(temporary)
+    return target
+
+
+def open_tunnel():
+    """Start the share server and a quick tunnel to it, then keep note of the public address."""
+    try:
+        with share_state["lock"]:
+            if not share_state["server"]:
+                share_state["server"] = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ShareHandler)
+                threading.Thread(target=share_state["server"].serve_forever, daemon=True).start()
+            port = share_state["server"].server_address[1]
+        program = cloudflared_path()
+        if not program:
+            share_state["step"] = "Getting Cloudflare\u2019s tunnel program, about 40 MB. This happens once\u2026"
+            program = download_cloudflared()
+        share_state["step"] = "Asking Cloudflare for a link\u2026"
+        tunnel = subprocess.Popen([program, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                                  errors="replace", creationflags=0x08000000 if WINDOWS else 0,  # CREATE_NO_WINDOW
+                                  preexec_fn=None if WINDOWS else end_with_parent)
+        atexit.register(stop_share)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        with share_state["lock"]:
+            share_state.update(step="", error=f"Sharing didn't start: {clean(str(exc))[:200]}")
+        return
+    with share_state["lock"]:
+        if not share_state["shares"]:  # Stopped while it was starting.
+            tunnel.terminate()
+            return
+        share_state["tunnel"] = tunnel
+    deadline = time.monotonic() + 60
+    for line in tunnel.stderr:  # cloudflared logs to stderr. Reading it all also keeps the pipe from filling.
+        found = TUNNEL_URL.search(line)
+        if found and not share_state["url"]:
+            with share_state["lock"]:
+                if share_state["tunnel"] is tunnel:
+                    share_state.update(url=found.group(0), step="")
+        elif not share_state["url"] and time.monotonic() > deadline:
+            break
+    with share_state["lock"]:
+        if share_state["tunnel"] is tunnel:  # It ended by itself, rather than being stopped.
+            error = ("The Cloudflare link stopped working. Share again for a new one." if share_state["url"]
+                     else "Cloudflare didn't give a link. Check this computer is online, then share again.")
+            share_state.update(tunnel=None, url="", step="", error=error)
+    with contextlib.suppress(OSError):
+        tunnel.terminate()
+
+
+class ShareHandler(http.server.BaseHTTPRequestHandler):
+    """The public side: GET only, and only a shared printer's page, picture and print details."""
+
+    def respond(self, status, content_type, body):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Robots-Tag", "noindex")
+        self.send_header("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+                         "img-src blob:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parts = urllib.parse.urlsplit(self.path).path.split("/")
+        host = None
+        if len(parts) == 3 and parts[0] == "":
+            with share_state["lock"]:
+                host = next((h for h, token in share_state["shares"].items() if hmac.compare_digest(token, parts[1])), None)
+        if not host:
+            self.respond(404, "text/plain", b"This link isn't shared any more.\n")
+            return
+        try:
+            if parts[2] == "":
+                self.respond(200, "text/html; charset=utf-8", SHARE_PAGE.encode())
+            elif parts[2] == "frame":
+                frame = printer_camera(host).frame()
+                if frame:
+                    self.respond(200, frame[0], frame[1])
+                else:
+                    self.respond(503, "text/plain", b"no picture yet")
+            elif parts[2] == "status":
+                camera = printer_camera(host)
+                # printer_devices() also asks the printer for its name, in the background, when it's due.
+                label = next((d["label"] for d in printer_devices() if d["serial"] == f"printer-{host}"), "")
+                name = label.removesuffix(" camera") or "3D printer"
+                self.send_json({"name": name, "print": camera.current_status(), "problem": camera.problem})
+            else:
+                self.respond(404, "text/plain", b"not found")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def send_json(self, value):
+        self.respond(200, "application/json", json.dumps(value).encode())
+
+    def log_message(self, *args):
+        pass
 
 
 def read_attention(session):
@@ -3575,6 +3840,7 @@ def restart_server():
         arguments += ["--browser-pid", str(attached_browser_pid)]
     elif "--no-open" not in arguments:
         arguments.append("--no-open")
+    stop_share()  # A shared camera's link ends with this copy; the new one starts unshared.
     with queue_locked():
         if WINDOWS:
             # Windows can't replace a running process, so start the new one and leave. It waits for
@@ -4157,6 +4423,80 @@ class Screen:
                 self.draw()
 
 
+# The page someone opening a shared printer link sees. It only asks for its own picture and print details.
+PRINT_TEXT_JS = r'''
+function printSummary(p){
+ if(!p)return '';
+ const mins=m=>m==null?'':m>=60?Math.floor(m/60)+'h '+String(Math.round(m%60)).padStart(2,'0')+'m':Math.round(m)+'m';
+ const temp=(now,goal)=>now+(goal?'/'+goal:'')+'°C';
+ const bits=[];
+ if(p.state==='printing'||p.state==='paused'){
+  bits.push((p.state==='paused'?'Paused':'Printing')+(p.progress!=null?' '+p.progress+'%':''));
+  if(p.layers)bits.push('layer '+p.layer+' of '+p.layers);
+  if(p.remaining!=null)bits.push(mins(p.remaining)+' left');
+ }else bits.push(p.state==='busy'?'Busy':'Not printing');
+ if(p.nozzle!=null)bits.push('nozzle '+temp(p.nozzle,p.nozzle_target));
+ if(p.bed!=null)bits.push('bed '+temp(p.bed,p.bed_target));
+ return bits.join(' · ');
+}
+'''
+SHARE_PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex"><title>3D printer camera</title>
+<style>
+:root{color-scheme:dark;--bg:#14161f;--card:#1e2130;--line:#32364a;--text:#e8e9f0;--dim:#9a9eb5;--busy:#5fd38d}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:960px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 2px}
+#file{color:var(--dim);margin:0 0 12px;overflow-wrap:anywhere}
+#view{position:relative;background:#000;border:1px solid var(--line);border-radius:8px;overflow:hidden;aspect-ratio:16/9}
+#view img{display:block;width:100%;height:100%;object-fit:contain}
+#wait{position:absolute;inset:0;display:grid;place-items:center;color:var(--dim);padding:16px;text-align:center}
+#bar{height:6px;background:var(--line);border-radius:3px;margin:12px 0 6px;overflow:hidden}
+#bar div{height:100%;width:0;background:var(--busy);transition:width .5s}
+#summary{font-variant-numeric:tabular-nums}
+footer{color:var(--dim);font-size:12px;margin-top:16px}
+</style></head><body><main>
+<h1 id="name">3D printer</h1><p id="file"></p>
+<div id="view"><img id="cam" alt="Live view of the 3D printer"><div id="wait">Starting the camera&hellip; this takes a few seconds.</div></div>
+<div id="bar" hidden><div></div></div><div id="summary"></div>
+<footer>Live view, shared from Claude Sessions. It stops when sharing is turned off.</footer>
+</main><script>
+''' + PRINT_TEXT_JS + r'''
+const $=id=>document.getElementById(id);
+let shown=null;
+async function nextFrame(){
+ let wait=2000;
+ try{
+  const r=await fetch('frame',{cache:'no-store'});
+  if(r.status===404){$('wait').textContent='This printer isn’t shared any more.';$('wait').hidden=false;return}
+  if(r.ok){
+   const url=URL.createObjectURL(await r.blob());
+   $('cam').src=url;if(shown)URL.revokeObjectURL(shown);shown=url;$('wait').hidden=true;wait=document.hidden?2000:150;
+  }
+ }catch(e){}
+ setTimeout(nextFrame,wait);
+}
+async function status(){
+ try{
+  const r=await fetch('status',{cache:'no-store'});
+  if(r.ok){
+   const d=await r.json(),p=d.print;
+   $('name').textContent=d.name;document.title=d.name+' camera';
+   $('file').textContent=p&&p.file?p.file:'';
+   $('bar').hidden=!(p&&p.progress!=null&&(p.state==='printing'||p.state==='paused'));
+   if(p&&p.progress!=null)$('bar').firstElementChild.style.width=Math.max(0,Math.min(100,p.progress))+'%';
+   $('summary').textContent=printSummary(p);
+  }
+ }catch(e){}
+ setTimeout(status,5000);
+}
+nextFrame();status();
+</script></body></html>
+'''
+
+
 PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -4265,6 +4605,12 @@ html:has(#hist[open]){overflow:hidden}
 /* The picture gets the full height, so its caption appears over it when wanted. */
 #histDevices .devtext{position:absolute;left:0;right:0;bottom:0;padding:8px 10px;background:#000c;opacity:0;transition:opacity .15s}
 #histDevices .dev:hover .devtext,#histDevices .dev:focus-visible .devtext,#histDevices .dev.nopic .devtext{opacity:1}
+.devprint{display:block;white-space:pre-line;font-size:12px;color:var(--text);overflow-wrap:anywhere;background:linear-gradient(90deg,#5fd38d40 var(--done,0%),transparent 0);border-radius:3px;padding:2px 6px}
+.devprint[hidden]{display:none}
+#histDevices .devprint{position:absolute;left:0;right:0;top:0;border-radius:0;padding:6px 10px;background:linear-gradient(90deg,#5fd38d55 var(--done,0%),#000b 0)}
+#printerList li.printshare{display:grid;justify-items:start;gap:6px;margin:4px 0 10px 0;padding:8px;border:1px solid var(--line);border-radius:4px}
+.printshare .qr{width:160px;background:#fff;padding:6px;border-radius:4px}.printshare .qr svg{display:block;width:100%;height:auto}
+.printshare code{overflow-wrap:anywhere}
 #histChanges h3,#agentList h3{margin:0;font-size:13px}
 #agentList{flex:1;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:10px;align-content:start}
 .agent{border:1px solid var(--line);border-radius:4px;padding:10px;display:grid;grid-template-columns:minmax(0,1fr);gap:8px;min-width:0}
@@ -4407,6 +4753,7 @@ textarea{min-height:110px;resize:vertical}
 <div id="trustAsk" role="alert" hidden><p><b>Trust this folder?</b> <code id="trustPath"></code></p><p>Claude Code will be able to read, edit and run files here, and any hooks or settings the folder defines will apply. Only trust a project you created or know is safe. This is remembered for future sessions.</p><div class="row"><button type="button" id="trustNo">Don't trust</button><button type="button" id="trustYes" class="deny">Trust and start session</button></div></div>
 <div id="newErr" role="alert"></div><div class="row"><button type="button" id="newCancel">Cancel</button><button type="submit" id="newStart" class="primary">Start session</button></div></form></dialog>
 <script>
+/*PRINT_SUMMARY*/
 'use strict';
 const SCALE=3, SLOT=34, ROW=46, DOOR=20, STALE=120;
 const SHIRTS=['#e0726c','#5aa9e6','#7fc97f','#c78be0','#4fc4b8','#e88fb4','#a3a8f0','#d8c65a'];
@@ -4710,6 +5057,7 @@ function makeTile(parent,delay,paused){
  const t={root:b,img:el('img','',b),device:null,state:null,stop:null};
  t.img.alt='';
  const text=el('span','devtext',b);t.name=el('b','',text);t.line=el('small','',text);t.note=el('small','',text);
+ t.print=el('span','devprint',b);t.print.hidden=true;
  t.paused=paused;t.delay=delay;
  b.addEventListener('click',()=>openViewer(t.device.serial));
  return t;
@@ -4717,7 +5065,13 @@ function makeTile(parent,delay,paused){
 function updateTile(t,d){
  t.device=d;
  t.name.textContent=d.label;
- t.line.textContent=d.serial+' · '+linkText(d);
+ t.line.textContent=d.serial+' · '+linkText(d)+(d.shared?' · shared publicly':'');
+ const p=d.print;
+ t.print.hidden=!p;
+ if(p){
+  t.print.textContent=(p.file?p.file+'\n':'')+printSummary(p);
+  t.print.style.setProperty('--done',(p.progress!=null&&(p.state==='printing'||p.state==='paused')?p.progress:0)+'%');
+ }
  if(d.state!==t.state){
   t.state=d.state;
   if(t.stop){t.stop();t.stop=null}
@@ -4745,7 +5099,7 @@ function updateViewer(){
  if(!viewSerial)return;
  const d=devices.find(x=>x.serial===viewSerial);
  $('viewName').textContent=d?d.label:viewSerial;
- $('viewInfo').textContent=d?viewSerial+' · '+linkText(d)+' · view only':viewSerial+' has stopped.';
+ $('viewInfo').textContent=d?viewSerial+' · '+linkText(d)+' · view only'+(d.print?' · '+printSummary(d.print):''):viewSerial+' has stopped.';
 }
 function openViewer(serial){
  viewSerial=serial;
@@ -4761,23 +5115,46 @@ $('viewClose').addEventListener('click',()=>$('viewDlg').close());
 $('viewDlg').addEventListener('close',()=>{if(viewStop)viewStop();viewStop=null;viewSerial=null});
 $('devices').addEventListener('click',()=>{$('devDlg').showModal();loadPrinters()});
 // 3D printer cameras: saved by IP address, or found by asking every address on this network.
-function showPrinters(list){
+let shareTimer=0;
+function showPrinters(list,shares){
+ shares=shares||{};
  const ul=$('printerList');ul.textContent='';
  if(!list.length)el('li','note',ul,'No printers added yet.');
  for(const host of list){
-  const li=el('li','',ul);el('span','',li,host);
-  const b=el('button','',li,'Remove');b.type='button';b.addEventListener('click',()=>printerAction('remove',host));
+  const li=el('li','',ul),share=shares[host];el('span','',li,host);
+  if(share){
+   const b=el('button','',li,'Stop sharing');b.type='button';b.addEventListener('click',()=>printerAction('unshare',host));
+  }else{
+   const b=el('button','',li,'Share\u2026');b.type='button';b.title='Make a public link to watch this camera';
+   b.addEventListener('click',()=>{if(confirm('Make a public link to this printer\u2019s camera? Anyone with the link can watch it, and see the print\u2019s progress, until you stop sharing or close this app. It goes through Cloudflare\u2019s free tunnel.'))printerAction('share',host)});
+  }
+  const r=el('button','',li,'Remove');r.type='button';r.addEventListener('click',()=>printerAction('remove',host));
+  if(!share)continue;
+  const box=el('li','printshare',ul);
+  if(share.error)el('span','',box,share.error).style.color='var(--bad)';
+  else if(!share.url)el('span','note',box,share.step||'Starting\u2026');
+  else{
+   el('span','',box,'Anyone with this link can watch:');
+   el('code','',box,share.url);
+   const row=el('div','',box),copy=el('button','',row,'Copy link');copy.type='button';
+   copy.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(share.url);copy.textContent='Copied'}catch(e){copy.textContent='Copy failed; select the link instead'}});
+   const open=el('a','',row,' Open it');open.href=share.url;open.target='_blank';open.rel='noopener noreferrer';
+   const qr=el('div','qr',box);qr.innerHTML=qrSvg(share.url);qr.setAttribute('role','img');qr.setAttribute('aria-label','QR code with the shared link');
+  }
  }
+ // Keep asking while a link is on its way, or the dialog is open with sharing on.
+ clearTimeout(shareTimer);
+ if(Object.keys(shares).length&&$('devDlg').open)shareTimer=setTimeout(loadPrinters,Object.values(shares).some(x=>!x.url&&!x.error)?1500:10000);
 }
 async function loadPrinters(){
- try{const r=await fetch('/api/printers',{cache:'no-store'});if(r.ok)showPrinters((await r.json()).printers)}
+ try{const r=await fetch('/api/printers',{cache:'no-store'});if(r.ok){const d=await r.json();showPrinters(d.printers,d.shares)}}
  catch(e){$('printerErr').textContent='Lost connection to claude-monitor.'}
 }
 async function printerAction(action,host){
  $('printerErr').textContent='';
  const d=await post('printers',{action,host}).catch(()=>({error:'Lost connection to claude-monitor.'}));
  if(d.error){$('printerErr').textContent=d.error;return null}
- showPrinters(d.message.printers);
+ showPrinters(d.message.printers,d.message.shares);
  return d.message;
 }
 $('printerForm').addEventListener('submit',async e=>{
@@ -5760,6 +6137,7 @@ setInterval(()=>{frame++;for(const c of cards.values())c.office.draw(frame,still
 poll();
 </script></body></html>
 '''
+PAGE = PAGE.replace("/*PRINT_SUMMARY*/", PRINT_TEXT_JS, 1)
 
 
 def app_browser():
@@ -5947,7 +6325,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
             elif parts.path == "/api/sessions":
                 self.send_json(200, monitor.snapshot())
             elif parts.path == "/api/printers":
-                self.send_json(200, {"printers": read_printers()})
+                self.send_json(200, printers_view())
             elif parts.path == "/api/commands":
                 commands = monitor.commands(query.get("id", [""])[0])
                 if commands is None:
