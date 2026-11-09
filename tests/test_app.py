@@ -220,6 +220,9 @@ class SetupTests(unittest.TestCase):
             ours = [h for g in settings["hooks"][event] for h in g["hooks"] if "--hook" in h["command"]]
             self.assertEqual(len(ours), 1, event)
         self.assertEqual(settings["hooks"]["Stop"][0]["hooks"][0]["command"], "other --thing")
+        context = [h for g in settings["hooks"]["UserPromptSubmit"] for h in g["hooks"] if "--context" in h["command"]]
+        self.assertEqual(len(context), 1)
+        self.assertNotIn("async", context[0])  # Its output has to reach Claude.
 
 
 class BackgroundTaskTests(unittest.TestCase):
@@ -607,6 +610,42 @@ class QuestionTests(unittest.TestCase):
         text = 'User has answered your questions: "Which colour?"="Green, please", "Which size?"="L".'
         self.assertEqual(app.given_answers(asked, None, text, False), {"list": ["Green, please", "L"]})
         self.assertEqual(app.given_answers(asked, None, "The user declined to answer.", True)["note"], "Not answered: The user declined to answer.")
+
+
+class PreviewTests(unittest.TestCase):
+    """A session can see the previews beside its chat, and is told about them once."""
+
+    def test_print_summary(self):
+        status = {"state": "printing", "progress": 20, "layer": 12, "layers": 500, "remaining": 565, "file": "tray",
+                  "nozzle": 260, "nozzle_target": 260, "bed": 100, "bed_target": 100}
+        self.assertEqual(app.print_summary(status), "Printing 20% \u00b7 layer 12 of 500 \u00b7 9h 25m left \u00b7 file tray \u00b7 nozzle 260/260\u00b0C \u00b7 bed 100/100\u00b0C")
+        self.assertEqual(app.print_summary(None), "")
+
+    def test_context_said_once_per_set_of_previews(self):
+        import io
+        saved = {name: getattr(app, name) for name in ("ask_running_app", "MONITOR_DIR")}
+        app.MONITOR_DIR = tempfile.mkdtemp(dir=CONFIG)
+        devices = [{"serial": "printer-192.168.0.66", "label": "Kobra X camera", "kind": "printer"}]
+        app.ask_running_app = lambda path, timeout: (200, {"session": "3D Printing", "devices": devices})
+        stdin, stdout = sys.stdin, sys.stdout
+        try:
+            said = []
+            for _ in range(2):
+                sys.stdin, sys.stdout = io.StringIO(json.dumps({"session_id": "0" * 8 + "-1111-2222-3333-" + "4" * 12})), io.StringIO()
+                app.run_context_hook()
+                said.append(sys.stdout.getvalue())
+            context = json.loads(said[0])["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("Kobra X camera", context)
+            self.assertIn("--preview", context)
+            self.assertEqual(said[1], "")
+            app.ask_running_app = lambda path, timeout: None  # The app isn't running: say nothing.
+            sys.stdin, sys.stdout = io.StringIO(json.dumps({"session_id": "5" * 8 + "-1111-2222-3333-" + "4" * 12})), io.StringIO()
+            self.assertEqual(app.run_context_hook(), 0)
+            self.assertEqual(sys.stdout.getvalue(), "")
+        finally:
+            sys.stdin, sys.stdout = stdin, stdout
+            for name, value in saved.items():
+                setattr(app, name, value)
 
 
 class PortTests(unittest.TestCase):

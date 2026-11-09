@@ -23,6 +23,10 @@ claude-monitor --setup
 `--setup` adds the app's hooks to `~/.claude/settings.json` (backing it up first), adds a status line if
 you don't have one, and puts **Claude Sessions** in your applications menu.
 
+Sessions can see the previews shown beside their chat (an emulator, a browser, a 3D printer camera):
+`claude-monitor --preview` saves a current picture of each and prints where, and a hook tells Claude
+about it the first time a preview is linked to its session.
+
 ### Windows
 
 Needs Claude Code's native install (`claude.exe`) and Microsoft Edge, Chrome or Brave.

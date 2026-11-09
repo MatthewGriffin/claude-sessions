@@ -4075,6 +4075,161 @@ def write_attention(session_id, kind, message, notification):
     os.replace(temporary, target)
 
 
+# ---- Letting a session see the previews shown beside its chat ----
+
+PREVIEW_WAIT_SECONDS = 15  # A printer camera takes a few seconds to start.
+
+
+def print_summary(status):
+    """The same one-line summary the page shows, for Claude to read."""
+    if not status:
+        return ""
+    minutes = lambda m: f"{int(m) // 60}h {int(m) % 60:02d}m" if m >= 60 else f"{int(m)}m"  # noqa: E731
+    bits = []
+    if status.get("state") in ("printing", "paused"):
+        progress = f" {status['progress']}%" if status.get("progress") is not None else ""
+        bits.append(("Paused" if status["state"] == "paused" else "Printing") + progress)
+        if status.get("layers"):
+            bits.append(f"layer {status.get('layer')} of {status['layers']}")
+        if status.get("remaining") is not None:
+            bits.append(minutes(status["remaining"]) + " left")
+        if status.get("file"):
+            bits.append(f"file {status['file']}")
+    else:
+        bits.append("busy" if status.get("state") == "busy" else "not printing")
+    for name in ("nozzle", "bed"):
+        if status.get(name) is not None:
+            target = f"/{status[name + '_target']}" if status.get(name + "_target") else ""
+            bits.append(f"{name} {status[name]}{target}\u00b0C")
+    return " \u00b7 ".join(bits)
+
+
+def session_previews(monitor, query):
+    """The previews linked to one session, with a fresh picture of each saved to a file it can open."""
+    snapshot = monitor.snapshot()
+    session_id, pid = query.get("session", [""])[0], query.get("pid", [""])[0]
+    session = next((s for s in snapshot["sessions"] if s["id"] == session_id), None) \
+        or next((s for s in snapshot["sessions"] if pid.isdigit() and s["pid"] == int(pid)), None)
+    if not session:
+        return 404, {"error": "Claude Sessions doesn't know this session. It only sees sessions running on this computer."}
+    linked = [d for d in snapshot["devices"] if any(link["id"] == session["id"] for link in d["sessions"])]
+    found = []
+    for device in linked:
+        item = {"serial": device["serial"], "label": device["label"], "kind": device["kind"] or "device",
+                "state": device["state"], "print": print_summary(device.get("print"))}
+        if query.get("list", [""])[0]:
+            found.append(item)
+            continue
+        printer = device["kind"] == "printer"
+        image, deadline = None, time.time() + (PREVIEW_WAIT_SECONDS if printer else 3)
+        # A printer's camera is asked directly: just after the app starts, it may still be "checking".
+        while printer or device["state"] == "device":
+            frame = printer_camera(device["serial"][len("printer-"):]).frame() if printer else monitor.device_frame(device["serial"])
+            image = frame[1] if isinstance(frame, tuple) else frame
+            if image or time.time() > deadline:
+                break
+            time.sleep(0.5)
+        if image:
+            folder = os.path.join(MONITOR_DIR, "previews")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, f"{session['id'][:8]}-{re.sub(r'[^A-Za-z0-9.-]', '_', device['serial'])}.{image_type(image) or 'png'}")
+            with open(path, "wb") as handle:
+                handle.write(image)
+            item["path"] = path
+        else:
+            item["problem"] = device.get("problem") or f"no picture right now ({device['state']})"
+        if device["kind"] == "printer":  # The camera has just been asked, so its print details are fresh now.
+            camera = printer_state["cameras"].get(device["serial"][len("printer-"):])
+            item["print"] = print_summary(camera.current_status() if camera else None) or item["print"]
+        found.append(item)
+    return 200, {"session": session["name"], "devices": found}
+
+
+def ask_running_app(path, timeout):
+    """GET from this user's running Claude Sessions app, as (status, reply), or None if it isn't running."""
+    try:
+        with open(os.path.join(MONITOR_DIR, "token")) as handle:
+            token = handle.read().strip()
+    except OSError:
+        return None
+    for port in [*port_choices(APP_PORT), *port_choices(WEB_PORT)]:
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+            connection.request("GET", path, headers={"Cookie": f"monitor_token={token}"})
+            response = connection.getresponse()
+            body = response.read(1024 * 1024)
+            connection.close()
+        except (OSError, http.client.HTTPException):
+            continue
+        if response.getheader("X-Claude-Sessions"):
+            with contextlib.suppress(ValueError):
+                return response.status, json.loads(body)
+    return None
+
+
+def this_session():
+    """(session id, Claude Code's pid) of the session running this command."""
+    session_id, pid = os.environ.get("CLAUDE_CODE_SESSION_ID", ""), os.environ.get("CLAUDE_PID", "")
+    if not session_id and not pid and not WINDOWS:
+        session_id, found = session_ancestor(os.getpid())
+        pid = str(found or "")
+    return session_id, pid
+
+
+def run_preview():
+    """For Claude: save a current picture of each preview beside this session's chat, and say where."""
+    session_id, pid = this_session()
+    answer = ask_running_app("/api/previews?" + urllib.parse.urlencode({"session": session_id, "pid": pid}), PREVIEW_WAIT_SECONDS * 3)
+    if answer is None:
+        print("Claude Sessions isn't running, so there are no previews to see.")
+        return 1
+    status, reply = answer
+    if status != 200:
+        print(reply.get("error", "Claude Sessions couldn't find this session."))
+        return 1
+    if not reply["devices"]:
+        print(f"No previews are attached to this session ({reply['session']}) in Claude Sessions right now.")
+        return 0
+    print(f"Previews beside this session ({reply['session']}) in Claude Sessions:")
+    for device in reply["devices"]:
+        print(f"- {device['label']} ({device['serial']}, {device['kind']})")
+        if device.get("print"):
+            print(f"  {device['print']}")
+        print(f"  picture: {device['path']}" if device.get("path") else f"  no picture: {device['problem']}")
+    if any(d.get("path") for d in reply["devices"]):
+        print("Open each picture with the Read tool to see it. Run this again for a newer one.")
+    return 0
+
+
+def run_context_hook():
+    """UserPromptSubmit hook: tell Claude, once, which previews are beside its chat and how to look at them."""
+    try:
+        payload = json.load(sys.stdin)
+        session_id = str(payload.get("session_id", ""))
+        if not SESSION_ID.match(session_id):
+            return 0
+        answer = ask_running_app("/api/previews?" + urllib.parse.urlencode({"session": session_id, "list": "1"}), 2)
+        if not answer or answer[0] != 200 or not answer[1]["devices"]:
+            return 0
+        devices = answer[1]["devices"]
+        folder = os.path.join(MONITOR_DIR, "announced")
+        os.makedirs(folder, exist_ok=True)
+        record = os.path.join(folder, session_id + ".json")
+        with contextlib.suppress(OSError, ValueError), open(record) as handle:
+            if set(json.load(handle)) >= {d["serial"] for d in devices}:
+                return 0  # Already told about each of these.
+        with open(record, "w") as handle:
+            json.dump(sorted(d["serial"] for d in devices), handle)
+        names = ", ".join(f"{d['label']} ({d['kind']})" for d in devices)
+        context = (f"The Claude Sessions app shows live previews beside this chat: {names}. To see what they show "
+                   f"right now, run `{own_command_line('--preview')}`. It saves a current picture of each and prints "
+                   "the file paths (and a 3D printer's progress and temperatures); then open the pictures with the Read tool.")
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
+    except (OSError, ValueError, TypeError, AttributeError, KeyError):
+        pass
+    return 0
+
+
 def run_hook():
     """Handle one Claude Code hook event from stdin. Never fails the session it runs for."""
     try:
@@ -6387,6 +6542,9 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                 self.send_json(200, monitor.snapshot())
             elif parts.path == "/api/printers":
                 self.send_json(200, printers_view())
+            elif parts.path == "/api/previews" and not self.on_phone:
+                status, reply = session_previews(monitor, query)
+                self.send_json(status, reply)
             elif parts.path == "/api/commands":
                 commands = monitor.commands(query.get("id", [""])[0])
                 if commands is None:
@@ -6577,6 +6735,12 @@ def run_setup(verbose=True):
         if not any("--hook" in c and ("claude-monitor" in c or "claude-sessions" in c) for c in commands):
             groups.append({"hooks": [{"type": "command", "command": hook, "async": True, "timeout": 10}]})
             added.append(event)
+    # A second UserPromptSubmit hook, not async, so what it prints reaches Claude.
+    groups = hooks.setdefault("UserPromptSubmit", [])
+    commands = [h.get("command", "") for g in groups if isinstance(g, dict) for h in g.get("hooks", []) if isinstance(h, dict)]
+    if not any("--context" in c and ("claude-monitor" in c or "claude-sessions" in c) for c in commands):
+        groups.append({"hooks": [{"type": "command", "command": own_command_line("--context"), "timeout": 5}]})
+        added.append("previews note")
     if "statusLine" not in settings:
         settings["statusLine"] = {"type": "command", "command": own_command_line("--statusline")}
         added.append("statusLine")
@@ -6685,6 +6849,8 @@ def main():
     parser.add_argument("--browser-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--wait-for-port", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--hook", action="store_true", help="handle a Claude Code hook event from stdin")
+    parser.add_argument("--context", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--preview", action="store_true", help="for a session: save a picture of each preview beside its chat")
     parser.add_argument("--statusline", action="store_true", help="status line for Claude Code that also feeds this app")
     parser.add_argument("--setup", action="store_true", help="add this app's hooks (and a status line, if none) to Claude Code")
     parser.add_argument("--session-host", action="store_true", help=argparse.SUPPRESS)
@@ -6692,6 +6858,10 @@ def main():
     args = parser.parse_args()
     if args.hook:
         return run_hook()
+    if args.context:
+        return run_context_hook()
+    if args.preview:
+        return run_preview()
     if args.statusline:
         return run_statusline()
     if args.setup:
