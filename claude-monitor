@@ -7279,6 +7279,8 @@ def start_menu_shortcut():
 def older_windows_builds():
     """Earlier versions of this program: beside it (named with their version), and the old claude-sessions.exe install."""
     mine = os.path.normcase(os.path.abspath(PROGRAM_PATH))
+    named = WINDOWS_BUILD_NAME.match(os.path.basename(PROGRAM_PATH))
+    version = version_tuple(named.group(1) if named else APP_VERSION)  # What it was released as.
     found = []
     for folder in {os.path.dirname(PROGRAM_PATH), installers_dir()}:
         with contextlib.suppress(OSError):
@@ -7287,7 +7289,7 @@ def older_windows_builds():
                 match = WINDOWS_BUILD_NAME.match(name)
                 if os.path.normcase(os.path.abspath(path)) == mine:
                     continue
-                newer = match and version_tuple(APP_VERSION) and version_tuple(match.group(1)) > version_tuple(APP_VERSION)
+                newer = match and version and version_tuple(match.group(1)) > version
                 if (match and not newer) or (name.startswith("claude-sessions-windows-") and name.endswith(".download")):
                     found.append(path)
     if os.environ.get("LOCALAPPDATA") and not mine.startswith(os.path.normcase(WINDOWS_INSTALL_DIR)):
