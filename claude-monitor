@@ -3047,13 +3047,16 @@ def heif_to_jpeg(data):
     if not ffmpeg:
         return None
     with tempfile.TemporaryDirectory() as folder:
-        source, target = os.path.join(folder, "photo.heic"), os.path.join(folder, "photo.jpg")
+        source, full, target = (os.path.join(folder, name) for name in ("photo.heic", "full.jpg", "photo.jpg"))
         with open(source, "wb") as handle:
             handle.write(data)
+        # Two steps: a phone's photo is a grid of tiles, which ffmpeg joins with its own filters,
+        # and those can't be combined with a resize in the same run.
         try:
-            subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-i", source, "-frames:v", "1",
-                            "-vf", "scale=w='min(2000,iw)':h='min(2000,ih)':force_original_aspect_ratio=decrease",
-                            "-q:v", "3", target], capture_output=True, timeout=60)
+            for arguments in (["-i", source, "-frames:v", "1", "-q:v", "2", full],
+                              ["-i", full, "-vf", "scale=w='min(2000,iw)':h='min(2000,ih)':force_original_aspect_ratio=decrease",
+                               "-q:v", "3", target]):
+                subprocess.run([ffmpeg, "-y", "-v", "error", "-nostdin", *arguments], capture_output=True, timeout=60)
             with open(target, "rb") as handle:
                 converted = handle.read()
         except (OSError, subprocess.TimeoutExpired):
@@ -3073,8 +3076,8 @@ def save_upload(monitor, request):
         # The phone's browser couldn't open it to shrink it, so it sent the photo as it is.
         data = heif_to_jpeg(data)
         if not data:
-            return False, ("That photo is HEIC, which this computer can't convert without ffmpeg. "
-                           "Set the phone's camera to save JPEG (\u201cMost compatible\u201d), or send a screenshot of it.")
+            reason = "this computer couldn't convert it" if shutil.which("ffmpeg") else "converting it needs ffmpeg, which this computer doesn't have"
+            return False, f"That photo is HEIC, and {reason}. Use Take a photo instead, which gives a JPEG."
     kind = image_type(data)
     if not kind:
         return False, "Only JPEG, PNG, GIF, WebP and HEIC pictures can be sent."
@@ -4356,7 +4359,7 @@ button.deny{color:var(--bad)}
 .pimg{position:relative;width:64px;height:64px}
 .pimg img{width:64px;height:64px;object-fit:cover;border-radius:4px;display:block;border:1px solid var(--line)}
 .pimg button{position:absolute;top:-6px;right:-6px;width:22px;height:22px;padding:0;border-radius:50%;font-size:14px;line-height:1}
-#replyAttach{flex:none;align-self:stretch;padding:0 10px}
+#replyAttach,#replyCamera{flex:none;align-self:stretch;padding:0 10px}
 .qimgs{display:flex;gap:4px;margin-top:4px}.qimgs img{width:36px;height:36px;object-fit:cover;border-radius:3px}
 .msg.system a.picture img{max-width:min(320px,100%);max-height:240px;border-radius:4px;display:block;margin-top:2px}
 .msg.system:has(a.picture){max-height:none}
@@ -4383,7 +4386,7 @@ textarea{min-height:110px;resize:vertical}
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
 <dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="reqBox" aria-label="Requests to this computer" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replyNote"></div><div id="queue" hidden></div>
-<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" hidden><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
+<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" hidden><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
 <ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p></section></dialog>
@@ -5654,6 +5657,10 @@ $('phoneOn').addEventListener('change',()=>phoneAction($('phoneOn').checked?'on'
 $('phoneRenew').addEventListener('click',()=>{if(confirm('Make a new link? Phones using the current one will need to scan the new code.'))phoneAction('renew')});
 $('replyAttach').addEventListener('click',()=>$('replyFile').click());
 $('replyFile').addEventListener('change',()=>{addImages($('replyFile').files);$('replyFile').value=''});
+// On a phone or tablet, a button that opens the camera straight away. Its photos come back as JPEG.
+$('replyCamera').hidden=!matchMedia('(pointer:coarse)').matches;
+$('replyCamera').addEventListener('click',()=>$('replyCameraFile').click());
+$('replyCameraFile').addEventListener('change',()=>{addImages($('replyCameraFile').files);$('replyCameraFile').value=''});
 $('replyText').addEventListener('paste',e=>{
  const files=[...(e.clipboardData&&e.clipboardData.files||[])].filter(f=>f.type.startsWith('image/'));
  if(files.length){e.preventDefault();addImages(files);return}
