@@ -35,6 +35,7 @@ import http.cookies
 import http.server
 import ipaddress
 import json
+import mmap
 import os
 import platform
 import re
@@ -138,9 +139,10 @@ LIVE_RULE = re.compile(r"^\s*─{10,}")
 # One symbol, then words ending in an ellipsis: "✽ Moseying… (12m 13s · ↓ 8.8k tokens)".
 LIVE_STATUS = re.compile(r"^\s*[^\w\s●⎿❯─]\s+[^…]*…(\s.*)?$")
 LIVE_LINES = 14
-# Built-in commands of Claude Code, checked against version 2.1.319. Claude Code keeps no list a
-# program can read, so this has to be kept up to date by hand. Skills and custom commands are found
-# for each session. Some of these open a menu, which shows in the app as a prompt to answer.
+# Built-in commands of Claude Code, checked against version 2.1.319. The list is read from the
+# installed Claude Code where possible (installed_commands), and this is the fallback, and the wording
+# used where Claude Code's own description can't be read. Skills and custom commands are found for
+# each session. Some of these open a menu, which shows in the app as a prompt to answer.
 BUILTIN_COMMANDS = [
     ("add-dir", "<path>", "Add another working folder"),
     ("branch", "[name]", "Branch the conversation at this point"),
@@ -149,6 +151,7 @@ BUILTIN_COMMANDS = [
     ("compact", "[instructions]", "Free up context by summarizing the conversation so far"),
     ("config", "", "Open settings"),
     ("context", "", "Show what is using the context window"),
+    ("diff", "", "View uncommitted changes and what each turn changed"),
     ("doctor", "", "Check the Claude Code installation"),
     ("effort", "", "Set the effort level"),
     ("exit", "", "End this session"),
@@ -158,6 +161,7 @@ BUILTIN_COMMANDS = [
     ("help", "", "Show help and available commands"),
     ("hooks", "", "View hook configurations"),
     ("init", "", "Write a CLAUDE.md describing this project"),
+    ("login", "", "Sign in to your Anthropic account"),
     ("mcp", "", "Manage MCP servers"),
     ("memory", "", "Edit CLAUDE.md files and memory settings"),
     ("model", "[model]", "Set the AI model"),
@@ -166,15 +170,27 @@ BUILTIN_COMMANDS = [
     ("plugin", "", "Manage plugins"),
     ("recap", "", "Write a one-line recap of the session"),
     ("release-notes", "", "Show what changed in Claude Code"),
+    ("remote-control", "", "Control this session from your phone or claude.ai/code (also /rc)"),
     ("rename", "[name]", "Rename the conversation"),
+    ("restart", "", "Restart Claude Code, keeping this conversation"),
     ("resume", "", "Resume an earlier conversation"),
     ("rewind", "", "Go back to an earlier point in the conversation"),
     ("skills", "", "List available skills"),
     ("status", "", "Show version, model, account and connection status"),
     ("statusline", "", "Set up the status line"),
     ("tasks", "", "View and manage background tasks"),
+    ("terminal-setup", "", "Set up Shift+Enter for new lines in this terminal"),
+    ("ultraplan", "<prompt>", "Plan in the cloud, then review the plan"),
+    ("ultrareview", "", "Start a cloud review that finds and verifies bugs in your branch"),
     ("usage", "", "Show session cost and plan usage (also /cost, /stats)"),
 ]
+# How each command is defined inside Claude Code's program: {type:"local-jsx",name:"theme",description:"Change the theme",...}
+COMMAND_TYPE = re.compile(rb'(?<![\w$])type:"(?:local|local-jsx|prompt)"')
+COMMAND_FIELD = {key: re.compile(rb'(?<![\w$])' + key.encode() + rb':"((?:[^"\\]|\\.){0,300})"')
+                 for key in ("name", "description", "argumentHint")}
+COMMAND_NAME = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+COMMAND_SCAN_SPAN = 1500
+installed_commands_cache = {"key": None, "commands": None, "lock": threading.Lock()}
 SKILL_LINE = re.compile(r"^- ([\w.:-]+): (.*)$")
 # A numbered answer: "❯ 1. Red", "  2. [✔] Fruit". Groups: number, tick box, label.
 MENU_NUMBERED = re.compile(r"^\s*(?:❯\s*)?(\d{1,2})\.\s+(?:\[(.)\]\s+)?(\S.*?)\s*$")
@@ -909,7 +925,7 @@ class Monitor:
         if not session:
             return None
         skills = transcript_skills(path) if path else {}
-        found = {name: {"name": name, "hint": hint, "description": text, "source": "built-in"} for name, hint, text in BUILTIN_COMMANDS}
+        found = {name: {"name": name, "hint": hint, "description": text, "source": "built-in"} for name, hint, text in builtin_commands()}
         for name, text in skills.items():
             found[name] = {"name": name, "hint": "", "description": clean(text)[:200], "source": "skill"}
         for command in custom_commands(session.get("cwd") or ""):
@@ -2060,6 +2076,86 @@ def turn_ended(session, pane):
 def claude_is_free(screen):
     """Whether the terminal shows Claude Code's input box with no working line above it."""
     return input_box(screen) is not None and not live_activity(screen)["head"]
+
+
+def js_string(raw):
+    """A string literal's text, as written in Claude Code's program."""
+    with contextlib.suppress(ValueError):
+        return clean(json.loads(b'"' + raw + b'"'))
+    return ""
+
+
+def scan_commands(data):
+    """{name: (hint, description, hidden)} for each built-in command defined in Claude Code's program.
+
+    Each definition is the object around a type:"local" (or "local-jsx", "prompt") key, read only up
+    to the next definition, so one command's fields can't be taken for another's. Descriptions that
+    are worked out while running (a getter) aren't in the text, and are left empty.
+    """
+    found = {}
+    for match in COMMAND_TYPE.finditer(data):
+        start = data.rfind(b"{", max(0, match.start() - 400), match.start())
+        if start < 0 or b"}" in data[start:match.start()]:
+            continue
+        following = COMMAND_TYPE.search(data, match.end(), match.end() + COMMAND_SCAN_SPAN)
+        body = data[start:following.start() if following else match.end() + COMMAND_SCAN_SPAN]
+        fields = {key: pattern.search(body) for key, pattern in COMMAND_FIELD.items()}
+        name = js_string(fields["name"].group(1)) if fields["name"] else ""
+        if not COMMAND_NAME.match(name) or name in found:
+            continue
+        code = body.find(b"call")
+        hidden = b"isHidden:!0" in (body[:code] if code > 0 else body)
+        found[name] = (js_string(fields["argumentHint"].group(1)) if fields["argumentHint"] else "",
+                       js_string(fields["description"].group(1)) if fields["description"] else "", hidden)
+    return found
+
+
+def installed_commands():
+    """Claude Code's built-in commands, read from the installed program, or None if they can't be.
+    Kept until the program file changes."""
+    path = shutil.which("claude")
+    if not path:
+        return None
+    path = os.path.realpath(path)
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    key = (path, info.st_size, info.st_mtime)
+    cache = installed_commands_cache
+    with cache["lock"]:
+        if cache["key"] != key:
+            commands = None
+            try:
+                with open(path, "rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    commands = scan_commands(data)
+            except (OSError, ValueError):
+                pass
+            cache.update(key=key, commands=commands)
+        return cache["commands"]
+
+
+def builtin_commands():
+    """[(name, hint, description)] of Claude Code's built-in commands, from the installed Claude Code
+    when it can be read, otherwise the app's own list. Where two commands claim the same description,
+    one of them took it from a neighbour, so the app's own wording is used for both."""
+    fallback = {name: (hint, text) for name, hint, text in BUILTIN_COMMANDS}
+    scanned = installed_commands()
+    if not scanned or len(scanned) < 20:  # Its layout has changed too much to read.
+        return BUILTIN_COMMANDS
+    shared = collections.Counter(text for _, text, _ in scanned.values() if text)
+    commands = []
+    for name, (hint, text, hidden) in scanned.items():
+        if hidden:
+            continue
+        if not text or shared[text] > 1 or text.startswith("(removed)") or text.startswith("Renamed to"):
+            text = fallback.get(name, ("", ""))[1]
+        if not text:
+            continue  # No description anywhere: possibly not a command at all.
+        commands.append((name, hint or fallback.get(name, ("", ""))[0], text[:200]))
+    names = {name for name, _, _ in commands}
+    commands += [command for command in BUILTIN_COMMANDS if command[0] not in names and command[0] not in scanned]
+    return commands
 
 
 def read_attention(session):
@@ -6740,6 +6836,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
     serving_port = port
     threading.Thread(target=releases.watch, daemon=True).start()
     threading.Thread(target=run_queue_delivery, args=(monitor,), daemon=True).start()
+    threading.Thread(target=installed_commands, daemon=True).start()  # Reading Claude Code takes a few seconds.
     phone["handler"] = type("PhoneHandler", (Handler,), {"on_phone": True})
     if phone_settings()["enabled"]:
         threading.Thread(target=start_phone_on_launch, daemon=True).start()

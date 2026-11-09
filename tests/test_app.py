@@ -785,5 +785,49 @@ class PasteTests(unittest.TestCase):
         self.assertEqual(app.pasted_parts("plain"), ("plain", None))
 
 
+class InstalledCommandTests(unittest.TestCase):
+    """The built-in commands are read from the installed Claude Code's program."""
+
+    PROGRAM = (b'var a=1;Qx={type:"local-jsx",name:"theme",description:"Change the theme",call:()=>{}},'
+               b'Rz={name:"remote-control",aliases:["rc"],type:"local-jsx",get description(){return x()?"A":"B"},isEnabled:()=>!0},'
+               b'Kb={type:"local",name:"keybindings",description:"Open your keyboard shortcuts file"},'
+               b'In={type:"prompt",name:"init",get description(){return y},progressMessage:"x"},'
+               b'Hd={type:"local",name:"heapdump",description:"Dump the heap",isHidden:!0,call:z},'
+               b'Ad={type:"local",name:"add-dir",description:"Add a new working directory",argumentHint:"<path>"},'
+               b'Fn={type:"local",name:"function",get description(){return q}}')
+
+    def test_reads_names_hints_and_descriptions(self):
+        found = app.scan_commands(self.PROGRAM)
+        self.assertEqual(found["theme"], ("", "Change the theme", False))
+        self.assertEqual(found["add-dir"], ("<path>", "Add a new working directory", False))
+        self.assertEqual(found["remote-control"], ("", "", False))  # Worked out while running.
+        self.assertEqual(found["init"][1], "")  # Not taken from the next command along.
+        self.assertTrue(found["heapdump"][2])
+
+    def test_merges_with_the_apps_own_list(self):
+        saved = app.installed_commands
+        try:
+            scanned = app.scan_commands(self.PROGRAM)
+            scanned.update({f"extra-{n}": ("", f"Extra {n}", False) for n in range(20)})
+            app.installed_commands = lambda: scanned
+            commands = {name: (hint, text) for name, hint, text in app.builtin_commands()}
+        finally:
+            app.installed_commands = saved
+        self.assertEqual(commands["theme"], ("", "Change the theme"))
+        self.assertIn("remote-control", commands)  # Described by the app's own list.
+        self.assertEqual(commands["init"][1], dict((n, t) for n, _, t in app.BUILTIN_COMMANDS)["init"])
+        self.assertNotIn("heapdump", commands)
+        self.assertNotIn("function", commands)  # Nothing describes it, so it may not be a command.
+        self.assertIn("compact", commands)  # Kept from the app's list though the scan missed it.
+
+    def test_falls_back_when_it_cant_be_read(self):
+        saved = app.installed_commands
+        try:
+            app.installed_commands = lambda: None
+            self.assertEqual(app.builtin_commands(), app.BUILTIN_COMMANDS)
+        finally:
+            app.installed_commands = saved
+
+
 if __name__ == "__main__":
     unittest.main()
