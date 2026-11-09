@@ -4638,6 +4638,12 @@ html:has(#hist[open]){overflow:hidden}
 .devprint{display:block;white-space:pre-line;font-size:12px;color:var(--text);overflow-wrap:anywhere;background:linear-gradient(90deg,#5fd38d40 var(--done,0%),transparent 0);border-radius:3px;padding:2px 6px}
 .devprint[hidden]{display:none}
 #histDevices .devprint{position:absolute;left:0;right:0;top:0;border-radius:0;padding:6px 10px;background:linear-gradient(90deg,#5fd38d55 var(--done,0%),#000b 0)}
+/* In the narrow layout the picture is small, so the print details go underneath it instead of over it. */
+@media(max-width:900px){
+ #histDevices .dev{display:flex;flex-direction:column}
+ #histDevices .dev img{position:static;flex:1 1 0;height:auto}
+ #histDevices .devprint{position:static;flex:none;background:linear-gradient(90deg,#5fd38d40 var(--done,0%),var(--card) 0)}
+}
 #printerList li.printshare{display:grid;justify-items:start;gap:6px;margin:4px 0 10px 0;padding:8px;border:1px solid var(--line);border-radius:4px}
 .printshare .qr{width:160px;background:#fff;padding:6px;border-radius:4px}.printshare .qr svg{display:block;width:100%;height:auto}
 .printshare code{overflow-wrap:anywhere}
