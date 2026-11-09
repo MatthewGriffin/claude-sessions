@@ -284,7 +284,9 @@ class BuiltUpdateTests(unittest.TestCase):
         with open(os.path.join(tools, "claude.cmd"), "w") as handle:
             handle.write("@echo []\n")
         environment.update(CLAUDE_CONFIG_DIR=self.config, CLAUDE_SESSIONS_RELEASES_URL=self.base + "/latest",
-                           CLAUDE_SESSIONS_NO_INSTALL="1", PATH=tools + os.pathsep + environment.get("PATH", ""))
+                           CLAUDE_SESSIONS_NO_INSTALL="1", PATH=tools + os.pathsep + environment.get("PATH", ""),
+                           # Its own session host port: the terminal tests' host may still hold theirs.
+                           CLAUDE_SESSIONS_HOST_PORT=str(23000 + secrets.randbelow(2000)))
         started = time.time()
         subprocess.run([self.program, "--statusline"], input=b"{}", env=environment, capture_output=True, timeout=60)
         print(f"\n  one status line run took {time.time() - started:.1f} s", file=sys.stderr)
