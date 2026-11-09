@@ -169,6 +169,17 @@ class UpdateTests(unittest.TestCase):
         with open(self.installed, encoding="utf-8") as handle:
             self.assertIn('APP_VERSION = "1.2.0"', handle.read())
 
+    def test_prefers_the_file_named_with_its_version(self):
+        self.publish("1.2.0", b"plain")
+        versioned = self.old.versioned_asset("1.2.0")
+        listing = json.loads(self.files["/latest"])
+        listing["assets"].append({"name": versioned, "browser_download_url": self.base + "/versioned"})
+        self.files["/latest"] = json.dumps(listing).encode()
+        self.old.releases.check()
+        self.assertTrue(self.old.releases.latest["url"].endswith("/versioned"))
+        if WINDOWS:
+            self.assertEqual(versioned, "claude-sessions-windows-1.2.0.exe")
+
     def test_no_offer_for_the_same_or_an_older_version(self):
         for version in ("1.0.0", "0.9.9"):
             self.publish(version, self.stamped(version).encode())
@@ -241,10 +252,11 @@ class BuiltUpdateTests(unittest.TestCase):
         shutil.rmtree(self.folder, ignore_errors=True)
 
     def publish(self, version):
+        name = f"claude-sessions-windows-{version}.exe"
         self.files["/asset"] = self.body
-        self.files["/sums"] = f"{hashlib.sha256(self.body).hexdigest()}  claude-sessions-windows.exe\n".encode()
+        self.files["/sums"] = f"{hashlib.sha256(self.body).hexdigest()}  {name}\n".encode()
         self.files["/latest"] = json.dumps({"tag_name": "v" + version, "html_url": self.base + "/page", "assets": [
-            {"name": "claude-sessions-windows.exe", "browser_download_url": self.base + "/asset"},
+            {"name": name, "browser_download_url": self.base + "/asset"},
             {"name": "SHA256SUMS", "browser_download_url": self.base + "/sums"}]}).encode()
 
     def request(self, path, body=None):
@@ -266,8 +278,16 @@ class BuiltUpdateTests(unittest.TestCase):
     def test_updates_and_restarts(self):
         # Like a real start from the Start menu: none of PyInstaller's variables in the environment.
         environment = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_") and k != "_MEIPASS2"}
+        # The app won't start without Claude Code, so a stand-in that lists no sessions.
+        tools = os.path.join(self.folder, "tools")
+        os.makedirs(tools)
+        with open(os.path.join(tools, "claude.cmd"), "w") as handle:
+            handle.write("@echo []\n")
         environment.update(CLAUDE_CONFIG_DIR=self.config, CLAUDE_SESSIONS_RELEASES_URL=self.base + "/latest",
-                           CLAUDE_SESSIONS_NO_INSTALL="1")
+                           CLAUDE_SESSIONS_NO_INSTALL="1", PATH=tools + os.pathsep + environment.get("PATH", ""))
+        started = time.time()
+        subprocess.run([self.program, "--statusline"], input=b"{}", env=environment, capture_output=True, timeout=60)
+        print(f"\n  one status line run took {time.time() - started:.1f} s", file=sys.stderr)
         self.publish("998.0.0")
         first = subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
         self.assertTrue(wait_for(self.answers, 60), "the program didn't start")

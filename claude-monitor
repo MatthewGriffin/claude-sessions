@@ -4179,6 +4179,12 @@ def restart_app(monitor, request):
     return True, "Restarting."
 
 
+def versioned_asset(version):
+    """The release file carrying its version in its name ("claude-sessions-windows-1.2.3.exe")."""
+    stem, dot, extension = RELEASE_ASSET.rpartition(".") if WINDOWS else (RELEASE_ASSET, "", "")
+    return f"{stem}-{version}{dot}{extension}"
+
+
 def version_tuple(text):
     match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(text or "").strip())
     return tuple(int(n) for n in match.groups()) if match else None
@@ -4208,8 +4214,9 @@ class Releases:
         release = json.loads(fetch(RELEASES_URL, 1024 * 1024))
         assets = {a.get("name"): a.get("browser_download_url") for a in release.get("assets", []) if isinstance(a, dict)}
         version = str(release.get("tag_name", "")).lstrip("v")
-        if version_tuple(version) and assets.get(RELEASE_ASSET) and assets.get("SHA256SUMS"):
-            self.latest = {"version": version, "url": assets[RELEASE_ASSET], "sums": assets["SHA256SUMS"],
+        name = versioned_asset(version) if assets.get(versioned_asset(version)) else RELEASE_ASSET
+        if version_tuple(version) and assets.get(name) and assets.get("SHA256SUMS"):
+            self.latest = {"version": version, "url": assets[name], "sums": assets["SHA256SUMS"], "asset": name,
                            "page": str(release.get("html_url", ""))}
 
     def watch(self):
@@ -4239,7 +4246,7 @@ class Releases:
             for line in fetch(latest["sums"], 64 * 1024).decode(errors="replace").splitlines():
                 digest, _, name = line.strip().partition(" ")
                 sums[name.strip().lstrip("*")] = digest.lower()
-            expected = sums.get(RELEASE_ASSET)
+            expected = sums.get(latest.get("asset", RELEASE_ASSET))
             if not expected:
                 return False, "The release has no checksum for this app, so it wasn't installed."
             data = fetch(latest["url"], MAX_DOWNLOAD_BYTES, timeout=300)
@@ -7127,8 +7134,24 @@ def install_windows():
     return True
 
 
+def forget_pyinstaller_environment():
+    """Make whatever this program starts an independent program.
+
+    The Windows build is a PyInstaller one-file program. Its bootloader leaves _PYI_* variables
+    for its own helper processes, and anything started with them believes it is one: a restart
+    after an update, the session host, and every hook and status line run by Claude Code in a
+    session it hosts. Those then use this copy's unpacked files, which go when it exits, and
+    after an update they read the new file with the old one's layout ("Could not load
+    PyInstaller's embedded PKG archive").
+    """
+    for name in [n for n in os.environ if n.upper().startswith("_PYI_") or n.upper() == "_MEIPASS2"]:
+        del os.environ[name]
+
+
 def main():
     global wait_for_port
+    if FROZEN:
+        forget_pyinstaller_environment()
     if sys.stdout is None:  # The Windows build has no console.
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
