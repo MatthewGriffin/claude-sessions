@@ -593,6 +593,22 @@ class PrinterTests(unittest.TestCase):
         self.assertEqual([l["id"] for l in monitor.linked_devices(sessions)[0]["sessions"]], ["a"])
 
 
+class QuestionTests(unittest.TestCase):
+    """A question Claude asks shows in the chat with its options, and then the answers given."""
+
+    def test_questions_and_answers(self):
+        asked = app.asked_questions({"questions": [
+            {"question": "Which colour?", "header": "Colour", "options": [{"label": "Red"}, {"label": "Blue"}]},
+            {"question": "Which size?", "header": "Size", "multiSelect": True, "options": [{"label": "S"}, {"label": "L"}]}]})
+        self.assertEqual(asked[0], {"header": "Colour", "question": "Which colour?", "options": ["Red", "Blue"], "multi": False})
+        self.assertTrue(asked[1]["multi"])
+        self.assertEqual(app.given_answers(asked, {"answers": {"Which colour?": "Blue", "Which size?": "S, L"}}, "", False), {"list": ["Blue", "S, L"]})
+        # Without the structured result, the answers are read from the text.
+        text = 'User has answered your questions: "Which colour?"="Green, please", "Which size?"="L".'
+        self.assertEqual(app.given_answers(asked, None, text, False), {"list": ["Green, please", "L"]})
+        self.assertEqual(app.given_answers(asked, None, "The user declined to answer.", True)["note"], "Not answered: The user declined to answer.")
+
+
 class PortTests(unittest.TestCase):
     """Another program on the app's port: the app moves to the next one, not open that program's page."""
 

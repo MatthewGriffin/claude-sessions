@@ -2050,6 +2050,32 @@ def read_attention(session):
     }
 
 
+def asked_questions(tool_input):
+    """The questions of an AskUserQuestion call: [{"header", "question", "options"}]."""
+    asked = []
+    for item in (tool_input or {}).get("questions") or []:
+        if isinstance(item, dict):
+            options = [clean(str(o.get("label", ""))) for o in item.get("options") or [] if isinstance(o, dict)]
+            asked.append({"header": clean(str(item.get("header", "")))[:60], "question": history_text(item.get("question", ""), 2000),
+                          "options": [o for o in options if o][:10], "multi": bool(item.get("multiSelect"))})
+    return asked[:6]
+
+
+def given_answers(asked, result, text, failed):
+    """The user's answer to each question, in order, or a note when none was given."""
+    answers = (result or {}).get("answers") if isinstance((result or {}).get("answers"), dict) else {}
+    found = []
+    for item in asked:
+        answer = answers.get(item["question"])
+        if answer is None:  # Older results only say it in text: "question"="answer".
+            match = re.search(re.escape(json.dumps(item["question"])[1:-1]) + r'"="((?:[^"\\]|\\.)*)"', text)
+            answer = match.group(1) if match else None
+        found.append(history_text(answer if not isinstance(answer, list) else ", ".join(map(str, answer)), 4000) if answer is not None else None)
+    if not any(a is not None for a in found):
+        return {"note": "Not answered" + (": " + history_text(text, 300) if failed and text else ".")}
+    return {"list": found}
+
+
 PASTED_CONTENT = re.compile(r'<pasted_content id="([^"]*)">\n?(.*?)\n?</pasted_content(?: id="\1")?>', re.S)
 PASTE_LINES, PASTE_CHARS = 4, 800  # Claude Code folds a paste this long into "[Pasted text]", and so does the page.
 
@@ -2453,6 +2479,8 @@ class HistoryReader:
             "pending": True,
             "starts_agent": starts_agent,
         })
+        if name == "AskUserQuestion":
+            message["question"] = asked_questions(block.get("input"))  # Shown as chat, not as a tool.
         self.tools[block.get("id")] = {"message": message, "use_at": position, "result_at": None}
         command = str((block.get("input") or {}).get("command", "")) if name == "Bash" else ""
         sent = shell_requests(command) if command else []
@@ -2470,6 +2498,8 @@ class HistoryReader:
         message["error"] = bool(block.get("is_error"))
         message["images"] = len(images)
         message["more"] = message["more"] or len(text) > HISTORY_TOOL_TEXT or bool(images)
+        if "question" in message:
+            message["answers"] = given_answers(message["question"], entry.get("toolUseResult"), text, message["error"])
         note_file_change(self.turn["files"], entry.get("toolUseResult"))
 
     def request_list(self):
@@ -4683,6 +4713,8 @@ button.deny{color:var(--bad)}
 .msg{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
 .msg b{display:block;font-size:12px;color:var(--dim)}
 .msg.you{background:#23304a;border-radius:4px;padding:8px 10px}
+.qa{display:grid;gap:8px}.qitem+.qitem{margin-top:8px}.qtext{white-space:pre-wrap}
+.qopts,.qwait{color:var(--dim);font-size:12px;margin-top:2px}.qhead{color:var(--dim)}
 .msg details.paste{margin:6px 0;border-left:2px solid var(--line);padding-left:8px;white-space:normal}
 .msg details.paste summary{cursor:pointer;font-size:12px;color:var(--dim)}
 .msg details.paste pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0 0;max-height:60vh;overflow:auto;font-size:12px}
@@ -5572,7 +5604,27 @@ function renderLive(s,live){
   ...tasks.map(t=>el('div','',null,'Background: '+t.description+(t.running!==null?' · running for '+age(t.running):''))));
  if(atEnd)output.scrollTop=output.scrollHeight;
 }
+function questionRow(m){
+ // A question Claude asked, and the answers given, as chat rather than a tool call.
+ const box=el('div','qa'),q=el('div','msg claude',box);
+ el('b','',q,'Claude asked');
+ for(const item of m.question){
+  const d=el('div','qitem',q);
+  el('div','qtext',d,item.question);
+  if(item.options.length)el('div','qopts',d,(item.multi?'Pick any: ':'Options: ')+item.options.join(' \u00b7 '));
+ }
+ if(!m.answers){if(m.pending)el('div','qwait',q,'Waiting for your answer\u2026');return box}
+ const a=el('div','msg you',box);el('b','',a,'You answered');
+ if(m.answers.note){el('div','',a,m.answers.note);return box}
+ m.answers.list.forEach((answer,i)=>{
+  const item=m.question[i],line=el('div','',a);
+  if(m.question.length>1&&item)el('span','qhead',line,(item.header||'Question '+(i+1))+': ');
+  line.append(answer==null?'(no answer)':answer);
+ });
+ return box;
+}
 function messageRow(m,open,agent,openSet){
+ if(m.role==='tool'&&m.question&&m.question.length)return questionRow(m);
  if(m.role==='tool')return toolRow(m,open,agent);
  if(m.role==='thinking'){
   const d=el('details','thinking');d.dataset.seq=m.seq;d.open=open;
