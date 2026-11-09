@@ -4363,50 +4363,6 @@ def stage_installer(data, name):
     raise OSError(f"couldn't save the new version in {folder}")
 
 
-def move_aside(path):
-    """Move a program that may be running out of the way, as Windows can't overwrite it. Returns its new name.
-
-    The session host and Claude Code's hooks can still be running from the copy an earlier update
-    moved aside, so that name may be taken and impossible to delete: then a new one is used.
-    """
-    with contextlib.suppress(OSError):
-        os.unlink(path + ".old")
-    names = [path + ".old"] + [f"{path}.{secrets.token_hex(4)}.old" for _ in range(3)]
-    for attempt, name in enumerate(names):
-        try:
-            os.replace(path, name)
-            return name
-        except OSError:
-            if attempt == len(names) - 1:
-                raise
-            time.sleep(0.5)  # Antivirus may be holding it for a moment.
-
-
-def replace_running_program(new, path):
-    """Put the file `new` in place of the (running) program at `path`, keeping the old one if that fails."""
-    previous = move_aside(path)
-    for attempt in range(10):
-        try:
-            os.replace(new, path)
-            return
-        except OSError:
-            if attempt == 9:
-                with contextlib.suppress(OSError):
-                    os.replace(previous, path)
-                raise
-            time.sleep(1)  # Antivirus often holds a program it has just seen written.
-
-
-def remove_old_copies(path):
-    """Copies an update moved aside, once nothing runs from them any more."""
-    folder, name = os.path.split(path)
-    with contextlib.suppress(OSError):
-        for entry in os.listdir(folder):
-            if entry.startswith(name + ".") and (entry.endswith(".old") or entry.endswith(".download")):
-                with contextlib.suppress(OSError):
-                    os.unlink(os.path.join(folder, entry))
-
-
 def version_tuple(text):
     match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(text or "").strip())
     return tuple(int(n) for n in match.groups()) if match else None
@@ -7303,7 +7259,75 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
 
 HOOK_EVENTS = ("PermissionRequest", "Notification", "Stop", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "SessionEnd")
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+# Where versions before 0.1.25 copied themselves to, as claude-sessions.exe. Now each version runs as downloaded.
 WINDOWS_INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Claude Sessions")
+WINDOWS_BUILD_NAME = re.compile(r"^claude-sessions-windows-(\d+\.\d+\.\d+)(?:-[0-9a-f]+)?\.exe$", re.I)
+
+
+def start_menu_shortcut():
+    """Point the Start menu's Claude Sessions at this copy, which changes name with each version."""
+    script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
+              "[Environment]::GetFolderPath('Programs')+'\\Claude Sessions.lnk');"
+              "if($s.TargetPath -ne $env:CS_TARGET){$s.TargetPath=$env:CS_TARGET;$s.Arguments='--app';"
+              "$s.WorkingDirectory=$env:CS_DIR;$s.Description='Watch and start your Claude Code sessions';$s.Save()}")
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], timeout=30, capture_output=True,
+                       env={**os.environ, "CS_TARGET": PROGRAM_PATH, "CS_DIR": os.path.dirname(PROGRAM_PATH)},
+                       creationflags=0x08000000)  # CREATE_NO_WINDOW
+
+
+def older_windows_builds():
+    """Earlier versions of this program: beside it (named with their version), and the old claude-sessions.exe install."""
+    mine = os.path.normcase(os.path.abspath(PROGRAM_PATH))
+    found = []
+    for folder in {os.path.dirname(PROGRAM_PATH), installers_dir()}:
+        with contextlib.suppress(OSError):
+            for name in os.listdir(folder):
+                path = os.path.join(folder, name)
+                match = WINDOWS_BUILD_NAME.match(name)
+                if os.path.normcase(os.path.abspath(path)) == mine:
+                    continue
+                newer = match and version_tuple(APP_VERSION) and version_tuple(match.group(1)) > version_tuple(APP_VERSION)
+                if (match and not newer) or (name.startswith("claude-sessions-windows-") and name.endswith(".download")):
+                    found.append(path)
+    if os.environ.get("LOCALAPPDATA") and not mine.startswith(os.path.normcase(WINDOWS_INSTALL_DIR)):
+        with contextlib.suppress(OSError):
+            found += [os.path.join(WINDOWS_INSTALL_DIR, n) for n in os.listdir(WINDOWS_INSTALL_DIR)
+                      if n.lower().startswith("claude-sessions.exe")]
+    return found
+
+
+def tidy_windows(monitor):
+    """Start menu, then delete earlier versions once nothing needs them.
+
+    Claude Code sessions keep calling the hook commands they started with, which name the version
+    that was running then. So an earlier version goes only when every running session started after
+    this one was saved, and when nothing runs from it any more (Windows won't delete it before).
+    """
+    if os.environ.get("CLAUDE_SESSIONS_NO_INSTALL"):
+        return
+    start_menu_shortcut()
+    for wait in [5] * 12 + [600] * 1000:
+        time.sleep(wait)
+        try:
+            saved = os.path.getmtime(PROGRAM_PATH)
+        except OSError:
+            return
+        with monitor.lock:
+            sessions = list(monitor.sessions)
+        if any((s.get("startedAt") or 0) / 1000 < saved for s in sessions):
+            continue
+        left = []
+        for path in older_windows_builds():
+            try:
+                os.unlink(path)
+            except OSError:
+                left.append(path)  # Still running: the session host, or a hook right now.
+        with contextlib.suppress(OSError):
+            if os.path.isdir(WINDOWS_INSTALL_DIR) and not os.listdir(WINDOWS_INSTALL_DIR):
+                os.rmdir(WINDOWS_INSTALL_DIR)
+        if not left:
+            return
 
 
 def command_line(arguments):
@@ -7345,6 +7369,11 @@ def run_setup(verbose=True):
     hook = own_command_line("--hook")
     hooks = settings.setdefault("hooks", {})
     added = []
+    if FROZEN:
+        # Each Windows version has its own file name, so commands naming an earlier one move to this one.
+        moved = point_commands_here(settings)
+        if moved:
+            added.append(f"{moved} command{'s' if moved > 1 else ''} moved to this version")
     for event in HOOK_EVENTS:
         groups = hooks.setdefault(event, [])
         commands = [h.get("command", "") for g in groups if isinstance(g, dict) for h in g.get("hooks", []) if isinstance(h, dict)]
@@ -7394,6 +7423,31 @@ def run_setup(verbose=True):
     return 0
 
 
+OWN_FLAGS = ("--hook", "--context", "--statusline")
+
+
+def point_commands_here(settings):
+    """Make this app's hook and status line commands run this copy. Returns how many changed."""
+    changed = 0
+
+    def fixed(entry):
+        nonlocal changed
+        command = entry.get("command") if isinstance(entry, dict) else None
+        if not isinstance(command, str) or not ("claude-sessions" in command or "claude-monitor" in command):
+            return
+        flag = next((f for f in OWN_FLAGS if command.rstrip().endswith(f)), None)
+        if flag and command != own_command_line(flag):
+            entry["command"] = own_command_line(flag)
+            changed += 1
+
+    for groups in (settings.get("hooks") or {}).values():
+        for group in groups if isinstance(groups, list) else []:
+            for entry in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                fixed(entry)
+    fixed(settings.get("statusLine"))
+    return changed
+
+
 def run_statusline():
     """A status line for Claude Code that also saves the figures this app shows. Used when there was none."""
     try:
@@ -7416,38 +7470,6 @@ def run_statusline():
             parts.append(f"{label} left {100 - used:.0f}%")
     print(" | ".join(parts))
     return 0
-
-
-def install_windows():
-    """Run from wherever it was downloaded to, the Windows build copies itself into the user's programs
-    folder, where it can update itself, adds itself to the Start menu and starts from there.
-    Returns True if this copy should stop because the installed one has taken over."""
-    if not WINDOWS or not FROZEN or not os.environ.get("LOCALAPPDATA") or os.environ.get("CLAUDE_SESSIONS_NO_INSTALL"):
-        return False
-    target = os.path.join(WINDOWS_INSTALL_DIR, "claude-sessions.exe")
-    if os.path.normcase(os.path.abspath(PROGRAM_PATH)) == os.path.normcase(target):
-        return False
-    try:
-        os.makedirs(WINDOWS_INSTALL_DIR, exist_ok=True)
-        temporary = f"{target}.{secrets.token_hex(4)}.download"  # A fresh name: an old one may be held open.
-        shutil.copyfile(PROGRAM_PATH, temporary)
-        if os.path.exists(target):
-            replace_running_program(temporary, target)  # It may be running.
-        else:
-            os.replace(temporary, target)
-    except OSError:
-        with contextlib.suppress(OSError, UnboundLocalError):
-            os.unlink(temporary)
-        return False  # Carry on from here instead.
-    script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
-              "[Environment]::GetFolderPath('Programs')+'\\Claude Sessions.lnk');"
-              "$s.TargetPath=$env:CS_TARGET;$s.Arguments='--app';$s.WorkingDirectory=$env:CS_DIR;"
-              "$s.Description='Watch and start your Claude Code sessions';$s.Save()")
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], timeout=30,
-                       env={**os.environ, "CS_TARGET": target, "CS_DIR": WINDOWS_INSTALL_DIR}, capture_output=True)
-    subprocess.Popen([target, *sys.argv[1:]], close_fds=True)
-    return True
 
 
 def forget_pyinstaller_environment():
@@ -7502,12 +7524,8 @@ def main():
     if args.session_host:
         return run_session_host()
     wait_for_port = args.wait_for_port
-    if WINDOWS:
-        remove_old_copies(PROGRAM_PATH)  # Left behind by updates.
-        if FROZEN and not (args.web or args.once):
-            args.app = True  # There is no terminal view in the Windows build.
-        if install_windows():
-            return 0
+    if WINDOWS and FROZEN and not (args.web or args.once):
+        args.app = True  # There is no terminal view in the Windows build.
     # Menu launchers don't always inherit the terminal's PATH.
     os.environ["PATH"] += os.pathsep + os.path.expanduser("~/.local/bin")
     if WINDOWS:
@@ -7521,6 +7539,8 @@ def main():
     if args.app:
         run_setup(verbose=False)
     monitor = Monitor()
+    if WINDOWS and FROZEN:
+        threading.Thread(target=tidy_windows, args=(monitor,), daemon=True).start()
     if args.app:
         return run_app(monitor, args.port or APP_PORT, args.browser_pid, args.port is not None)
     if args.web:

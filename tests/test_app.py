@@ -302,18 +302,14 @@ class BuiltUpdateTests(unittest.TestCase):
                            # Its own session host port: the terminal tests' host may still hold theirs.
                            CLAUDE_SESSIONS_HOST_PORT=str(23000 + secrets.randbelow(2000)))
         environment.pop("CLAUDE_SESSIONS_NO_INSTALL", None)
-        installed = os.path.join(local, "Programs", "Claude Sessions", "claude-sessions.exe")
         started = time.time()
         subprocess.run([self.program, "--statusline"], input=b"{}", env=environment, capture_output=True, timeout=60)
         print(f"\n  one status line run took {time.time() - started:.1f} s", file=sys.stderr)
         self.publish("998.0.0")
-        # Started from where it was downloaded, it installs itself and starts from there.
-        subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
+        first = subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
         self.assertTrue(wait_for(self.answers, 60), "the program didn't start")
-        self.assertTrue(os.path.exists(installed), "it didn't install itself")
-        # A session host running from the installed program keeps running from the copy each update moves
-        # aside, as it does for real while sessions run.
-        host = subprocess.Popen([installed, "--session-host"], env=environment)
+        # A session host keeps running from the program it started from, as it does while sessions run.
+        host = subprocess.Popen([self.program, "--session-host"], env=environment)
         time.sleep(5)
         self.assertIsNone(host.poll(), "the session host didn't keep running")
         for attempt in ("first", "second"):
@@ -325,17 +321,14 @@ class BuiltUpdateTests(unittest.TestCase):
             self.assertEqual(status, 200, reply)
             time.sleep(3)
             self.assertTrue(wait_for(self.answers, 60), f"the program didn't come back after the {attempt} update")
-            self.assertIn("claude-sessions-windows-998.0.0.exe", os.listdir(installers), "the update wasn't saved as an installer")
+        self.assertIsNotNone(first.poll(), "the first copy should have handed over and exited")
         self.assertIsNone(host.poll(), "the session host should have kept running through both updates")
+        # The second update saved beside the running first one; once it has exited, only the newest is kept.
+        builds = lambda: sorted(n for n in os.listdir(installers) if n.startswith("claude-sessions-windows-"))  # noqa: E731
+        self.assertTrue(wait_for(lambda: len(builds()) == 1, 60), builds())
+        self.assertFalse(os.path.exists(os.path.join(local, "Programs", "Claude Sessions", "claude-sessions.exe")))
+        self.assertTrue(os.path.exists(self.program), "a program not named like a release is left alone")
         host.kill()
-        self.stop_programs()
-        time.sleep(2)
-        # Started again with nothing running from them, the program clears the copies updates moved aside.
-        later = subprocess.Popen([installed, "--web", "--no-open", "--port", str(self.port)], env=environment)
-        self.assertTrue(wait_for(self.answers, 60), "the program didn't start again")
-        left = [n for n in os.listdir(os.path.dirname(installed)) if n.endswith(".old") or n.endswith(".download")]
-        self.assertEqual(left, [])
-        later.kill()
 
 
 class PrinterControlTests(unittest.TestCase):
@@ -382,6 +375,47 @@ class PrinterControlTests(unittest.TestCase):
         self.assertEqual((camera.status["light"], camera.status["fan"]), (True, 30))
         camera._take_report(b"x/info/report", json.dumps({"data": {"state": "busy", "project": {"task_id": 77, "filename": "a.gcode"}}}).encode())
         self.assertEqual((camera.status["state"], camera.status["task"]), ("printing", "77"))
+
+
+class WindowsVersionTests(unittest.TestCase):
+    """Each Windows version runs as downloaded: settings follow it, and earlier versions go."""
+
+    def test_commands_move_to_this_copy(self):
+        settings = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": '"C:/old/claude-sessions-windows-0.1.1.exe" --hook'}]}],
+                              "UserPromptSubmit": [{"hooks": [{"type": "command", "command": '"C:/old/claude-sessions.exe" --context'},
+                                                              {"type": "command", "command": "other-tool --hook"}]}]},
+                    "statusLine": {"type": "command", "command": "bash ~/.claude/statusline-command.sh"}}
+        self.assertEqual(app.point_commands_here(settings), 2)
+        self.assertEqual(settings["hooks"]["Stop"][0]["hooks"][0]["command"], app.own_command_line("--hook"))
+        self.assertEqual(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"], app.own_command_line("--context"))
+        self.assertEqual(settings["hooks"]["UserPromptSubmit"][0]["hooks"][1]["command"], "other-tool --hook")
+        self.assertEqual(settings["statusLine"]["command"], "bash ~/.claude/statusline-command.sh")
+        self.assertEqual(app.point_commands_here(settings), 0)
+
+    def test_finds_earlier_versions_only(self):
+        folder = tempfile.mkdtemp(dir=CONFIG)
+        local = os.path.join(folder, "local")
+        os.makedirs(local)
+        names = ["claude-sessions-windows-1.1.0.exe", "claude-sessions-windows-1.2.0.exe", "claude-sessions-windows-1.2.0-abc123.exe",
+                 "claude-sessions-windows-1.3.0.exe", "claude-sessions-windows-1.2.0.exe.1a2b.download", "notes.txt", "other.exe"]
+        for name in names:
+            open(os.path.join(folder, name), "w").close()
+        for name in ("claude-sessions.exe", "claude-sessions.exe.old", "readme.txt"):
+            open(os.path.join(local, name), "w").close()
+        saved = app.PROGRAM_PATH, app.APP_VERSION, app.WINDOWS_INSTALL_DIR, os.environ.get("CLAUDE_SESSIONS_INSTALLERS_DIR"), os.environ.get("LOCALAPPDATA")
+        try:
+            app.PROGRAM_PATH, app.APP_VERSION, app.WINDOWS_INSTALL_DIR = os.path.join(folder, names[2]), "1.2.0", local
+            os.environ["CLAUDE_SESSIONS_INSTALLERS_DIR"], os.environ["LOCALAPPDATA"] = folder, folder
+            found = sorted(os.path.basename(p) for p in app.older_windows_builds())
+        finally:
+            app.PROGRAM_PATH, app.APP_VERSION, app.WINDOWS_INSTALL_DIR = saved[:3]
+            for key, value in (("CLAUDE_SESSIONS_INSTALLERS_DIR", saved[3]), ("LOCALAPPDATA", saved[4])):
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(found, sorted(["claude-sessions-windows-1.1.0.exe", "claude-sessions-windows-1.2.0.exe",
+                                        "claude-sessions-windows-1.2.0.exe.1a2b.download", "claude-sessions.exe", "claude-sessions.exe.old"]))
 
 
 class SetupTests(unittest.TestCase):

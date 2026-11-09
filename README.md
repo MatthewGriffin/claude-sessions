@@ -31,9 +31,13 @@ about it the first time a preview is linked to its session.
 
 Needs Claude Code's native install (`claude.exe`) and Microsoft Edge, Chrome or Brave.
 
-Download [`claude-sessions-windows.exe`](https://github.com/MatthewGriffin/claude-sessions/releases/latest/download/claude-sessions-windows.exe)
-and open it. It copies itself to `%LOCALAPPDATA%\Programs\Claude Sessions`, adds **Claude Sessions** to the
-Start menu, sets up Claude Code's hooks and opens.
+Download `claude-sessions-windows-<version>.exe` from the [latest release](https://github.com/MatthewGriffin/claude-sessions/releases/latest)
+and open it. It runs from where it is, adds **Claude Sessions** to the Start menu, sets up Claude Code's
+hooks and opens.
+
+**Update** saves the new version beside it (or in `C:\installers`, if that folder exists, for workplaces
+that only allow programs from there) and runs it. The new version points the Start menu and Claude Code's
+hooks at itself, and deletes earlier versions once no session started before the update is still running.
 
 Windows has no tmux, so sessions started from the app run in a small background session host
 (the same program, with `--session-host`), which keeps them going while the app restarts or updates.
