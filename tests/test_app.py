@@ -8,6 +8,7 @@ session host is then the one tested.
 """
 import contextlib
 import hashlib
+import http.client
 import http.server
 import importlib.machinery
 import importlib.util
@@ -1130,6 +1131,25 @@ class PortTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return server.server_address[1]
+
+    def test_a_reopened_window_gets_a_single_use_code(self):
+        port = 21000 + secrets.randbelow(4000)
+        threading.Thread(target=app.run_web, args=(None, port, False), kwargs={"fixed_port": True}, daemon=True).start()
+        self.assertTrue(wait_for(lambda: app.app_answers(port), 10))
+        token = app.access_token()
+
+        def sign_in(code):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            connection.request("GET", "/?t=" + code)
+            response = connection.getresponse()
+            response.read()
+            return response.status
+
+        code = app.window_code(port, token)
+        self.assertTrue(code)
+        self.assertEqual(sign_in(code), 302)
+        self.assertEqual(sign_in(code), 403)  # Used up.
+        self.assertIsNone(app.window_code(port, "not the token"))
 
     def test_moves_past_another_program(self):
         taken = self.foreign_server()

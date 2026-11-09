@@ -4724,6 +4724,22 @@ def ask_running_app(path, timeout):
     return None
 
 
+def window_code(port, token):
+    """A single-use sign-in code for a new app window, from the copy of this app running on the port."""
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("POST", "/api/window-code", body=b"{}", headers={
+            "Cookie": f"monitor_token={token}", "Origin": f"http://127.0.0.1:{port}", "Host": f"127.0.0.1:{port}",
+            "Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = response.read(4096)
+        connection.close()
+        code = json.loads(body).get("code") if response.status == 200 else None
+        return code if isinstance(code, str) and code else None
+    except (OSError, http.client.HTTPException, ValueError, AttributeError):
+        return None
+
+
 def this_session():
     """(session id, Claude Code's pid) of the session running this command."""
     session_id, pid = os.environ.get("CLAUDE_CODE_SESSION_ID", ""), os.environ.get("CLAUDE_PID", "")
@@ -7414,6 +7430,15 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
             if not self.host_ok() or not origin_ok or not is_json or not self.authorized():
                 self.respond(403, "text/plain", b"forbidden")
                 return
+            if self.path == "/api/window-code" and not self.on_phone:
+                # Opening the app again while this copy still runs: the new window has no cookie (it went
+                # when the browser closed), so the opener, holding the token, gets it a single-use code.
+                while len(app_codes) >= 5:
+                    app_codes.pop()
+                code = secrets.token_urlsafe(32)
+                app_codes.add(code)
+                self.send_json(200, {"code": code})
+                return
             action = POST_ROUTES.get(self.path)
             if self.on_phone and action is set_phone:
                 self.respond(403, "text/plain", b"forbidden")  # Only this computer turns phone access on or off.
@@ -7461,8 +7486,13 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
     url = f"http://127.0.0.1:{port}/?t={token}"
     app_url = f"http://127.0.0.1:{port}/?t={next(iter(app_codes))}" if app_codes else ""
     if running and app_browser_command:
-        # Already open: this browser profile holds the cookie, so no code is needed.
-        return open_app_window(app_browser_command, f"http://127.0.0.1:{running}/")
+        # Already running. The window's cookie may have gone with the browser, so get a single-use code.
+        code = window_code(running, token)
+        if code:
+            return open_app_window(app_browser_command, f"http://127.0.0.1:{running}/?t={code}")
+        # A version from before window codes. The token in the window's arguments is visible to other
+        # local users while it starts, but without it the window would just say it isn't signed in.
+        return open_app_window(app_browser_command, url)
     if running:
         sys.exit(f"claude-monitor is already running. Open: {url}")
     if not server:
