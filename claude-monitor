@@ -770,6 +770,10 @@ class Monitor:
     def session_state(self, session):
         transcript = self.transcript(session)
         quiet = quiet_seconds(transcript)
+        if session.get("status") == "busy" and not transcript.pending and turn_ended(session, self.panes.get(session.get("pid"))):
+            # Claude Code stays "busy" while a background task runs, though Claude is free. Treated
+            # as busy, the session would hold every message and command until the task ended.
+            session = {**session, "status": "idle", "heldBusy": True}
         started = session.get("startedAt")
         busy = session.get("status") == "busy"
         return {
@@ -796,6 +800,7 @@ class Monitor:
             "hosted": session.get("pid") in self.panes,
             "tmux": self.panes.get(session.get("pid")),
             "attention": read_attention(session),
+            "heldBusy": bool(session.get("heldBusy")),
         }
 
     def background_state(self, session, transcript):
@@ -2028,6 +2033,33 @@ class ShareHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+def turn_ended(session, pane):
+    """Whether Claude has finished its turn although Claude Code still reports the session busy.
+
+    The Stop hook recorded the turn's end after Claude Code last changed the status, and the app's
+    own terminal shows the input box and no working line ("✻ Thinking… (12s)"). Only sessions the
+    app started can be checked like that, so only they count.
+    """
+    if not pane:
+        return False
+    try:
+        with open(os.path.join(ATTENTION_DIR, session["sessionId"] + ".json")) as handle:
+            state = json.load(handle)
+    except (OSError, ValueError, KeyError):
+        return False
+    if not isinstance(state, dict) or state.get("kind") != "done":
+        return False
+    changed = session.get("statusUpdatedAt") or session.get("updatedAt") or 0
+    if not isinstance(state.get("at"), (int, float)) or state["at"] * 1000 <= changed:
+        return False
+    return claude_is_free(session_screen(pane))
+
+
+def claude_is_free(screen):
+    """Whether the terminal shows Claude Code's input box with no working line above it."""
+    return input_box(screen) is not None and not live_activity(screen)["head"]
 
 
 def read_attention(session):
@@ -3435,9 +3467,15 @@ def type_text(target, text, pasted=()):
     return True
 
 
-def type_into(session, text, images=(), pasted=()):
+def type_into(session, text, images=(), pasted=(), in_box=None):
     """Type a message into the input box without sending it. Each picture's path is pasted on
-    its own, which is what makes Claude Code attach it as an image rather than leave it as text."""
+    its own, which is what makes Claude Code attach it as an image rather than leave it as text.
+    Text already in the box, such as a message Claude Code put back after an interrupt, stays,
+    and this starts on a new paragraph rather than running on from its last word."""
+    if in_box is None:
+        in_box = input_box(session_screen(session["tmux"]))
+    if text and in_box:
+        text = "\n\n" + text
     if text and not type_text(session["tmux"], text + ("\n" if images else ""), pasted):
         return False
     for name in images:
@@ -3476,6 +3514,39 @@ def input_box(screen):
     return None
 
 
+COMMAND_WAIT_SECONDS = 8
+
+
+def interrupt_and_type_command(session, command):
+    """Stop what Claude is doing, as Esc does, then run a slash command once the input box is free.
+
+    Typed into Claude Code's own queue instead, a command wouldn't run as one, so it waits for the
+    interrupt to land. Claude Code can put an interrupted message back in the box, and a command
+    typed after that text would just be part of a message, so it's only typed into an empty box.
+    """
+    target = session["tmux"]
+    if input_box(session_screen(target)) is None:
+        return False, "Its input box isn't showing right now, so nothing was done. Try again in a moment."
+    if not send_keys(target, "Escape"):
+        return False, "Could not reach the session."
+    deadline = time.time() + COMMAND_WAIT_SECONDS
+    while True:
+        time.sleep(0.25)
+        screen = session_screen(target)
+        if claude_is_free(screen):
+            break
+        if time.time() > deadline:
+            return False, "Claude was interrupted, but its screen didn't settle, so the command wasn't typed. It stays queued."
+    if input_box(screen):
+        return False, "Claude was interrupted, but its input box has text in it, so the command wasn't typed. Clear the box in the terminal, then try again."
+    if not type_into(session, command, in_box=""):
+        return False, "Could not type into the session."
+    if menu_options(session_screen(target)):
+        return False, "Something appeared on its screen while typing, so Enter wasn't pressed. Check the terminal."
+    send_keys(target, "Enter")
+    return True, "Sent."
+
+
 def send_queued_now(monitor, request):
     """Type a queued message into a working session's own input box, as typing in its terminal would.
 
@@ -3494,15 +3565,18 @@ def send_queued_now(monitor, request):
             return False, "That message has already been sent."
         if item.get("refresh") or item.get("retry") or item.get("guard"):
             return False, "That step only runs once the session is idle."
-        if item["text"].startswith("/"):
-            return False, "Commands only run once the session is idle, so it stays queued."
         if session["status"] == "waiting":
             return False, "It's waiting for an answer. Answer it first, then send this."
-        if session["status"] == "busy":
+        if session["status"] == "busy" and item["text"].startswith("/"):
+            ok, message = interrupt_and_type_command(session, item["text"])
+            if not ok:
+                return False, message
+            state["sent"][session["id"]] = time.time()
+        elif session["status"] == "busy":
             before = input_box(session_screen(session["tmux"]))
             if before is None:
                 return False, "Its input box isn't showing right now, so nothing was typed. Try again in a moment."
-            if not type_into(session, item["text"], item.get("images", []), item.get("pasted", [])):
+            if not type_into(session, item["text"], item.get("images", []), item.get("pasted", []), in_box=before):
                 return False, "Could not type into the session."
             time.sleep(0.1)
             after = input_box(session_screen(session["tmux"]))
@@ -5637,9 +5711,9 @@ function renderQueue(s){
    const b=el('button','primary',row,'Retry');b.type='button';
    b.addEventListener('click',()=>act('resend',{id:s.id,item:item.id}));
   }
-  if(s.status==='busy'&&!item.refresh&&!item.retry&&!item.error&&!item.text.startsWith('/')){
+  if(s.status==='busy'&&!item.refresh&&!item.retry&&!item.error){
    const b=el('button','primary',row,'Send now');b.type='button';
-   b.title='Interrupt Claude and send this now, like Ctrl+X Ctrl+S in Claude Code';
+   b.title=item.text.startsWith('/')?'Interrupt Claude, then run this command':'Interrupt Claude and send this now, like Ctrl+X Ctrl+S in Claude Code';
    b.addEventListener('click',()=>{b.disabled=true;act('sendnow',{id:s.id,item:item.id})});
   }
   if(!item.refresh)button('Remove');

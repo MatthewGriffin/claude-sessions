@@ -289,6 +289,8 @@ class BackgroundTaskTests(unittest.TestCase):
 RULE = "─" * 60
 BOX = "\n".join(["● Working on it", "", "✻ Running the tests… (1m 2s)", "", RULE + " Meal Planner ─", "❯\xa0{text}", RULE,
                   "  Opus 5.5 | Ctx 16%", "  ⏵⏵ auto mode on · 1 shell"])
+FREE = "\n".join(["● Done. The watcher is running in the background.", "", RULE + " Meal Planner ─", "❯\xa0{text}", RULE,
+                   "  Opus 5.5 | Ctx 16%", "  ⏵⏵ auto mode on · 1 shell"])
 MENU = "\n".join(["● Bash(rm -rf build)", "", " Do you want to proceed?", " ❯ 1. Yes", "   2. No", "", " Esc to cancel"])
 
 
@@ -298,8 +300,9 @@ class SendNowTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.mkdtemp(dir=CONFIG)
         self.saved = {name: getattr(app, name) for name in
-                      ("QUEUE_FILE", "MONITOR_DIR", "hosted_session", "session_screen", "paste_text", "send_keys")}
+                      ("QUEUE_FILE", "MONITOR_DIR", "ATTENTION_DIR", "hosted_session", "session_screen", "paste_text", "send_keys")}
         app.MONITOR_DIR = self.folder
+        app.ATTENTION_DIR = self.folder
         app.QUEUE_FILE = os.path.join(self.folder, "queue.json")
         self.session = {"id": "s1", "tmux": "s1", "status": "busy", "failure": None}
         app.hosted_session = lambda monitor, request: self.session
@@ -332,6 +335,46 @@ class SendNowTests(unittest.TestCase):
         self.assertEqual([i["id"] for i in self.queued()], ["b"])
         self.assertEqual(app.read_queue()["checks"]["s1"]["count"], 3)
 
+    def test_text_left_in_the_box_gets_its_own_paragraph(self):
+        # After an interrupt Claude Code puts the message back in the box, and the next one
+        # mustn't run on from it ("fix issuesBefore this chat...").
+        self.screens = [BOX.format(text="read notes and fix issues")]
+        self.assertTrue(app.type_into(self.session, "Before this chat is cleared"))
+        self.assertEqual(self.typed, ["C-j", "C-j", "Before this chat is cleared"])
+        self.typed.clear()
+        self.screens = [BOX.format(text="")]
+        self.assertTrue(app.type_into(self.session, "Before this chat is cleared"))
+        self.assertEqual(self.typed, ["Before this chat is cleared"])
+
+    def test_a_command_interrupts_claude_then_runs(self):
+        self.screens = [BOX.format(text=""), BOX.format(text=""), FREE.format(text=""), FREE.format(text="/clear")]
+        ok, message = app.send_queued_now(self.monitor, {"id": "s1", "item": "b"})
+        self.assertTrue(ok, message)
+        self.assertEqual(self.typed, ["Escape", "/clear", "Enter"])
+        self.assertEqual([i["id"] for i in self.queued()], ["a"])
+
+    def test_a_command_isnt_typed_after_text_put_back_in_the_box(self):
+        self.screens = [BOX.format(text=""), FREE.format(text="check the logs too")]
+        ok, _ = app.send_queued_now(self.monitor, {"id": "s1", "item": "b"})
+        self.assertFalse(ok)
+        self.assertEqual(self.typed, ["Escape"])
+        self.assertEqual([i["id"] for i in self.queued()], ["a", "b"])
+
+    def test_busy_only_on_background_tasks_counts_as_free(self):
+        session = {"sessionId": "s1", "status": "busy", "statusUpdatedAt": 1000_000}
+        with open(os.path.join(self.folder, "s1.json"), "w") as handle:
+            json.dump({"kind": "done", "at": 1001}, handle)  # Stop came after the status last changed.
+        self.screens = [FREE.format(text="")]
+        self.assertTrue(app.turn_ended(session, "s1"))
+        self.assertFalse(app.turn_ended(session, None))  # Not the app's own terminal, so it can't be checked.
+        self.screens = [BOX.format(text="")]
+        self.assertFalse(app.turn_ended(session, "s1"))  # Still working on screen.
+        self.screens = [FREE.format(text="")]
+        self.assertFalse(app.turn_ended({**session, "statusUpdatedAt": 1002_000}, "s1"))  # A new turn since.
+        with open(os.path.join(self.folder, "s1.json"), "w") as handle:
+            json.dump({"kind": "permission", "at": 1001}, handle)
+        self.assertFalse(app.turn_ended(session, "s1"))
+
     def test_no_enter_if_a_menu_appears_while_typing(self):
         self.screens = [BOX.format(text=""), MENU]
         ok, _ = app.send_queued_now(self.monitor, {"id": "s1", "item": "a"})
@@ -345,10 +388,10 @@ class SendNowTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(self.typed, [])
 
-    def test_refuses_commands_and_prompts(self):
-        self.assertFalse(app.send_queued_now(self.monitor, {"id": "s1", "item": "b"})[0])
+    def test_refuses_while_a_prompt_is_waiting(self):
         self.session["status"] = "waiting"
         self.assertFalse(app.send_queued_now(self.monitor, {"id": "s1", "item": "a"})[0])
+        self.assertFalse(app.send_queued_now(self.monitor, {"id": "s1", "item": "b"})[0])
         self.assertEqual(self.typed, [])
 
     def test_queued_mid_turn_counts_as_arrived(self):
