@@ -4662,7 +4662,6 @@ html:has(#hist[open]){overflow:hidden}
 #keys{display:flex;flex-wrap:wrap;gap:8px}
 button.deny{color:var(--bad)}
 #replyForm{display:flex;gap:8px;align-items:flex-end;position:relative}
-.typeanswer{display:flex;gap:6px;flex:1 1 260px;min-width:0}.typeanswer input{flex:1;min-width:0}
 #cmdList{position:absolute;left:0;right:0;bottom:100%;margin-bottom:6px;z-index:2;max-height:min(50vh,340px);overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px;display:grid;box-shadow:0 6px 20px #0008}
 .cmd{display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:2px 10px;align-items:baseline;text-align:left;border:0;border-radius:4px;background:none;padding:6px 8px;color:var(--text);min-width:0}
 .cmd[aria-selected="true"]{background:#2b2e40}
@@ -5401,12 +5400,7 @@ async function act(path,body){
  finally{await refresh();await loadHistory()}
 }
 // "Type something": a box to write the answer in, sent in place of picking one of the others.
-function typeButton(body){
- const f=el('form','typeanswer',$('keys'));
- const t=el('input','',f);t.placeholder='Type something…';t.setAttribute('aria-label','Your own answer');t.maxLength=2000;
- const b=el('button','',f,'Send answer');b.type='submit';
- f.addEventListener('submit',e=>{e.preventDefault();if(t.value.trim())act('key',{id:histSession,action:'type',text:t.value,...body})});
-}
+let answerFor=null;  // The question the reply box answers right now, if any.
 function keyButton(label,cls,body){
  const b=el('button',cls,$('keys'),label);b.type='button';
  b.addEventListener('click',()=>act('key',{id:histSession,...body}));
@@ -5493,11 +5487,15 @@ function updateFoot(s){
  $('histRefresh').textContent=refreshing.some(i=>i.error)?'Try write notes & restart again':refreshing.length?'Restarting…':'Write notes & restart';
  $('replyForm').hidden=!s.hosted;
  $('screen').hidden=!(s.hosted&&waiting);
- const sendsNow=s.status==='idle'&&!(s.queue&&s.queue.length);
- $('replySend').textContent=sendsNow?'Send':'Queue';
- $('replyText').placeholder=(sendsNow?'Reply…':waiting?'Queue a message for after you answer the prompt…':'Queue a message for when it finishes…')+' (Enter to '+(sendsNow?'send':'queue')+', Shift+Enter for a new line)';
- $('replyNote').textContent=s.hosted?'':s.job?'Started outside this app. To reply, use Open in terminal.':'Started in its own terminal. Reply there.';
  const options=waiting&&menuOptions.at===String(a.at)?menuOptions.list:[];
+ // A question that takes its own answer is answered from the reply box, not a box of its own.
+ const own=s.hosted&&!options.some(o=>o.checked!==null)&&options.find(o=>/^Type something\b/.test(o.label));
+ answerFor=own?{prompt:a.at,key:own.key,label:own.label}:null;
+ const sendsNow=s.status==='idle'&&!(s.queue&&s.queue.length);
+ $('replySend').textContent=answerFor?'Answer':sendsNow?'Send':'Queue';
+ $('replyText').placeholder=answerFor?'Type your own answer, or pick one above (Enter to answer, Shift+Enter for a new line)':
+  (sendsNow?'Reply…':waiting?'Queue a message for after you answer the prompt…':'Queue a message for when it finishes…')+' (Enter to '+(sendsNow?'send':'queue')+', Shift+Enter for a new line)';
+ $('replyNote').textContent=s.hosted?'':s.job?'Started outside this app. To reply, use Open in terminal.':'Started in its own terminal. Reply there.';
  const want=!s.hosted?'':waiting&&options.length?'menu:'+a.at+':'+JSON.stringify(options):permission?'perm:'+a.at:waiting?'wait':s.status==='busy'?'busy':'';
  if(want===keysFor)return;
  keysFor=want;$('keys').replaceChildren();
@@ -5508,7 +5506,7 @@ function updateFoot(s){
   for(const o of options){
    const [label,...more]=o.label.split(' · '),no=/^No\b/.test(label);
    const body={prompt:a.at,key:o.key,label:o.label};
-   if(/^Type something\b/.test(o.label)){if(!ticks)typeButton(body);continue}
+   if(/^Type something\b/.test(o.label)&&!ticks)continue;  // Typed in the reply box instead.
    const tick=o.checked===null?'':o.checked?'☑ ':'☐ ';
    const strong=permission?o.key==='1':/^Submit/.test(label);
    const b=keyButton(tick+label,strong?'primary':no||/^Cancel$/.test(label)?'deny':'',{action:'choose',...body});
@@ -5839,6 +5837,11 @@ $('replyForm').addEventListener('submit',async e=>{
  e.preventDefault();
  const text=$('replyText').value,images=pendingImages.map(p=>p.name),pasted=pastedTexts.filter(p=>text.includes(p));
  if(imagesLoading){$('replyErr').textContent='Still adding a picture. Send again in a moment.';return}
+ if(answerFor){
+  if(images.length){$('replyErr').textContent='Pictures can\u2019t go with an answer. Answer first, then send them.';return}
+  if(text.trim()&&await act('key',{id:histSession,action:'type',text,...answerFor})){$('replyText').value='';pastedTexts=[]}
+  return;
+ }
  if((text.trim()||images.length)&&await act('send',{id:histSession,text,images,pasted})){$('replyText').value='';pendingImages=[];pastedTexts=[];renderPending()}
 });
 // Pictures to send with the next message. Each is shrunk here, then kept by the app until it's sent.
