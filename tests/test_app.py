@@ -303,6 +303,52 @@ class BuiltUpdateTests(unittest.TestCase):
         self.assertIsNotNone(first.poll(), "the first copy should have handed over and exited")
 
 
+class PrinterControlTests(unittest.TestCase):
+    """Printer controls become the messages Anycubic's own slicer sends, and silly values are refused."""
+
+    def plan(self, control, value=None, state="idle", task=""):
+        return app.printer_plan(control, value, state in ("printing", "paused"), state, task)
+
+    def test_idle_heaters_fan_and_light(self):
+        self.assertEqual(self.plan("nozzle", 210), ([("tempature", "set", {"type": 0, "target_hotbed_temp": 0, "target_nozzle_temp": 210})], None))
+        self.assertEqual(self.plan("preheat", {"nozzle": 260, "bed": 100})[0],
+                         [("tempature", "set", {"type": 1, "target_hotbed_temp": 100, "target_nozzle_temp": 0}),
+                          ("tempature", "set", {"type": 0, "target_hotbed_temp": 0, "target_nozzle_temp": 260})])
+        self.assertEqual([m[2] for m in self.plan("cool")[0]], [{"type": 1, "target_hotbed_temp": 0, "target_nozzle_temp": 0},
+                                                                {"type": 0, "target_hotbed_temp": 0, "target_nozzle_temp": 0}])
+        self.assertEqual(self.plan("fan", 50), ([("fan", "setSpeed", {"fan_speed_pct": 50})], None))
+        self.assertEqual(self.plan("light", True), ([("light", "control", {"type": 3, "status": 1, "brightness": 100})], None))
+
+    def test_while_printing(self):
+        self.assertEqual(self.plan("bed", 95, "printing", "42"), ([("print", "update", {"taskid": "42", "settings": {"target_hotbed_temp": 95}})], None))
+        self.assertEqual(self.plan("pause", state="printing", task="42"), ([("print", "pause", {"taskid": "42"})], None))
+        self.assertEqual(self.plan("resume", state="paused", task="42"), ([("print", "resume", {"taskid": "42"})], None))
+        self.assertEqual(self.plan("stop", state="paused", task="42"), ([("print", "stop", {"taskid": "42"})], None))
+        self.assertTrue(self.plan("preheat", {"nozzle": 200, "bed": 60}, "printing", "42")[1])
+        self.assertTrue(self.plan("cool", state="printing", task="42")[1])
+
+    def test_refused(self):
+        for control, value, state in [("nozzle", 301, "idle"), ("bed", 111, "idle"), ("bed", -1, "idle"), ("nozzle", True, "idle"),
+                                      ("nozzle", "200", "idle"), ("fan", 101, "idle"), ("preheat", {"nozzle": 200}, "idle"),
+                                      ("pause", None, "idle"), ("resume", None, "printing"), ("stop", None, "idle"), ("explode", None, "idle")]:
+            plan, error = self.plan(control, value, state, "42")
+            self.assertEqual(plan, [], (control, value))
+            self.assertTrue(error, (control, value))
+
+    def test_only_saved_printers(self):
+        self.assertFalse(app.printer_control(None, {"host": "192.168.0.250", "control": "light", "value": True})[0])
+        self.assertFalse(app.printer_control(None, {"host": "8.8.8.8", "control": "light", "value": True})[0])
+
+    def test_status_keeps_the_light_and_reads_the_fan(self):
+        camera = app.PrinterCamera("192.168.0.250")
+        camera._take_report(b"x/info/report", json.dumps({"data": {"state": "free", "fan_speed_pct": 30, "temp": {"curr_nozzle_temp": 40}}}).encode())
+        camera._take_report(b"x/light/report", json.dumps({"data": {"lights": [{"type": 3, "status": 1, "brightness": 100}]}}).encode())
+        camera._take_report(b"x/info/report", json.dumps({"data": {"state": "free", "fan_speed_pct": 30}}).encode())
+        self.assertEqual((camera.status["light"], camera.status["fan"]), (True, 30))
+        camera._take_report(b"x/info/report", json.dumps({"data": {"state": "busy", "project": {"task_id": 77, "filename": "a.gcode"}}}).encode())
+        self.assertEqual((camera.status["state"], camera.status["task"]), ("printing", "77"))
+
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.settings = os.path.join(CONFIG, "settings.json")

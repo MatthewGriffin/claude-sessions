@@ -1628,6 +1628,8 @@ def printer_status(data):
     project = data.get("project") if isinstance(data.get("project"), dict) else {}
     state = str(data.get("state") or "")
     status = {"state": "idle", **printer_temperatures(data.get("temp") if isinstance(data.get("temp"), dict) else {})}
+    if number(data.get("fan_speed_pct")) is not None:
+        status["fan"] = number(data["fan_speed_pct"])
     if project and state == "busy":
         name = clean(str(project.get("filename") or ""))
         status.update({
@@ -1637,9 +1639,73 @@ def printer_status(data):
             "layer": number(project.get("curr_layer")), "layers": number(project.get("total_layers")),
             "elapsed": number(project.get("print_time")), "remaining": number(project.get("remain_time")),
         })
+        if project.get("task_id") not in (None, ""):
+            status["task"] = clean(str(project["task_id"]))[:40]  # Needed to pause, resume or stop it.
     elif state == "busy":
         status["state"] = "busy"
     return status
+
+
+PRINTER_CAMERA_LIGHT = 3  # The Kobra X's only light; 1 and 2 are a printhead and a chamber light on other models.
+PRINTER_MAX = {"nozzle": 300, "bed": 110}  # The Kobra X's limits.
+PRINTER_DONE = {"pause": "Pausing the print.", "resume": "Resuming the print.", "stop": "Stopping the print.",
+                "cool": "Heaters off.", "light": "Done.", "fan": "Fan set."}
+
+
+def printer_plan(control, value, printing, state, task):
+    """The messages for one control, as ([(type, action, data)], error). Checked against a Kobra X on 2026-11-09,
+    except those for a running print (print/update, pause, resume, stop), which follow Anycubic's slicer."""
+    def degrees(name, number):
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not 0 <= number <= PRINTER_MAX[name]:
+            raise ValueError(f"Choose a {name} temperature from 0 to {PRINTER_MAX[name]}°C.")
+        return int(number)
+
+    def heat(name, number):
+        number = degrees(name, number)
+        if printing:
+            return ("print", "update", {"taskid": task, "settings": {f"target_{'nozzle' if name == 'nozzle' else 'hotbed'}_temp": number}})
+        if name == "nozzle":
+            return ("tempature", "set", {"type": 0, "target_hotbed_temp": 0, "target_nozzle_temp": number})
+        return ("tempature", "set", {"type": 1, "target_hotbed_temp": number, "target_nozzle_temp": 0})
+
+    try:
+        if control in ("nozzle", "bed"):
+            return [heat(control, value)], None
+        if control in ("preheat", "cool"):
+            if printing:
+                return [], "That's for when the printer isn't printing."
+            temps = value if control == "preheat" and isinstance(value, dict) else {"nozzle": 0, "bed": 0}
+            return [heat("bed", temps.get("bed")), heat("nozzle", temps.get("nozzle"))], None
+        if control == "light":
+            return [("light", "control", {"type": PRINTER_CAMERA_LIGHT, "status": 1 if value else 0, "brightness": 100 if value else 0})], None
+        if control == "fan":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 100:
+                return [], "Choose a fan speed from 0 to 100%."
+            if printing:
+                return [("print", "update", {"taskid": task, "settings": {"fan_speed_pct": int(value)}})], None
+            return [("fan", "setSpeed", {"fan_speed_pct": int(value)})], None
+        if control in ("pause", "resume", "stop"):
+            needed = {"pause": ("printing",), "resume": ("paused",), "stop": ("printing", "paused")}[control]
+            if state not in needed or not task:
+                return [], {"pause": "It isn't printing.", "resume": "It isn't paused.", "stop": "It isn't printing."}[control]
+            return [("print", control, {"taskid": task})], None
+    except ValueError as exc:
+        return [], str(exc)
+    return [], "Unknown control."
+
+
+def printer_control(monitor, request):
+    """Change a setting on a saved printer: heaters, preheat, light, fan, or pause/resume/stop a print."""
+    host = printer_address(request.get("host", ""))
+    if not host or host not in read_printers():
+        return False, "That printer isn't one of yours in this app."
+    try:
+        succeeded, message = printer_camera(host).command(str(request.get("control", "")), request.get("value"))
+    except (OSError, ValueError, KeyError, TypeError, ssl.SSLError) as exc:
+        return False, f"Couldn't reach the printer: {clean(str(exc))[:200]}"
+    if not succeeded:
+        return False, message
+    return True, {"text": message, "print": printer_camera(host).current_status()}
 
 
 class PrinterCamera:
@@ -1656,6 +1722,7 @@ class PrinterCamera:
         self.process = None
         self.status = None  # What the printer last said about its print, from printer_status().
         self.status_at = 0
+        self.command_lock = threading.Lock()  # One change at a time.
 
     def frame(self):
         with self.lock:
@@ -1682,10 +1749,18 @@ class PrinterCamera:
         if not isinstance(data, dict):
             return
         if topic.endswith(b"/info/report"):
-            self.status = printer_status(data)
+            kept = {k: v for k, v in (self.status or {}).items() if k == "light"}  # Info reports don't include it.
+            self.status = {**kept, **printer_status(data)}
             self.status_at = time.monotonic()
         elif topic.endswith(b"/tempature/report") and self.status:  # The printer's own spelling.
-            self.status = {**self.status, **printer_temperatures(data)}
+            self.status = {**self.status, **{k: v for k, v in printer_temperatures(data).items() if v is not None}}
+        elif topic.endswith(b"/light/report") and self.status:
+            lights = data.get("lights") if isinstance(data.get("lights"), list) else [data]
+            camera = next((l for l in lights if isinstance(l, dict) and l.get("type") == PRINTER_CAMERA_LIGHT), None)
+            if camera and camera.get("status") in (0, 1):
+                self.status = {**self.status, "light": camera["status"] == 1}
+        elif topic.endswith(b"/fan/report") and self.status and isinstance(data.get("fan_speed_pct"), (int, float)):
+            self.status = {**self.status, "fan": data["fan_speed_pct"]}
 
     def _run(self):
         while self._wanted():
@@ -1721,10 +1796,9 @@ class PrinterCamera:
         broker = urllib.parse.urlsplit(str(login.get("broker", "")))
         return login, broker.port or 9883
 
-    def _stream_once(self):
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
-            self.problem = "ffmpeg isn't installed, and it's needed to show the camera"  # The print details still come.
+    @contextlib.contextmanager
+    def _connected(self):
+        """An MQTT connection to the printer, subscribed to its reports. Yields (socket, send(kind, action, data=None))."""
         login, port = self._login()
         mode, device = str(login.get("modeId") or login.get("modelId")), str(login["deviceId"])
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -1739,12 +1813,76 @@ class PrinterCamera:
                 raise OSError("the printer refused the login")
             sock.sendall(mqtt_packet(0x82, struct.pack("!H", 1) + mqtt_string(f"anycubic/anycubicCloud/v1/printer/+/{mode}/{device}/#") + b"\0"))
 
-            def send(kind, action):
-                message = {"type": kind, "action": action, "timestamp": int(time.time() * 1000), "msgid": str(uuid.uuid4()), "data": None}
+            def send(kind, action, data=None):
+                message = {"type": kind, "action": action, "timestamp": int(time.time() * 1000), "msgid": str(uuid.uuid4()), "data": data}
                 topic = f"anycubic/anycubicCloud/v1/web/printer/{mode}/{device}/{kind}"
                 sock.sendall(mqtt_packet(0x30, mqtt_string(topic) + json.dumps(message, separators=(",", ":")).encode()))
 
+            yield sock, send
+
+    def _reports(self, sock, seconds):
+        """(topic, message) for each report in the next few seconds, after keeping the print details from it."""
+        sock.settimeout(0.5)
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                kind, body = mqtt_read(sock)
+            except (socket.timeout, TimeoutError):
+                continue
+            if kind & 0xF0 == 0x30:
+                size = struct.unpack("!H", body[:2])[0]
+                topic, payload = body[2:2 + size], body[2 + size:]
+                self._take_report(topic, payload)
+                with contextlib.suppress(ValueError):
+                    message = json.loads(payload)
+                    if isinstance(message, dict):
+                        yield topic.decode(errors="replace"), message
+
+    def command(self, control, value=None):
+        """Change a setting on the printer, as its own slicer does. Returns (succeeded, message)."""
+        with self.command_lock, self._connected() as (sock, send):
             send("info", "query")
+            status = None
+            for topic, message in self._reports(sock, 5):
+                if topic.endswith("/info/report") and isinstance(message.get("data"), dict):
+                    status = printer_status(message["data"])
+                    break
+            if not status:
+                return False, "The printer didn't answer."
+            printing = status["state"] in ("printing", "paused")
+            task = status.get("task") or ""
+            plan, error = printer_plan(control, value, printing, status["state"], task)
+            if error:
+                return False, error
+            failed = None
+            for kind, action, data in plan:
+                send(kind, action, data)
+                answered = False
+                for topic, message in self._reports(sock, 8):
+                    if topic.endswith(f"/{kind}/report") and message.get("action") == action:
+                        answered = True
+                        if message.get("code") not in (200, None):
+                            failed = clean(str(message.get("msg") or "")) or f"code {message.get('code')}"
+                        break
+                if failed:
+                    return False, f"The printer refused that: {failed}"
+                if not answered:
+                    return False, "The printer didn't confirm the change. Check it before trying again."
+            send("info", "query")
+            send("light", "query")
+            list(self._reports(sock, 1.5))
+            self.status_at = time.monotonic()
+            with contextlib.suppress(OSError):
+                sock.sendall(b"\xe0\x00")
+        return True, PRINTER_DONE.get(control, "Done.")
+
+    def _stream_once(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.problem = "ffmpeg isn't installed, and it's needed to show the camera"  # The print details still come.
+        with self._connected() as (sock, send):
+            send("info", "query")
+            send("light", "query")
             send("video", "startCapture")
             sock.settimeout(1)
             stream_url, pinged, started = None, time.monotonic(), time.monotonic()
@@ -1767,6 +1905,7 @@ class PrinterCamera:
                         pinged = time.monotonic()
                     if time.monotonic() - asked > PRINTER_STATUS_SECONDS:
                         send("info", "query")  # Progress and temperatures, for the tile and shared page.
+                        send("light", "query")
                         asked = time.monotonic()
                     if self.process and self.process.poll() is not None:
                         raise OSError("the camera stream stopped")
@@ -4308,6 +4447,7 @@ POST_ROUTES = {
     "/api/sessions/key": press_key,
     "/api/sessions/end": end_session,
     "/api/sessions/printers": printer_settings,
+    "/api/sessions/printer-control": printer_control,
     "/api/sessions/terminal": open_terminal,
 }
 
@@ -5073,6 +5213,15 @@ dialog::backdrop{background:#0009}
 #histSide #histDevices{flex:1;width:100%}
 #reqBox{order:1;flex:1 1 0;min-height:0;overflow:auto;background:var(--bg);padding:10px 12px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:6px;font-size:12px;border-top:1px solid var(--line)}
 #reqBox h3{margin:0;font-size:13px}
+#printCtl{order:1;flex:none;background:var(--bg);border-top:1px solid var(--line);font-size:12px;max-height:60%;overflow:auto}
+.pctl{padding:10px 12px;display:grid;gap:8px}.pctl+.pctl{border-top:1px solid var(--line)}
+.pctl h3{margin:0;font-size:13px}.pctl.stale h3{color:var(--dim)}
+.prow{display:flex;flex-wrap:wrap;align-items:center;gap:6px}.prow[hidden]{display:none}
+.prow form{display:flex;align-items:center;gap:6px;margin-right:8px}
+.plabel{color:var(--dim);min-width:44px}.prow b{font-weight:600;min-width:72px}
+.pctl input{width:64px}.pctl button{padding:4px 10px}.pctl .danger{color:var(--bad)}
+.pctl button[aria-pressed="true"]{border-color:var(--warn);color:var(--warn)}
+.pmsg{color:var(--dim);overflow-wrap:anywhere}.pmsg:empty{display:none}.pmsg.bad{color:var(--bad)}
 .req summary{overflow-wrap:anywhere;color:var(--text)}
 .req pre{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--dim);max-height:16em;overflow:auto}
 .reqstatus{display:inline-block;min-width:3.2em;font-weight:700;color:var(--dim)}
@@ -5216,7 +5365,7 @@ textarea{min-height:110px;resize:vertical}
 <header><h1>Claude Sessions</h1><span id="summary">connecting…</span><span id="error"></span><button id="updateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="restartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><span id="usage" class="usage"></span><button id="devices">Devices</button><button id="phoneBtn" title="Use this app from your phone, on the same Wi-Fi" aria-label="Phone access"><svg viewBox="0 0 16 16" width="14" height="16" aria-hidden="true"><rect x="4" y="1.5" width="8" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 12h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="new" class="primary">New session</button></header>
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
-<dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="reqBox" aria-label="Requests to this computer" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
+<dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section><section id="reqBox" aria-label="Requests to this computer" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replyNote"></div><div id="queue" hidden></div>
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" hidden><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
@@ -5770,8 +5919,80 @@ makeResizer($('sideHandle'),'side',x=>innerWidth-x,()=>$('histSide').getBounding
 function updatePagePreview(){
  const box=$('histDevices');
  const visible=()=>box.getClientRects().length>0&&!$('viewDlg').open;
- syncTiles(box,histSession?devices.filter(d=>linkedTo(d,histSession)):[],250,()=>!visible());
+ const linked=histSession?devices.filter(d=>linkedTo(d,histSession)):[];
+ syncTiles(box,linked,250,()=>!visible());
+ renderPrinterControls(linked.filter(d=>d.kind==='printer'&&d.state==='device'));
  layoutPreview();
+}
+// Controls for a printer shown beside the session: heaters, preheat, light, fan, and pausing or stopping a print.
+const PRESETS=[['PLA',210,60],['PETG',240,80],['ASA / ABS',260,100],['TPU',230,50]];
+function renderPrinterControls(list){
+ const box=$('printCtl');box.panels=box.panels||new Map();
+ const wanted=new Set(list.map(d=>d.serial));
+ for(const [serial,p] of box.panels)if(!wanted.has(serial)){p.root.remove();box.panels.delete(serial)}
+ for(const d of list){
+  if(!box.panels.has(d.serial))box.panels.set(d.serial,makePrinterPanel(box,d));
+  const p=box.panels.get(d.serial);if(!p.busy){p.device=d;updatePrinterPanel(p)}
+ }
+ box.hidden=!list.length;
+}
+const printingNow=p=>['printing','paused'].includes((p.device.print||{}).state);
+function makePrinterPanel(box,d){
+ const p={root:el('div','pctl',box),host:d.serial.slice('printer-'.length),device:d,busy:false};
+ const button=(parent,text,run)=>{const b=el('button','',parent,text);b.type='button';b.addEventListener('click',run);return b};
+ p.title=el('h3','',p.root);
+ const heaters=el('div','prow',p.root);
+ const heater=(name,label,max)=>{
+  const f=el('form','',heaters);el('span','plabel',f,label);const now=el('b','',f);
+  const i=el('input','',f);i.type='number';i.min=0;i.max=max;i.step=5;i.inputMode='numeric';i.placeholder='°C';i.setAttribute('aria-label',label+' target, °C');
+  el('button','',f,'Set').type='submit';
+  f.addEventListener('submit',async e=>{
+   e.preventDefault();const v=Number(i.value);
+   if(i.value===''||!(v>=0&&v<=max)){say(p,'Choose a '+label.toLowerCase()+' temperature from 0 to '+max+'°C.',true);return}
+   if(await sendPrinter(p,name,v,printingNow(p)?'Change the running print\u2019s '+label.toLowerCase()+' temperature to '+v+'°C?':''))i.value='';
+  });
+  return now;
+ };
+ p.nozzle=heater('nozzle','Nozzle',300);p.bed=heater('bed','Bed',110);
+ p.presets=el('div','prow',p.root);el('span','plabel',p.presets,'Preheat');
+ for(const [name,nozzle,bed] of PRESETS)button(p.presets,name,()=>sendPrinter(p,'preheat',{nozzle,bed})).title=nozzle+'°C nozzle, '+bed+'°C bed';
+ button(p.presets,'Cool down',()=>sendPrinter(p,'cool')).title='Turn both heaters off';
+ const more=el('div','prow',p.root);
+ p.light=button(more,'Light',()=>sendPrinter(p,'light',!(p.device.print||{}).light));
+ el('span','plabel',more,'Fan');p.fan=el('b','',more);
+ for(const v of [0,50,100])button(more,v?v+'%':'Off',()=>sendPrinter(p,'fan',v,printingNow(p)?'Set the part fan to '+v+'% during the print?':''));
+ p.job=el('div','prow',p.root);el('span','plabel',p.job,'Print');
+ p.pause=button(p.job,'Pause',()=>sendPrinter(p,'pause'));
+ p.resume=button(p.job,'Resume',()=>sendPrinter(p,'resume'));
+ p.stop=button(p.job,'Stop print',()=>sendPrinter(p,'stop',null,'Stop the print? It can\u2019t be resumed afterwards.'));p.stop.classList.add('danger');
+ p.msg=el('div','pmsg',p.root);p.msg.setAttribute('role','status');
+ return p;
+}
+function updatePrinterPanel(p){
+ const s=p.device.print,temp=(now,goal)=>now==null?'\u2013':now+'°C'+(goal?' \u2192 '+goal+'°C':'');
+ p.root.classList.toggle('stale',!s);
+ p.title.textContent=(p.device.label||'Printer').replace(/ camera$/,'')+' controls'+(s?'':' \u00b7 waiting for the printer\u2026');
+ p.nozzle.textContent=s?temp(s.nozzle,s.nozzle_target):'\u2013';
+ p.bed.textContent=s?temp(s.bed,s.bed_target):'\u2013';
+ const printing=printingNow(p);
+ p.presets.hidden=printing;p.job.hidden=!printing;
+ p.pause.hidden=!!s&&s.state==='paused';p.resume.hidden=!(s&&s.state==='paused');
+ p.light.textContent='Light '+(s&&s.light?'on':'off');p.light.setAttribute('aria-pressed',String(!!(s&&s.light)));
+ p.light.title=s&&s.light?'Turn the camera light off':'Turn the camera light on';
+ p.fan.textContent=s&&s.fan!=null?s.fan+'%':'\u2013';
+ for(const b of p.root.querySelectorAll('button,input'))b.disabled=p.busy||!s;
+}
+function say(p,text,bad){p.msg.textContent=text;p.msg.classList.toggle('bad',!!bad)}
+async function sendPrinter(p,control,value,question){
+ if(question&&!confirm(question))return false;
+ p.busy=true;updatePrinterPanel(p);say(p,'Sending\u2026');
+ try{
+  const d=await post('printer-control',{host:p.host,control,value});
+  if(d.error){say(p,d.error,true);return false}
+  if(d.message.print)p.device={...p.device,print:d.message.print};
+  say(p,d.message.text);return true;
+ }catch(e){say(p,'Lost connection to claude-monitor.',true);return false}
+ finally{p.busy=false;updatePrinterPanel(p)}
 }
 roomyScreen.addEventListener('change',layoutPreview);
 $('tabPreview').addEventListener('click',()=>selectSideTab('preview'));
