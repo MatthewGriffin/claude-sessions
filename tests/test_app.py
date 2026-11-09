@@ -217,7 +217,6 @@ class UpdateTests(unittest.TestCase):
 
 
 @unittest.skipUnless(WINDOWS and os.environ.get("CLAUDE_SESSIONS_TEST_PROGRAM"), "needs the built Windows program")
-@unittest.skipUnless(WINDOWS and os.environ.get("CLAUDE_SESSIONS_TEST_PROGRAM"), "needs the built Windows program")
 class BuiltHookTests(unittest.TestCase):
     """The built program, run as Claude Code runs a status line or hook: JSON in on stdin, text out."""
 
@@ -245,6 +244,7 @@ class BuiltHookTests(unittest.TestCase):
             self.assertEqual(json.load(handle)["kind"], "done")
 
 
+@unittest.skipUnless(WINDOWS and os.environ.get("CLAUDE_SESSIONS_TEST_PROGRAM"), "needs the built Windows program")
 class BuiltUpdateTests(unittest.TestCase):
     """The built program updates itself from a stand-in release and comes back, twice in a row."""
 
