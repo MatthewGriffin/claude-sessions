@@ -468,6 +468,26 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(len(context), 1)
         self.assertNotIn("async", context[0])  # Its output has to reach Claude.
 
+    def test_windows_leaves_out_the_hook_claude_code_waits_for(self):
+        self.assertEqual(app.run_setup(verbose=False), 0)
+        with open(self.settings) as handle:
+            settings = json.load(handle)
+        settings["hooks"]["UserPromptSubmit"][-1]["hooks"].append({"type": "command", "command": "someone --else"})
+        with open(self.settings, "w") as handle:
+            json.dump(settings, handle)
+        original = app.CONTEXT_HOOK
+        app.CONTEXT_HOOK = False
+        try:
+            self.assertEqual(app.run_setup(verbose=False), 0)
+            self.assertEqual(app.run_setup(verbose=False), 0)
+        finally:
+            app.CONTEXT_HOOK = original
+        with open(self.settings) as handle:
+            commands = [h["command"] for g in json.load(handle)["hooks"]["UserPromptSubmit"] for h in g["hooks"]]
+        self.assertFalse(any("--context" in c for c in commands))
+        self.assertIn("someone --else", commands)  # Other hooks in the same group stay.
+        self.assertEqual(sum("--hook" in c for c in commands), 1)
+
 
 class BackgroundTaskTests(unittest.TestCase):
     """Background commands are found in the transcript and end when Claude Code reports back."""

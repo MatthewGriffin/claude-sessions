@@ -5367,6 +5367,8 @@ button.deny{color:var(--bad)}
 .msg{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
 .msg b{display:block;font-size:12px;color:var(--dim)}
 .msg.you{background:#23304a;border-radius:4px;padding:8px 10px}
+.msg.you.pending{opacity:.65}
+.msg.you.pending small{display:block;margin-top:4px;color:#9aa4b5}
 .qa{display:grid;gap:8px}.qitem+.qitem{margin-top:8px}.qtext{white-space:pre-wrap}
 .qopts,.qwait{color:var(--dim);font-size:12px;margin-top:2px}.qhead{color:var(--dim)}
 .msg details.paste{margin:6px 0;border-left:2px solid var(--line);padding-left:8px;white-space:normal}
@@ -6149,11 +6151,12 @@ async function post(path,body){
  const d=await r.json().catch(()=>({error:'Unexpected response (HTTP '+r.status+').'}));
  return r.ok?d:{error:d.error||'That did not work.'};
 }
+let lastActMessage='';
 async function act(path,body){
  $('replyErr').textContent='';
  for(const b of $('keys').children)b.disabled=true;
  keysFor=null;
- try{const d=await post(path,body);if(d.error)$('replyErr').textContent=d.error;return !d.error}
+ try{const d=await post(path,body);lastActMessage=d.message||'';if(d.error)$('replyErr').textContent=d.error;return !d.error}
  catch(e){$('replyErr').textContent='Lost connection to claude-monitor.';return false}
  finally{await refresh();await loadHistory()}
 }
@@ -6393,6 +6396,8 @@ function renderHistory(h){
  }
  if(!rows.length)rows.push(el('div','note',null,'Nothing here yet.'));
  body.replaceChildren(...rows);
+ shownMessages=h.messages;
+ showEcho();
  // Loading earlier items adds above, so stay on the same message.
  if(histScrollTo==='keep'){body.scrollTop=keep+body.scrollHeight-height;histScrollTo=null}
  else body.scrollTop=histFollow?body.scrollHeight:keep;
@@ -6566,7 +6571,7 @@ function openHistory(s,fromUrl){
  if(!fromUrl){history.pushState(null,'',pageHash(s.id));pagePushed=true}
  histSession=s.id;histPid=s.pid;histRev=null;histFollow=true;histLimit=400;histScrollTo=null;histCwd=s.cwd;toolFull=new Map();
  setRenaming(false);
- $('histBody').replaceChildren();$('histChanges').replaceChildren();changedCount=0;
+ $('histBody').replaceChildren();shownMessages=[];$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
  $('replyErr').textContent='';$('replyText').value='';pendingImages=[];pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;
  updateFoot(s);
@@ -6626,8 +6631,40 @@ $('replyForm').addEventListener('submit',async e=>{
   if(text.trim()&&await act('key',{id:histSession,action:'type',text,...answerFor})){$('replyText').value='';pastedTexts=[]}
   return;
  }
- if((text.trim()||images.length)&&await act('send',{id:histSession,text,images,pasted})){$('replyText').value='';pendingImages=[];pastedTexts=[];renderPending()}
+ const sid=histSession,seen=youMatches(text);
+ if((text.trim()||images.length)&&await act('send',{id:sid,text,images,pasted})){
+  $('replyText').value='';pendingImages=[];pastedTexts=[];renderPending();
+  if(lastActMessage==='Sent.'&&!text.trim().startsWith('/')&&sid===histSession){sentEcho={id:sid,text:text.trim(),images:images.length,seen,rev:histRev,at:Date.now()};showEcho();quickPoll()}
+ }
 });
+// What was just sent, shown until Claude Code records it. On Windows that can take a few seconds.
+let sentEcho=null,quickUntil=0,quickRunning=false;
+const squash=t=>String(t||'').replace(/\s+/g,'');
+function youText(m){return m.text!==undefined?m.text:(m.parts||[]).map(p=>p.text!==undefined?p.text:p.paste||'').join('\n')}
+let shownMessages=[];
+function youRows(){return shownMessages.filter(m=>m.role==='you')}
+function youMatches(text){const want=squash(text).slice(0,200);return want?youRows().filter(m=>squash(youText(m)).includes(want)).length:youRows().length}
+function showEcho(){
+ const body=$('histBody'),old=$('sentEcho');
+ if(old)old.remove();
+ if(!sentEcho||sentEcho.id!==histSession)return;
+ const arrived=sentEcho.text?youMatches(sentEcho.text)>sentEcho.seen:histRev!==sentEcho.rev&&youRows().length>sentEcho.seen;
+ if(arrived||Date.now()-sentEcho.at>120000){sentEcho=null;return}
+ const r=el('div','msg you pending',body);r.id='sentEcho';
+ el('b','',r,'You');
+ if(sentEcho.text)r.append(sentEcho.text);
+ if(sentEcho.images)el('div','',r,sentEcho.images+' picture'+(sentEcho.images>1?'s':''));
+ el('small','',r,Date.now()-sentEcho.at>15000?'Sent. Claude Code hasn\u2019t recorded it yet.':'Sending\u2026');
+ if(histFollow)body.scrollTop=body.scrollHeight;
+}
+// Look every half second for a while after sending, rather than every two.
+async function quickPoll(){
+ quickUntil=Date.now()+20000;
+ if(quickRunning)return;
+ quickRunning=true;
+ try{for(let n=0;Date.now()<quickUntil&&histSession;n++){await new Promise(r=>setTimeout(r,500));await loadHistory();if(n%2)await refresh();if(!sentEcho)quickUntil=Math.min(quickUntil,Date.now()+3000)}}
+ finally{quickRunning=false}
+}
 // Pictures to send with the next message. Each is shrunk here, then kept by the app until it's sent.
 var pendingImages=[],imagesLoading=0;
 // Long texts pasted into the reply box. Only these reach Claude as a paste; the rest is typed.
@@ -7410,12 +7447,16 @@ def run_setup(verbose=True):
         if not any("--hook" in c and ("claude-monitor" in c or "claude-sessions" in c) for c in commands):
             groups.append({"hooks": [{"type": "command", "command": hook, "async": True, "timeout": 10}]})
             added.append(event)
-    # A second UserPromptSubmit hook, not async, so what it prints reaches Claude.
+    # A second UserPromptSubmit hook, not async, so what it prints reaches Claude. Claude Code waits
+    # for it before taking each message, so it's left out where starting this program is slow.
     groups = hooks.setdefault("UserPromptSubmit", [])
-    commands = [h.get("command", "") for g in groups if isinstance(g, dict) for h in g.get("hooks", []) if isinstance(h, dict)]
-    if not any("--context" in c and ("claude-monitor" in c or "claude-sessions" in c) for c in commands):
-        groups.append({"hooks": [{"type": "command", "command": own_command_line("--context"), "timeout": 5}]})
-        added.append("previews note")
+    if CONTEXT_HOOK:
+        commands = [h.get("command", "") for g in groups if isinstance(g, dict) for h in g.get("hooks", []) if isinstance(h, dict)]
+        if not any(is_own_command(c, "--context") for c in commands):
+            groups.append({"hooks": [{"type": "command", "command": own_command_line("--context"), "timeout": 5}]})
+            added.append("previews note")
+    elif remove_own_hooks(groups, "--context"):
+        added.append("previews note removed, as it slowed every message")
     if "statusLine" not in settings:
         settings["statusLine"] = {"type": "command", "command": own_command_line("--statusline")}
         added.append("statusLine")
@@ -7429,7 +7470,7 @@ def run_setup(verbose=True):
             json.dump(settings, handle, indent=2)
             handle.write("\n")
         os.replace(temporary, SETTINGS_FILE)
-        say(f"Added to {SETTINGS_FILE}: {', '.join(added)}. Sessions started from now on use them.")
+        say(f"Updated {SETTINGS_FILE}: {', '.join(added)}. Sessions started from now on use them.")
     else:
         say("Claude Code is already set up for this app.")
     if not WINDOWS and not FROZEN:
@@ -7454,6 +7495,29 @@ def run_setup(verbose=True):
 
 
 OWN_FLAGS = ("--hook", "--context", "--statusline")
+# On Windows each run of the one-file program takes a second or more to start (longer with
+# antivirus scanning it), and Claude Code waits for this hook before it takes each message.
+CONTEXT_HOOK = not WINDOWS
+
+
+def is_own_command(command, flag):
+    return isinstance(command, str) and flag in command and ("claude-monitor" in command or "claude-sessions" in command)
+
+
+def remove_own_hooks(groups, flag):
+    """Take this app's hooks with the flag out of an event's groups, and any group left empty. Returns how many."""
+    removed = 0
+    for group in list(groups):
+        entries = group.get("hooks") if isinstance(group, dict) else None
+        if not isinstance(entries, list):
+            continue
+        keep = [h for h in entries if not (isinstance(h, dict) and is_own_command(h.get("command"), flag))]
+        removed += len(entries) - len(keep)
+        if not keep and entries:
+            groups.remove(group)
+        else:
+            group["hooks"] = keep
+    return removed
 
 
 def point_commands_here(settings):
