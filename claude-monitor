@@ -5867,7 +5867,11 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
             if parts.path == "/" and valid:
                 # Move the token out of the address bar into a cookie other sites can't send.
                 name = "monitor_phone" if self.on_phone else "monitor_token"
-                cookie = f"{name}={expected}; HttpOnly; SameSite=Strict; Path=/" + ("; Max-Age=31536000" if self.on_phone else "")
+                # A phone opens the link from its camera app, which browsers count as another site, and a
+                # Strict cookie wouldn't come back on the redirect below. Lax does, and still isn't sent
+                # with another site's POSTs, which also need a matching Origin.
+                same_site = "Lax" if self.on_phone else "Strict"
+                cookie = f"{name}={expected}; HttpOnly; SameSite={same_site}; Path=/" + ("; Max-Age=31536000" if self.on_phone else "")
                 self.respond(302, "text/plain", b"", [("Location", "/"), ("Set-Cookie", cookie)])
             elif not self.authorized():
                 message = b"Scan the phone code in Claude Sessions on your computer again.\n" if self.on_phone else b"Open the link printed by: claude-monitor --web\n"
