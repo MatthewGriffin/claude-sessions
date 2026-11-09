@@ -252,6 +252,8 @@ TASK_ID = re.compile(r"<task-id>([A-Za-z0-9_-]{1,40})</task-id>")
 TASK_STATUS = re.compile(r"<status>(\w+)</status>")
 # A background task writes to <temp>/claude-<uid>/<project>/<session id>/tasks/<task id>.output while it runs.
 TASK_OUTPUT_FILE = re.compile(r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/tasks/([A-Za-z0-9_-]{1,40})\.output$")
+# Named in a background command's result. The folder keeps the session's first id, even after /clear.
+TASK_FOLDER_NAMED = re.compile(r"/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/tasks/")
 TASK_SCAN_SECONDS = 5
 BROWSER_PORT_USE = re.compile(r"(?:remote-debugging-port[= ]|(?:127\.0\.0\.1|localhost):)(\d{2,5})\b")
 # 3D printing work, in a shell command, a file's name or the user's own words. Links printer cameras.
@@ -390,6 +392,7 @@ class Transcript:
         self.background = {}  # Background task id -> what it is and when it started, until it reports back.
         self.background_ended = set()
         self.not_background = set()  # Open task files that turned out to be ordinary, foreground commands.
+        self.task_folders = {session_id} if session_id else set()  # Session ids its task files are kept under.
         self.read_whole = False
 
     def poll(self):
@@ -475,6 +478,8 @@ class Transcript:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
                         call = self.pending.pop(block.get("tool_use_id"), None)
                         task = result.get("backgroundTaskId")
+                        if task and isinstance(task, str):
+                            self._note_task_folder(block.get("content"))
                         if task and isinstance(task, str) and task not in self.background_ended:
                             self.background[task] = {
                                 "id": task,
@@ -565,6 +570,30 @@ class Transcript:
         else:
             tasks = [t for t in self.background.values() if not started_at or not t["started"] or t["started"] >= started_at]
         return sorted(tasks, key=lambda t: t["started"] or 0)
+
+    def find_task_folders(self):
+        """Task folders named before the part of a long transcript that was read. Looked for once."""
+        if self.read_whole or getattr(self, "folders_looked_for", False) or not self.path:
+            return
+        self.folders_looked_for = True
+        try:
+            with open(self.path, "rb") as handle:
+                for line in handle:
+                    if b"backgroundTaskId" not in line or b"/tasks/" not in line:
+                        continue
+                    entry = json.loads(line)
+                    result = entry.get("toolUseResult")
+                    if entry.get("type") == "user" and isinstance(result, dict) and result.get("backgroundTaskId"):
+                        for block in (entry.get("message") or {}).get("content") or []:
+                            if isinstance(block, dict) and block.get("type") == "tool_result":
+                                self._note_task_folder(block.get("content"))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    def _note_task_folder(self, content):
+        texts = [content] if isinstance(content, str) else [b.get("text", "") for b in content or [] if isinstance(b, dict)]
+        for text in texts:
+            self.task_folders.update(TASK_FOLDER_NAMED.findall(str(text))[:2])
 
     def _find_task_start(self, task):
         if not self.path or not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", task):
@@ -836,7 +865,11 @@ class Monitor:
 
     def background_state(self, session, transcript):
         open_tasks = open_background_tasks()
-        live = None if open_tasks is None else open_tasks.get(session["sessionId"], set())
+        # Task files stay under the id the session started with, which /clear changes.
+        if open_tasks:
+            transcript.find_task_folders()
+        folders = {session["sessionId"], *transcript.task_folders}
+        live = None if open_tasks is None else set().union(*(open_tasks.get(f, set()) for f in folders))
         started = session.get("startedAt")
         now = time.time()
         return [

@@ -285,6 +285,22 @@ class BackgroundTaskTests(unittest.TestCase):
         t = self.transcript(*self.started("u1", "b1", "Old task", at="2026-11-08T10:00:00Z"))
         self.assertEqual(t.background_tasks(None, started_at=app.entry_time({"timestamp": "2026-11-08T11:00:00Z"})), [])
 
+    def test_files_kept_under_the_first_id_after_clear(self):
+        first = "32fe1e95-7071-43e6-ae8b-ff8c96e5a8b4"
+        entries = self.started("u1", "b1", "Run the evaluation")
+        entries[1]["message"]["content"][0]["content"] += f" Output is being written to: /tmp/claude-1000/x/{first}/tasks/b1.output"
+        saved = app.open_background_tasks
+        try:
+            app.open_background_tasks = lambda: {first: {"b1"}}
+            for whole in (True, False):
+                t = self.transcript(*entries)
+                if not whole:  # Only the end of a long transcript was read.
+                    t.read_whole, t.task_folders = False, {"session"}
+                state = app.Monitor.background_state(None, {"sessionId": "session", "startedAt": None}, t)
+                self.assertEqual([x["id"] for x in state], ["b1"])
+        finally:
+            app.open_background_tasks = saved
+
 
 RULE = "─" * 60
 BOX = "\n".join(["● Working on it", "", "✻ Running the tests… (1m 2s)", "", RULE + " Meal Planner ─", "❯\xa0{text}", RULE,
