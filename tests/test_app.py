@@ -495,6 +495,30 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(sum("--hook" in c for c in commands), 1)
 
 
+class RequestTests(unittest.TestCase):
+    """Requests Claude's shell commands send, to this computer or anywhere else."""
+
+    def test_finds_requests_anywhere(self):
+        self.assertEqual(app.shell_requests('curl -s "https://api.example.com/v1/items?id=3" | jq .'), [("GET", "https://api.example.com/v1/items?id=3")])
+        self.assertEqual(app.shell_requests("curl -X POST http://localhost:8080/api -d '{}'"), [("POST", "http://localhost:8080/api")])
+        self.assertEqual(app.shell_requests("curl localhost:3000/health && echo ok"), [("GET", "localhost:3000/health")])
+        self.assertEqual(app.shell_requests("curl http://[::1]:9000/x"), [("GET", "http://[::1]:9000/x")])
+
+    def test_leaves_out_what_isnt_sent(self):
+        self.assertEqual(app.shell_requests("cat <<EOF > f\ncurl https://no.example\nEOF"), [])
+        self.assertEqual(app.shell_requests("curl ${BASE}/x"), [])
+        self.assertEqual(app.shell_requests("git clone https://github.com/x/y"), [])
+        self.assertEqual(app.shell_requests("echo http://example.com"), [])
+
+    def test_says_where_each_went(self):
+        self.assertEqual(app.request_place(["http://127.0.0.1:8766/x", "localhost:3000"]), "computer")
+        self.assertEqual(app.request_place(["http://10.0.2.2:8000/api"]), "computer")  # The emulator's name for this computer.
+        self.assertEqual(app.request_place(["http://192.168.0.60:8090/info", "http://localhost:1"]), "network")
+        self.assertEqual(app.request_place(["http://printer.local/x"]), "network")
+        self.assertEqual(app.request_place(["https://api.example.com", "http://localhost:1"]), "internet")
+        self.assertEqual(app.request_place(["https://localhost.example.com/"]), "internet")
+
+
 class BackgroundTaskTests(unittest.TestCase):
     """Background commands are found in the transcript and end when Claude Code reports back."""
 

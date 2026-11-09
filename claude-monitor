@@ -274,13 +274,28 @@ HTTP_COMMAND = re.compile(
 )
 SHELL_SEPARATOR = re.compile(r"\n|;|&&|\|\||\||\$\(|`")
 HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
-LOCAL_URL = re.compile(
-    r"(?:https?://(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[::1\])(?::\d{1,5})?|(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0):\d{1,5})"
-    r"[^\s'\"<>|;&)`]*"
+# Any http(s) address, or this computer's own written without a scheme (curl localhost:8080/x).
+REQUEST_URL = re.compile(
+    r"https?://(?:[\w.~%-]+|\[[0-9a-fA-F:.]+\])(?::\d{1,5})?[^\s'\"<>|;&)`]*"
+    r"|(?<![\w./-])(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0):\d{1,5}[^\s'\"<>|;&)`]*"
 )
+# 10.0.2.2 is this computer as seen from inside an Android emulator.
+LOCAL_HOST = re.compile(r"^(?:https?://)?(?:localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|10\.0\.2\.2|\[::1\])(?:[:/?#]|$)", re.I)
+NETWORK_HOST = re.compile(
+    r"^(?:https?://)?(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}"
+    r"|169\.254(?:\.\d{1,3}){2}|[\w-]+\.local|\[f[cd][0-9a-f:]*\])(?:[:/?#]|$)", re.I)
+
+
+def request_place(urls):
+    """Where requests went: "computer" (this one, or it as an emulator sees it), "network" (a private address) or "internet"."""
+    if all(LOCAL_HOST.match(url) for url in urls):
+        return "computer"
+    if all(LOCAL_HOST.match(url) or NETWORK_HOST.match(url) for url in urls):
+        return "network"
+    return "internet"
 HTTP_STATUS = re.compile(r"HTTP/[\d.]+\s+(\d{3})")
 BARE_STATUS = re.compile(r"(?m)^\s*(\d{3})\s*$")
-MAX_REQUESTS = 20
+MAX_REQUESTS = 50
 
 
 SCRIPT_PATH = os.path.abspath(__file__)
@@ -2536,7 +2551,7 @@ def entry_time(entry):
 
 
 def shell_requests(command):
-    """(method, address) for each request to this computer that a shell command sends.
+    """(method, address) for each request a shell command sends, to this computer or anywhere else.
 
     Only commands that run curl, wget, HTTPie or xh count. Text being written into a file
     (a heredoc) doesn't, and nor do addresses still holding a variable to fill in.
@@ -2553,7 +2568,7 @@ def shell_requests(command):
     for part in SHELL_SEPARATOR.split("\n".join(lines)):
         if HTTP_COMMAND.match(part):
             method = request_method(part)
-            for url in LOCAL_URL.findall(part):
+            for url in REQUEST_URL.findall(part):
                 if "${" not in url and (method, url) not in sent:
                     sent.append((method, url))
     return sent
@@ -2885,13 +2900,14 @@ class HistoryReader:
         note_file_change(self.turn["files"], entry.get("toolUseResult"))
 
     def request_list(self):
-        """The latest requests to this computer, with the status code when the output shows one."""
+        """The latest requests sent by shell commands, with the status code when the output shows one."""
         listed = []
         for request in self.requests[-MAX_REQUESTS:]:
             message = request["message"]
             codes = HTTP_STATUS.findall(message["result"]) or (BARE_STATUS.findall(message["result"]) if request["bare_status"] else [])
             listed.append({
                 "seq": message["seq"], "text": message["text"], "method": request["method"], "urls": request["urls"],
+                "where": request_place(request["urls"]),
                 "more": request["more"], "status": codes[-1] if codes else "", "pending": message["pending"],
                 "error": message["error"], "result": message["result"],
             })
@@ -5255,13 +5271,22 @@ dialog::backdrop{background:#0009}
 #histSide{flex:none;width:min(50%,800px);border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
 #histPage.withPreview #histSide{width:min(38%,800px)}
 @media(max-width:900px){#histSide,#histPage.withPreview #histSide{width:100%;border-left:0}#histPage.files #histChat{display:none}}
-#sideTabs{display:flex;flex:none;gap:4px;padding:8px 12px 0;border-bottom:1px solid var(--line)}
+#sideTabs{display:flex;flex:none;gap:4px;padding:8px 12px 0;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:thin}
+#sideTabs[hidden]{display:none}
+#sideTabs button{flex:none;white-space:nowrap}
+/* In one column the tabs sit above everything, with Chat as one of them. */
+#hist>#sideTabs{grid-column:3;grid-row:2;padding:6px 8px 0}
+@media(max-width:900px){#histFiles,#histAgents{display:none}}
 #sideTabs button{border-radius:4px 4px 0 0;border-bottom:0;background:none;color:var(--dim)}
 #sideTabs button[aria-selected="true"]{background:#2b2e40;color:var(--text);font-weight:700}
 #histChanges{flex:1;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-auto-rows:max-content;gap:10px;align-content:start}
 #histDevices{flex:none;min-height:0;min-width:0;display:flex;flex-direction:column;overflow:hidden;background:#000}
 #histSide #histDevices{flex:1;width:100%}
-#reqBox{order:1;flex:1 1 0;min-height:0;overflow:auto;background:var(--bg);padding:10px 12px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:6px;font-size:12px;border-top:1px solid var(--line)}
+#reqBox{flex:1 1 0;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:6px;font-size:12px;align-content:start}
+#reqBox[hidden]{display:none}
+#reqBox .reqnote{color:var(--dim)}
+.reqwhere{display:inline-block;margin-right:6px;padding:0 5px;border-radius:3px;font-size:11px;background:#2b2e40;color:var(--dim)}
+.reqwhere.network{background:#1d3129;color:#a8e6c4}.reqwhere.internet{background:#3a2f4a;color:#d7c2f5}
 #reqBox h3{margin:0;font-size:13px}
 #printCtl{order:1;flex:none;background:var(--bg);border-top:1px solid var(--line);font-size:12px;max-height:60%;overflow:auto}
 .pctl{padding:10px 12px;display:grid;gap:8px}.pctl+.pctl{border-top:1px solid var(--line)}
@@ -5272,6 +5297,7 @@ dialog::backdrop{background:#0009}
 .pctl input{width:64px}.pctl button{padding:4px 10px}.pctl .danger{color:var(--bad)}
 .pctl button[aria-pressed="true"]{border-color:var(--warn);color:var(--warn)}
 .pmsg{color:var(--dim);overflow-wrap:anywhere}.pmsg:empty{display:none}.pmsg.bad{color:var(--bad)}
+.req{min-width:0}.req>div{overflow-wrap:anywhere;white-space:pre-wrap}
 .req summary{overflow-wrap:anywhere;color:var(--text)}
 .req pre{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--dim);max-height:16em;overflow:auto}
 .reqstatus{display:inline-block;min-width:3.2em;font-weight:700;color:var(--dim)}
@@ -5325,11 +5351,11 @@ html:has(#hist[open]){overflow:hidden}
 .thinking{font-size:12px;color:var(--dim);border:0;padding:0;min-width:0}
 .thinking summary{font-style:italic}.thinking div{white-space:pre-wrap;overflow-wrap:anywhere;border-left:2px solid var(--line);padding:4px 0 4px 8px;margin-top:4px}
 #histEarlier{justify-self:center}
-#hist[open]{display:grid;grid-template-columns:auto auto minmax(0,1fr);grid-template-rows:auto minmax(0,1fr)}
+#hist[open]{display:grid;grid-template-columns:auto auto minmax(0,1fr);grid-template-rows:auto auto minmax(0,1fr)}
 #hist>.dhead{grid-column:3;grid-row:1;min-width:0}
-#hist>#histPage{grid-column:3;grid-row:2}
-#hist>#histDevices{grid-column:1;grid-row:1/3}
-#hist>#previewHandle{grid-column:2;grid-row:1/3}
+#hist>#histPage{grid-column:3;grid-row:3}
+#hist>#histDevices{grid-column:1;grid-row:1/4}
+#hist>#previewHandle{grid-column:2;grid-row:1/4}
 .resizer{flex:none;width:7px;cursor:col-resize;background:var(--line);touch-action:none;background-clip:content-box;padding:0 3px;box-sizing:border-box}
 .resizer:hover,.resizer:focus-visible,.resizer.dragging{padding:0;background:#6a7094;outline:none}
 .dhead{display:flex;gap:12px;align-items:baseline;padding:12px 16px;border-bottom:1px solid var(--line)}
@@ -5417,9 +5443,9 @@ textarea{min-height:110px;resize:vertical}
 <header><h1>Claude Sessions</h1><span id="summary">connecting…</span><span id="error"></span><button id="updateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="restartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><span id="usage" class="usage"></span><button id="devices">Devices</button><button id="phoneBtn" title="Use this app from your phone, on the same Wi-Fi" aria-label="Phone access"><svg viewBox="0 0 16 16" width="14" height="16" aria-hidden="true"><rect x="4" y="1.5" width="8" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 12h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="new" class="primary">New session</button></header>
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
-<dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section><section id="reqBox" aria-label="Requests to this computer" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
+<dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replyNote"></div><div id="queue" hidden></div>
-<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" hidden><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
+<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
 <ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p></section></dialog>
@@ -5873,14 +5899,21 @@ function renderDevices(sessions){
  updateViewer();
  updatePagePreview();
 }
-// On a big enough screen the preview gets its own column on the left. Otherwise it shares the
-// right-hand panel with the changed files, as tabs. Resizing moves it across without reloading.
+// The session page's panels, as tabs that follow the screen and what there is to show:
+// - wide: the preview has its own column on the left; requests, files and subagents are tabs beside the chat.
+// - medium: the preview joins those tabs.
+// - one column (phones): the chat is a tab too, and the tabs sit above whichever is showing.
+// A tab only appears when it has something in it. The choice is remembered, and comes back
+// when that tab does.
 const roomyScreen=matchMedia('(min-width:1300px)');
 let changedCount=0,agentCount=0,requestCount=0,sideTab='preview',shownSideTab='files';
 try{sideTab=localStorage.getItem('sideTab')||'preview'}catch(e){}
+const SIDE_TABS={chat:'tabChat',preview:'tabPreview',requests:'tabRequests',files:'tabFiles',agents:'tabAgents'};
 function selectSideTab(tab){
+ if(tab==='chat'){setFilesOpen(false,true);layoutPreview();return}
  sideTab=tab;
  try{localStorage.setItem('sideTab',tab)}catch(e){}
+ if(singleColumn.matches&&$('histSide').hidden)setFilesOpen(true,true);
  layoutPreview();
  loadAgents();
 }
@@ -5889,30 +5922,51 @@ function toggleSideTab(tab){
  if(!$('histSide').hidden&&shownSideTab===tab){setFilesOpen(false,true);return}
  selectSideTab(tab);setFilesOpen(true,true);loadAgents();
 }
+function availableTabs(){
+ const box=$('histDevices'),hasPreview=!!(box.tiles&&box.tiles.size>0);
+ return {chat:singleColumn.matches,preview:hasPreview&&!roomyScreen.matches,requests:requestCount>0,files:true,agents:agentCount>0};
+}
 function layoutPreview(){
- const box=$('histDevices'),page=$('histPage'),side=$('histSide'),has=(box.tiles&&box.tiles.size>0)||requestCount>0,roomy=roomyScreen.matches;
+ const box=$('histDevices'),page=$('histPage'),side=$('histSide'),tabs=$('sideTabs');
+ const has=!!(box.tiles&&box.tiles.size>0),roomy=roomyScreen.matches,narrow=singleColumn.matches;
  if(roomy&&box.parentNode!==$('hist'))$('hist').prepend(box);
  if(!roomy&&box.parentNode!==side)side.insertBefore(box,$('histChanges'));
- const tabbed=has&&!roomy,withAgents=agentCount>0;
- let tab=sideTab;
- if((tab==='preview'&&!tabbed)||(tab==='agents'&&!withAgents))tab='files';
+ // In one column the tabs have to stay in view while the chat shows, so they leave the panel.
+ if(narrow&&tabs.parentNode!==$('hist'))$('hist').insertBefore(tabs,page);
+ if(!narrow&&tabs.parentNode!==side)side.prepend(tabs);
+ const avail=availableTabs();
+ let tab=avail[sideTab]&&sideTab!=='chat'?sideTab:'files';
  shownSideTab=tab;
- const onPreview=tab==='preview';
+ const active=narrow&&side.hidden?'chat':tab;
  page.classList.toggle('withPreview',has&&roomy);
- box.hidden=!has||(tabbed&&!onPreview);
- $('sideTabs').hidden=!tabbed&&!withAgents;
- $('tabPreview').hidden=!tabbed;
- $('tabAgents').hidden=!withAgents;
+ box.hidden=!has||(!roomy&&tab!=='preview');
  $('histChanges').hidden=tab!=='files';
  $('agentList').hidden=tab!=='agents';
+ $('reqBox').hidden=tab!=='requests';
+ for(const [name,id] of Object.entries(SIDE_TABS)){
+  $(id).hidden=!avail[name];
+  $(id).setAttribute('aria-selected',String(name===active));
+  $(id).tabIndex=name===active?0:-1;
+ }
+ // Files changed is always offered, so the bar is only worth showing with something else beside it.
+ tabs.hidden=Object.values(avail).filter(Boolean).length<2;
  const files='Files changed'+(changedCount?' ('+changedCount+')':'');
- $('tabFiles').textContent=files;
- $('tabPreview').setAttribute('aria-selected',String(onPreview));
- $('tabFiles').setAttribute('aria-selected',String(tab==='files'));
- $('tabAgents').setAttribute('aria-selected',String(tab==='agents'));
- $('histFiles').textContent=tabbed?'Preview & files':files;
+ $('tabFiles').textContent=narrow?'Files'+(changedCount?' ('+changedCount+')':''):files;  // Short enough for the tabs to fit on a phone.
+ $('tabRequests').textContent='Requests'+(requestCount?' ('+requestCount+')':'');
+ const others=['preview','requests'].filter(n=>avail[n]);
+ $('histFiles').textContent=others.length?'Side panel':files;
  sizePanes();
 }
+for(const [name,id] of Object.entries(SIDE_TABS))$(id).addEventListener('click',()=>selectSideTab(name));
+// Arrow keys move between tabs, as in any tab list.
+$('sideTabs').addEventListener('keydown',e=>{
+ const step=e.key==='ArrowRight'?1:e.key==='ArrowLeft'?-1:0;
+ if(!step&&e.key!=='Home'&&e.key!=='End')return;
+ const shown=[...$('sideTabs').children].filter(b=>!b.hidden);
+ let i=shown.indexOf(document.activeElement);
+ i=e.key==='Home'?0:e.key==='End'?shown.length-1:(i+step+shown.length)%shown.length;
+ e.preventDefault();shown[i].focus();shown[i].click();
+});
 // Width the text panes need before the automatic preview width stops growing. Dragging a
 // handle ignores this: a width chosen by hand is kept, however narrow that leaves the text.
 const CHAT_COMFORT=600,DEFAULT_CHAT_SHARE=.62,MIN_PANE=120,PREVIEW_FLOOR=240,HANDLE=7;
@@ -5950,7 +6004,7 @@ function sizePanes(){
  side.style.width=!full&&paneWidths.side?Math.round(Math.max(MIN_PANE,Math.min(paneWidths.side,total-used-MIN_PANE)))+'px':'';
 }
 addEventListener('resize',sizePanes);
-singleColumn.addEventListener('change',sizePanes);
+singleColumn.addEventListener('change',layoutPreview);
 // Captures the picture's first load, which is when its true shape becomes known.
 $('histDevices').addEventListener('load',sizePanes,true);
 function makeResizer(handle,name,widthFromPointer,currentWidth){
@@ -6047,9 +6101,6 @@ async function sendPrinter(p,control,value,question){
  finally{p.busy=false;updatePrinterPanel(p)}
 }
 roomyScreen.addEventListener('change',layoutPreview);
-$('tabPreview').addEventListener('click',()=>selectSideTab('preview'));
-$('tabFiles').addEventListener('click',()=>selectSideTab('files'));
-$('tabAgents').addEventListener('click',()=>selectSideTab('agents'));
 $('histAgents').addEventListener('click',()=>toggleSideTab('agents'));
 let sessionFolders=[],trustedFolders=[];
 function renderFolders(){
@@ -6403,16 +6454,18 @@ function renderHistory(h){
  else body.scrollTop=histFollow?body.scrollHeight:keep;
 }
 // Requests a session's shell commands sent to servers on this computer, newest first.
+const REQUEST_PLACES={computer:['this computer','To a server on this computer (10.0.2.2 is this computer as seen from an Android emulator)'],network:['local network','To a private address on your network, such as a printer'],internet:['internet','To a server on the internet']};
 function renderRequests(list){
  const box=$('reqBox'),open=new Set([...box.querySelectorAll('details[open]')].map(d=>d.dataset.seq)),keep=box.scrollTop;
  requestCount=list.length;
- box.hidden=!list.length;
- const rows=[el('h3','',null,'Requests to this computer ('+list.length+(list.length>=20?', latest':'')+')')];
+ const rows=[el('h3','',null,'Requests ('+list.length+(list.length>=50?', latest':'')+')'),el('div','reqnote',null,'Sent by Claude\u2019s shell commands (curl, wget, HTTPie, xh), newest first.')];
  for(const q of [...list].reverse()){
   const d=el('details','req');d.dataset.seq=q.seq;d.open=open.has(String(q.seq));
   const s=el('summary','',d);
   const code=Number(q.status),cls=q.pending?'run':q.error||code>=400?'bad':code>=200&&code<400?'ok':'';
   el('span','reqstatus '+cls,s,q.pending?'…':q.status||(q.error?'failed':'—'));
+  const [label,about]=REQUEST_PLACES[q.where]||REQUEST_PLACES.internet;
+  const where=el('span','reqwhere '+(q.where||'internet'),s,label);where.title=about;
   s.append(q.method+' '+q.urls[0]+(q.urls.length>1||q.more?' (+'+(q.urls.length-1)+(q.more?'+':'')+' more)':''));
   el('div','',d,q.text);
   if(q.urls.length>1)el('div','requrls',d,q.urls.join('\n'));
@@ -6528,7 +6581,7 @@ async function loadAgents(){
 }
 function setFilesOpen(on,remember){
  $('histSide').hidden=!on;$('histPage').classList.toggle('files',on);$('histFiles').setAttribute('aria-expanded',String(on));
- sizePanes();
+ layoutPreview();
  if(remember)try{localStorage.setItem('filesOpen',on?'1':'0')}catch(e){}
 }
 async function loadHistory(){
@@ -6576,7 +6629,7 @@ function openHistory(s,fromUrl){
  $('replyErr').textContent='';$('replyText').value='';pendingImages=[];pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;
  updateFoot(s);
  let saved=null;try{saved=localStorage.getItem('filesOpen')}catch(e){}
- setFilesOpen(saved?saved==='1':innerWidth>=1100,false);
+ setFilesOpen(!singleColumn.matches&&(saved?saved==='1':innerWidth>=1100),false);  // On a phone, the chat comes first.
  $('hist').showModal();
  updatePagePreview();
  loadHistory();
@@ -6588,7 +6641,7 @@ function openFromUrl(){
  else if(!m&&histSession)$('hist').close();
 }
 addEventListener('popstate',openFromUrl);
-$('histFiles').addEventListener('click',()=>toggleSideTab(shownSideTab==='agents'?'files':shownSideTab));
+$('histFiles').addEventListener('click',()=>toggleSideTab(shownSideTab));
 $('histClose').addEventListener('click',()=>$('hist').close());
 $('hist').addEventListener('close',()=>{
  histSession=null;
