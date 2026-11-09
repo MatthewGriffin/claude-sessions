@@ -4280,9 +4280,8 @@ def rename_session(monitor, request):
     return True, "Renamed."
 
 
-def restart_server():
-    """Replace this process with the current code. Sessions live in tmux, and the app window is
-    a separate process, so both carry on. The queue lock makes sure no message is mid-delivery."""
+def restart_arguments():
+    """This server's own command line options, to start a copy that takes over its port and window."""
     arguments = [a for a in sys.argv[1:]]
     for option in ("--browser-pid", "--port"):
         if option in arguments:
@@ -4294,6 +4293,13 @@ def restart_server():
         arguments += ["--browser-pid", str(attached_browser_pid)]
     elif "--no-open" not in arguments:
         arguments.append("--no-open")
+    return arguments
+
+
+def restart_server():
+    """Replace this process with the current code. Sessions live in tmux, and the app window is
+    a separate process, so both carry on. The queue lock makes sure no message is mid-delivery."""
+    arguments = restart_arguments()
     stop_share()  # A shared camera's link ends with this copy; the new one starts unshared.
     with queue_locked():
         if WINDOWS:
@@ -4322,6 +4328,39 @@ def versioned_asset(version):
     """The release file carrying its version in its name ("claude-sessions-windows-1.2.3.exe")."""
     stem, dot, extension = RELEASE_ASSET.rpartition(".") if WINDOWS else (RELEASE_ASSET, "", "")
     return f"{stem}-{version}{dot}{extension}"
+
+
+def installers_dir():
+    """Where the Windows build saves a new version before running it. Some workplaces only let programs
+    run, or install, from one folder such as C:\\installers, so that one is used when it exists."""
+    folder = os.environ.get("CLAUDE_SESSIONS_INSTALLERS_DIR") or "C:\\installers"
+    return folder if os.path.isdir(folder) else os.path.dirname(PROGRAM_PATH)
+
+
+def stage_installer(data, name):
+    """Save a downloaded Windows build as name in installers_dir(). Returns where it went."""
+    folder = installers_dir()
+    path = os.path.join(folder, os.path.basename(name))
+    downloaded = f"{path}.{secrets.token_hex(4)}.download"
+    with open(downloaded, "wb") as handle:
+        handle.write(data)
+    try:
+        for attempt in range(6):
+            # The same version may be there already and running; then it goes beside it.
+            target = path if attempt < 3 else f"{path[:-4]}-{secrets.token_hex(3)}.exe"
+            if os.path.normcase(os.path.abspath(target)) == os.path.normcase(PROGRAM_PATH):
+                continue
+            try:
+                os.replace(downloaded, target)
+                return target
+            except OSError:
+                if attempt == 5:
+                    raise
+                time.sleep(1)  # Antivirus often holds a program it has just seen written.
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(downloaded)
+    raise OSError(f"couldn't save the new version in {folder}")
 
 
 def move_aside(path):
@@ -4391,6 +4430,7 @@ class Releases:
 
     def __init__(self):
         self.latest = None
+        self.staged = None  # Windows: the downloaded new version, waiting to be run.
         self.lock = threading.Lock()
 
     def check(self):
@@ -4437,14 +4477,15 @@ class Releases:
                 return False, "The download didn't match its checksum, so it wasn't installed."
             if not WINDOWS:
                 compile(data, PROGRAM_PATH, "exec")  # A broken script would leave no app to come back to.
+            if WINDOWS:
+                # Saved as an installer and run from there: it then installs itself, as the first download did.
+                self.staged = stage_installer(data, latest.get("asset") or RELEASE_ASSET)
+                return True, f"Downloaded version {latest['version']}."
             downloaded = f"{PROGRAM_PATH}.{secrets.token_hex(4)}.download"  # A fresh name: an old one may be held open.
             with open(downloaded, "wb") as handle:
                 handle.write(data)
-            if WINDOWS:
-                replace_running_program(downloaded, PROGRAM_PATH)
-            else:
-                os.chmod(downloaded, os.stat(PROGRAM_PATH).st_mode | 0o111)
-                os.replace(downloaded, PROGRAM_PATH)
+            os.chmod(downloaded, os.stat(PROGRAM_PATH).st_mode | 0o111)
+            os.replace(downloaded, PROGRAM_PATH)
             return True, f"Installed version {latest['version']}."
         except (OSError, ValueError, SyntaxError) as exc:
             with contextlib.suppress(OSError, NameError):
@@ -4459,9 +4500,27 @@ releases = Releases()
 
 def update_app(monitor, request):
     succeeded, message = releases.install()
-    if succeeded:
-        threading.Timer(0.3, restart_server).start()  # After this request has been answered.
-    return succeeded, message
+    if not succeeded:
+        return False, message
+    if WINDOWS:
+        staged = releases.staged
+        try:
+            # It installs itself over this copy, then the installed one waits for this one's port.
+            subprocess.Popen([staged, *restart_arguments(), "--wait-for-port"], close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            return False, f"The new version is saved as {staged}, but Windows wouldn't start it ({clean(str(exc))}). Close this app, then run that file."
+        threading.Timer(0.3, hand_over).start()  # After this request has been answered.
+        return True, message
+    threading.Timer(0.3, restart_server).start()  # After this request has been answered.
+    return True, message
+
+
+def hand_over():
+    """Leave, for the copy that waits for this port. Not while a message is being typed."""
+    stop_share()
+    with queue_locked():
+        os._exit(0)
 
 
 POST_ROUTES = {
@@ -7370,13 +7429,15 @@ def install_windows():
         return False
     try:
         os.makedirs(WINDOWS_INSTALL_DIR, exist_ok=True)
-        temporary = target + ".download"
+        temporary = f"{target}.{secrets.token_hex(4)}.download"  # A fresh name: an old one may be held open.
         shutil.copyfile(PROGRAM_PATH, temporary)
         if os.path.exists(target):
             replace_running_program(temporary, target)  # It may be running.
         else:
             os.replace(temporary, target)
     except OSError:
+        with contextlib.suppress(OSError, UnboundLocalError):
+            os.unlink(temporary)
         return False  # Carry on from here instead.
     script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
               "[Environment]::GetFolderPath('Programs')+'\\Claude Sessions.lnk');"

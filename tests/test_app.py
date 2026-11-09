@@ -137,6 +137,7 @@ class UpdateTests(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
         os.environ["CLAUDE_SESSIONS_RELEASES_URL"] = self.base + "/latest"
+        os.environ["CLAUDE_SESSIONS_INSTALLERS_DIR"] = os.path.join(folder, "installers")  # Missing: beside the program.
         self.installed = os.path.join(folder, "claude-monitor")
         with open(self.installed, "w", encoding="utf-8") as handle:
             handle.write(self.stamped("1.0.0"))
@@ -145,6 +146,7 @@ class UpdateTests(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown()
         os.environ.pop("CLAUDE_SESSIONS_RELEASES_URL", None)
+        os.environ.pop("CLAUDE_SESSIONS_INSTALLERS_DIR", None)
         shutil.rmtree(self.folder, ignore_errors=True)
 
     def stamped(self, version):
@@ -166,7 +168,8 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.old.releases.offer()["version"], "1.2.0")
         succeeded, message = self.old.releases.install()
         self.assertTrue(succeeded, message)
-        with open(self.installed, encoding="utf-8") as handle:
+        # Windows saves it as an installer to run, which then installs itself.
+        with open(self.old.releases.staged if WINDOWS else self.installed, encoding="utf-8") as handle:
             self.assertIn('APP_VERSION = "1.2.0"', handle.read())
 
     def test_prefers_the_file_named_with_its_version(self):
@@ -217,10 +220,11 @@ class UpdateTests(unittest.TestCase):
 class BuiltUpdateTests(unittest.TestCase):
     """The built program updates itself from a stand-in release and comes back, twice in a row."""
 
-    NAME = "cs-update-test.exe"  # Its own name, so cleaning up can't stop a real copy.
+    NAME = "cs-update-test.exe"
 
     def setUp(self):
-        self.folder = tempfile.mkdtemp(prefix="claude-sessions-built-update-")
+        # The long form: Windows reports process paths that way, while the temp folder may be RUNNER~1.
+        self.folder = os.path.realpath(tempfile.mkdtemp(prefix="claude-sessions-built-update-"))
         self.program = os.path.join(self.folder, self.NAME)
         with open(os.environ["CLAUDE_SESSIONS_TEST_PROGRAM"], "rb") as handle:
             self.body = handle.read()
@@ -245,8 +249,14 @@ class BuiltUpdateTests(unittest.TestCase):
         self.config = os.path.join(self.folder, "config")
         self.addCleanup(self.stop)
 
+    def stop_programs(self):
+        """Every process running from this test's folder, and nothing else."""
+        script = "Get-Process | Where-Object { $_.Path -and $_.Path -like ($env:CS_FOLDER + '\\*') } | Stop-Process -Force"
+        subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                       env={**os.environ, "CS_FOLDER": self.folder}, capture_output=True, timeout=60)
+
     def stop(self):
-        subprocess.run(["taskkill", "/F", "/T", "/IM", self.NAME], capture_output=True)
+        self.stop_programs()
         self.server.shutdown()
         time.sleep(1)
         shutil.rmtree(self.folder, ignore_errors=True)
@@ -280,22 +290,30 @@ class BuiltUpdateTests(unittest.TestCase):
         environment = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_") and k != "_MEIPASS2"}
         # The app won't start without Claude Code, so a stand-in that lists no sessions.
         tools = os.path.join(self.folder, "tools")
-        os.makedirs(tools)
+        installers = os.path.join(self.folder, "installers")  # Like C:\\installers on a locked-down laptop.
+        local = os.path.join(self.folder, "local")
+        for folder in (tools, installers, local):
+            os.makedirs(folder)
         with open(os.path.join(tools, "claude.cmd"), "w") as handle:
             handle.write("@echo []\n")
         environment.update(CLAUDE_CONFIG_DIR=self.config, CLAUDE_SESSIONS_RELEASES_URL=self.base + "/latest",
-                           CLAUDE_SESSIONS_NO_INSTALL="1", PATH=tools + os.pathsep + environment.get("PATH", ""),
+                           CLAUDE_SESSIONS_INSTALLERS_DIR=installers, LOCALAPPDATA=local,
+                           PATH=tools + os.pathsep + environment.get("PATH", ""),
                            # Its own session host port: the terminal tests' host may still hold theirs.
                            CLAUDE_SESSIONS_HOST_PORT=str(23000 + secrets.randbelow(2000)))
+        environment.pop("CLAUDE_SESSIONS_NO_INSTALL", None)
+        installed = os.path.join(local, "Programs", "Claude Sessions", "claude-sessions.exe")
         started = time.time()
         subprocess.run([self.program, "--statusline"], input=b"{}", env=environment, capture_output=True, timeout=60)
         print(f"\n  one status line run took {time.time() - started:.1f} s", file=sys.stderr)
         self.publish("998.0.0")
-        first = subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
+        # Started from where it was downloaded, it installs itself and starts from there.
+        subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
         self.assertTrue(wait_for(self.answers, 60), "the program didn't start")
-        # A session host running from the program keeps running from the copy each update moves aside,
-        # as it does for real while sessions run. The second update then can't reuse that name.
-        host = subprocess.Popen([self.program, "--session-host"], env=environment)
+        self.assertTrue(os.path.exists(installed), "it didn't install itself")
+        # A session host running from the installed program keeps running from the copy each update moves
+        # aside, as it does for real while sessions run.
+        host = subprocess.Popen([installed, "--session-host"], env=environment)
         time.sleep(5)
         self.assertIsNone(host.poll(), "the session host didn't keep running")
         for attempt in ("first", "second"):
@@ -307,17 +325,15 @@ class BuiltUpdateTests(unittest.TestCase):
             self.assertEqual(status, 200, reply)
             time.sleep(3)
             self.assertTrue(wait_for(self.answers, 60), f"the program didn't come back after the {attempt} update")
-        self.assertIsNotNone(first.poll(), "the first copy should have handed over and exited")
+            self.assertIn("claude-sessions-windows-998.0.0.exe", os.listdir(installers), "the update wasn't saved as an installer")
         self.assertIsNone(host.poll(), "the session host should have kept running through both updates")
         host.kill()
-        host.wait(10)
-        time.sleep(1)
-        # Started again with nothing running from them, the program clears the copies updates moved aside.
-        subprocess.run(["taskkill", "/F", "/T", "/IM", self.NAME], capture_output=True)
+        self.stop_programs()
         time.sleep(2)
-        later = subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
+        # Started again with nothing running from them, the program clears the copies updates moved aside.
+        later = subprocess.Popen([installed, "--web", "--no-open", "--port", str(self.port)], env=environment)
         self.assertTrue(wait_for(self.answers, 60), "the program didn't start again")
-        left = [n for n in os.listdir(self.folder) if n.endswith(".old") or n.endswith(".download")]
+        left = [n for n in os.listdir(os.path.dirname(installed)) if n.endswith(".old") or n.endswith(".download")]
         self.assertEqual(left, [])
         later.kill()
 
