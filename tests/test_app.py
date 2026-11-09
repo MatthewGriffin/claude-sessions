@@ -535,5 +535,65 @@ class PrinterTests(unittest.TestCase):
         sessions = [{"id": "a", "name": "3D Printing", "pid": 1}, {"id": "b", "name": "Meal Planner", "pid": 2}]
         self.assertEqual([l["id"] for l in monitor.linked_devices(sessions)[0]["sessions"]], ["a"])
 
+
+class PortTests(unittest.TestCase):
+    """Another program on the app's port: the app moves to the next one, not open that program's page."""
+
+    def setUp(self):
+        self.saved = {name: getattr(app, name) for name in ("run_queue_delivery", "serving_port")}
+        self.saved_watch = app.releases.watch
+        app.run_queue_delivery = lambda monitor: None
+        app.releases.watch = lambda: None
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+        app.releases.watch = self.saved_watch
+
+    def foreign_server(self):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"404 page not found\n"  # What a Go program says.
+                self.send_response(404)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        for _ in range(20):
+            try:
+                server = http.server.ThreadingHTTPServer(("127.0.0.1", 20000 + secrets.randbelow(5000)), Handler)
+                break
+            except OSError:
+                continue
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def test_moves_past_another_program(self):
+        taken = self.foreign_server()
+        self.assertFalse(app.app_answers(taken))
+        self.assertFalse(app.host_answers(taken))
+        threading.Thread(target=app.run_web, args=(None, taken, False), kwargs={"fixed_port": False}, daemon=True).start()
+        moved = taken + 10000
+        self.assertTrue(wait_for(lambda: app.app_answers(moved), 10))
+        self.assertEqual(app.serving_port, moved)
+        # A second copy finds the first rather than starting another server.
+        with self.assertRaises(SystemExit) as raised:
+            app.run_web(None, taken, False, fixed_port=False)
+        self.assertIn(f"127.0.0.1:{moved}/", str(raised.exception.code))
+        # Asked for that port by name, it says so instead of moving.
+        with self.assertRaises(SystemExit) as raised:
+            app.run_web(None, taken, False)
+        self.assertIn("cannot use port", str(raised.exception.code))
+
+    def test_choices_are_fixed(self):
+        self.assertEqual(app.port_choices(8766), [8766, 18766, 28766, 38766, 48766])
+        self.assertEqual(app.port_choices(30000), [30000, 40000, 50000, 60000])
+
+
 if __name__ == "__main__":
     unittest.main()

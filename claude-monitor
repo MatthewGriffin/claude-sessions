@@ -189,6 +189,12 @@ APP_CLASS = "claude-sessions"
 TMUX_SOCKET = os.environ.get("CLAUDE_SESSIONS_TMUX_SOCKET") or "claude-sessions"
 PHONE_PORT = int(os.environ.get("CLAUDE_SESSIONS_PHONE_PORT") or 8768)  # Phone access, on the local network when turned on.
 HOST_PORT = int(os.environ.get("CLAUDE_SESSIONS_HOST_PORT") or 8767)  # The Windows session host, on 127.0.0.1 only.
+
+
+def port_choices(port):
+    """Ports to try in turn when another program already uses one. The list is fixed, so a second
+    copy looks in the same places and finds the first."""
+    return [port] + [port + step for step in (10000, 20000, 30000, 40000) if port + step < 65536]
 HOST_IDLE_SECONDS = 120  # How long the session host waits with no sessions before it exits.
 TERM_COLUMNS, TERM_ROWS = 120, 40
 START_TIMEOUT_SECONDS = 20
@@ -2383,8 +2389,10 @@ def host_call(op, start=False, timeout=5, **fields):
     for attempt in range(2):
         try:
             with open(HOST_TOKEN_FILE) as handle:
-                token = handle.read().strip()
-            with socket.create_connection(("127.0.0.1", HOST_PORT), timeout=timeout) as connection:
+                saved = handle.read().split()  # The token, then the port it found free.
+            token = saved[0] if saved else ""
+            port = int(saved[1]) if len(saved) > 1 else HOST_PORT
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout) as connection:
                 connection.sendall(json.dumps({"token": token, "op": op, **fields}).encode() + b"\n")
                 data = b""
                 while not data.endswith(b"\n"):
@@ -2400,6 +2408,18 @@ def host_call(op, start=False, timeout=5, **fields):
         if not start or attempt or not start_host():
             return None
     return None
+
+
+def host_answers(port):
+    """Whether this app's session host is on the port. It turns away a request without its token
+    in its own way, which no other program would copy."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
+            connection.settimeout(2)
+            connection.sendall(b"{}\n")
+            return json.loads(connection.recv(256)) == {"denied": True}
+    except (OSError, ValueError):
+        return False
 
 
 def start_host():
@@ -2604,15 +2624,21 @@ def run_session_host():
         allow_reuse_address = False  # On Windows it would let a second host share the port.
         daemon_threads = True
 
-    try:
-        server = Server(("127.0.0.1", HOST_PORT), Handler)
-    except OSError:
-        return 0  # Already running.
+    for port in port_choices(HOST_PORT):
+        try:
+            server = Server(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            if host_answers(port):
+                return 0  # Already running.
+            # Another program has this port, or Windows keeps it back, so try the next.
+    else:
+        return 1
     os.makedirs(MONITOR_DIR, exist_ok=True)
     temporary = f"{HOST_TOKEN_FILE}.{os.getpid()}"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w") as handle:
-        handle.write(token)
+        handle.write(f"{token}\n{port}\n")
     os.replace(temporary, HOST_TOKEN_FILE)
 
     def exit_when_idle():
@@ -3420,9 +3446,12 @@ def restart_server():
     """Replace this process with the current code. Sessions live in tmux, and the app window is
     a separate process, so both carry on. The queue lock makes sure no message is mid-delivery."""
     arguments = [a for a in sys.argv[1:]]
-    if "--browser-pid" in arguments:
-        at = arguments.index("--browser-pid")
-        del arguments[at:at + 2]
+    for option in ("--browser-pid", "--port"):
+        if option in arguments:
+            at = arguments.index(option)
+            del arguments[at:at + 2]
+    if serving_port:
+        arguments += ["--port", str(serving_port)]  # Wait for this port, not look for another.
     if attached_browser_pid:
         arguments += ["--browser-pid", str(attached_browser_pid)]
     elif "--no-open" not in arguments:
@@ -5633,14 +5662,14 @@ def wait_for_window():
         return 0
 
 
-def run_app(monitor, port, browser_pid=None):
+def run_app(monitor, port, browser_pid=None, fixed_port=False):
     browser = app_browser()
     if not browser:
         desktop_notify("Claude Sessions can't open", "It needs Chromium, Chrome or Brave installed.", True)
         if WINDOWS:
             message_box("Claude Sessions", "It needs Microsoft Edge, Chrome or Brave installed.")
         return 1
-    return run_web(monitor, port, False, browser, browser_pid)
+    return run_web(monitor, port, False, browser, browser_pid, fixed_port)
 
 
 class WebServer(http.server.ThreadingHTTPServer):
@@ -5661,15 +5690,28 @@ def bind_server(port, handler):
             time.sleep(0.2)
 
 
-def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=None):
-    global attached_browser_pid
-    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-    allowed_origins = {f"http://{host}" for host in allowed_hosts}
+def app_answers(port):
+    """Whether this app's own server is on the port, rather than some other program."""
+    try:
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        connection.request("GET", "/api/sessions")
+        response = connection.getresponse()
+        body = response.read(200)
+        connection.close()
+    except (OSError, http.client.HTTPException):
+        return False
+    # Versions up to 0.1.6 had no header, but turned the request away with this text.
+    return bool(response.getheader("X-Claude-Sessions")) or body.startswith(b"Open the link printed by: claude-monitor")
+
+
+serving_port = None  # The port this copy's server got, which a restart keeps.
+
+
+def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=None, fixed_port=True):
+    global attached_browser_pid, serving_port
     token = access_token()
-    url = f"http://127.0.0.1:{port}/?t={token}"
     # Process arguments are visible to other users, so the app window gets a single-use code.
     app_codes = {secrets.token_urlsafe(32)} if app_browser_command else set()
-    app_url = f"http://127.0.0.1:{port}/?t={next(iter(app_codes))}" if app_codes else ""
 
     class Handler(http.server.BaseHTTPRequestHandler):
         on_phone = False  # The copy listening on the local network, for phones.
@@ -5694,6 +5736,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Claude-Sessions", "1")  # So a second copy knows this port is ours.
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data: 'self'; "
@@ -5838,18 +5881,36 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
         def log_message(self, *args):
             pass
 
-    try:
-        server = bind_server(port, Handler)
-        threading.Thread(target=releases.watch, daemon=True).start()
-        threading.Thread(target=run_queue_delivery, args=(monitor,), daemon=True).start()
-        phone["handler"] = type("PhoneHandler", (Handler,), {"on_phone": True})
-        if phone_settings()["enabled"]:
-            threading.Thread(target=start_phone_on_launch, daemon=True).start()
-    except OSError as exc:
-        if app_browser_command:
-            # Already open: this browser profile holds the cookie, so no code is needed.
-            return open_app_window(app_browser_command, f"http://127.0.0.1:{port}/")
-        sys.exit(f"claude-monitor: cannot use port {port} ({exc}); try --port N\nIf it's already running, open: {url}")
+    server = running = failure = None
+    for port in [port] if fixed_port else port_choices(port):
+        try:
+            server = bind_server(port, Handler)
+            break
+        except OSError as exc:
+            failure = exc
+            if app_answers(port):
+                running = port
+                break
+            # Another program has this port, or Windows keeps it back, so try the next.
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    allowed_origins = {f"http://{host}" for host in allowed_hosts}
+    url = f"http://127.0.0.1:{port}/?t={token}"
+    app_url = f"http://127.0.0.1:{port}/?t={next(iter(app_codes))}" if app_codes else ""
+    if running and app_browser_command:
+        # Already open: this browser profile holds the cookie, so no code is needed.
+        return open_app_window(app_browser_command, f"http://127.0.0.1:{running}/")
+    if running:
+        sys.exit(f"claude-monitor is already running. Open: {url}")
+    if not server:
+        if app_browser_command and WINDOWS:
+            message_box("Claude Sessions", f"Claude Sessions couldn't start, because other programs are using its ports ({failure}).")
+        sys.exit(f"claude-monitor: cannot use port {port} ({failure}); try --port N")
+    serving_port = port
+    threading.Thread(target=releases.watch, daemon=True).start()
+    threading.Thread(target=run_queue_delivery, args=(monitor,), daemon=True).start()
+    phone["handler"] = type("PhoneHandler", (Handler,), {"on_phone": True})
+    if phone_settings()["enabled"]:
+        threading.Thread(target=start_phone_on_launch, daemon=True).start()
     if app_browser_command:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         attached_browser_pid = browser_pid or start_app_window(app_browser_command, app_url).pid
@@ -6059,9 +6120,9 @@ def main():
         run_setup(verbose=False)
     monitor = Monitor()
     if args.app:
-        return run_app(monitor, args.port or APP_PORT, args.browser_pid)
+        return run_app(monitor, args.port or APP_PORT, args.browser_pid, args.port is not None)
     if args.web:
-        return run_web(monitor, args.port or WEB_PORT, not args.no_open)
+        return run_web(monitor, args.port or WEB_PORT, not args.no_open, fixed_port=args.port is not None)
     if args.once or not sys.stdout.isatty():
         monitor.refresh()
         print_once(monitor)
