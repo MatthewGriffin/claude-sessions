@@ -3988,7 +3988,10 @@ def send_queued_now(monitor, request):
         item = next((i for i in items if i["id"] == request.get("item")), None)
         if not item:
             return False, "That message has already been sent."
-        if item.get("refresh") or item.get("retry") or item.get("guard"):
+        # Of Write notes & restart, only writing the notes can go now. Clearing the chat waits for
+        # the notes to be confirmed, and carrying on comes after that.
+        first_refresh = next((i for i in items if i.get("refresh")), None)
+        if item.get("retry") or item.get("guard") or (item.get("refresh") and item is not first_refresh):
             return False, "That step only runs once the session is idle."
         if session["status"] == "waiting":
             return False, "It's waiting for an answer. Answer it first, then send this."
@@ -4024,6 +4027,10 @@ def send_queued_now(monitor, request):
             if not succeeded:
                 return False, message
         items.remove(item)
+        if item.get("refresh"):
+            # The rest of the restart goes next, so no other message lands between the notes and the clear.
+            rest = [i for i in items if i.get("refresh")]
+            items[:] = rest + [i for i in items if not i.get("refresh")]
         return True, "Sent."
 
 
@@ -6335,9 +6342,10 @@ function renderQueue(s){
    const b=el('button','primary',row,'Retry');b.type='button';
    b.addEventListener('click',()=>act('resend',{id:s.id,item:item.id}));
   }
-  if(s.status==='busy'&&!item.refresh&&!item.retry&&!item.error){
+  const firstRefresh=item.refresh&&!item.guard&&items.find(i=>i.refresh)===item;
+  if(s.status==='busy'&&(!item.refresh||firstRefresh)&&!item.retry&&!item.error){
    const b=el('button','primary',row,'Send now');b.type='button';
-   b.title=item.text.startsWith('/')?'Interrupt Claude, then run this command':'Interrupt Claude and send this now, like Ctrl+X Ctrl+S in Claude Code';
+   b.title=item.refresh?'Interrupt Claude and have it write its notes now. The chat is cleared once it confirms they\u2019re saved, then it carries on.':item.text.startsWith('/')?'Interrupt Claude, then run this command':'Interrupt Claude and send this now, like Ctrl+X Ctrl+S in Claude Code';
    b.addEventListener('click',()=>{b.disabled=true;act('sendnow',{id:s.id,item:item.id})});
   }
   if(!item.refresh)button('Remove');

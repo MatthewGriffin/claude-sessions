@@ -711,6 +711,17 @@ class SendNowTests(unittest.TestCase):
         self.assertEqual([i["id"] for i in self.queued()], ["b"])
         self.assertEqual(app.read_queue()["checks"]["s1"]["count"], 3)
 
+    def test_write_notes_can_go_now_and_the_rest_follows_next(self):
+        app.save_and_refresh(self.monitor, {"id": "s1"})
+        steps = [i for i in self.queued() if i.get("refresh")]
+        for later in steps[1:]:  # Clearing the chat waits for the notes to be confirmed.
+            self.assertFalse(app.send_queued_now(self.monitor, {"id": "s1", "item": later["id"]})[0])
+        self.assertEqual(self.typed, [])
+        ok, message = app.send_queued_now(self.monitor, {"id": "s1", "item": steps[0]["id"]})
+        self.assertTrue(ok, message)
+        self.assertEqual(self.typed[-3:], ["Enter", "C-x", "C-s"])
+        self.assertEqual([i["id"] for i in self.queued()], [steps[1]["id"], steps[2]["id"], "a", "b"])
+
     def test_text_left_in_the_box_gets_its_own_paragraph(self):
         # After an interrupt Claude Code puts the message back in the box, and the next one
         # mustn't run on from it ("fix issuesBefore this chat...").
