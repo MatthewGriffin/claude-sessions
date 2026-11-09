@@ -291,6 +291,11 @@ class BuiltUpdateTests(unittest.TestCase):
         self.publish("998.0.0")
         first = subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
         self.assertTrue(wait_for(self.answers, 60), "the program didn't start")
+        # A session host running from the program keeps running from the copy each update moves aside,
+        # as it does for real while sessions run. The second update then can't reuse that name.
+        host = subprocess.Popen([self.program, "--session-host"], env=environment)
+        time.sleep(5)
+        self.assertIsNone(host.poll(), "the session host didn't keep running")
         for attempt in ("first", "second"):
             def offered():
                 status, state = self.request("/api/sessions")
@@ -301,6 +306,18 @@ class BuiltUpdateTests(unittest.TestCase):
             time.sleep(3)
             self.assertTrue(wait_for(self.answers, 60), f"the program didn't come back after the {attempt} update")
         self.assertIsNotNone(first.poll(), "the first copy should have handed over and exited")
+        self.assertIsNone(host.poll(), "the session host should have kept running through both updates")
+        host.kill()
+        host.wait(10)
+        time.sleep(1)
+        # Started again with nothing running from them, the program clears the copies updates moved aside.
+        subprocess.run(["taskkill", "/F", "/T", "/IM", self.NAME], capture_output=True)
+        time.sleep(2)
+        later = subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
+        self.assertTrue(wait_for(self.answers, 60), "the program didn't start again")
+        left = [n for n in os.listdir(self.folder) if n.endswith(".old") or n.endswith(".download")]
+        self.assertEqual(left, [])
+        later.kill()
 
 
 class PrinterControlTests(unittest.TestCase):

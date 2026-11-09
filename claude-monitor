@@ -4324,6 +4324,50 @@ def versioned_asset(version):
     return f"{stem}-{version}{dot}{extension}"
 
 
+def move_aside(path):
+    """Move a program that may be running out of the way, as Windows can't overwrite it. Returns its new name.
+
+    The session host and Claude Code's hooks can still be running from the copy an earlier update
+    moved aside, so that name may be taken and impossible to delete: then a new one is used.
+    """
+    with contextlib.suppress(OSError):
+        os.unlink(path + ".old")
+    names = [path + ".old"] + [f"{path}.{secrets.token_hex(4)}.old" for _ in range(3)]
+    for attempt, name in enumerate(names):
+        try:
+            os.replace(path, name)
+            return name
+        except OSError:
+            if attempt == len(names) - 1:
+                raise
+            time.sleep(0.5)  # Antivirus may be holding it for a moment.
+
+
+def replace_running_program(new, path):
+    """Put the file `new` in place of the (running) program at `path`, keeping the old one if that fails."""
+    previous = move_aside(path)
+    for attempt in range(10):
+        try:
+            os.replace(new, path)
+            return
+        except OSError:
+            if attempt == 9:
+                with contextlib.suppress(OSError):
+                    os.replace(previous, path)
+                raise
+            time.sleep(1)  # Antivirus often holds a program it has just seen written.
+
+
+def remove_old_copies(path):
+    """Copies an update moved aside, once nothing runs from them any more."""
+    folder, name = os.path.split(path)
+    with contextlib.suppress(OSError):
+        for entry in os.listdir(folder):
+            if entry.startswith(name + ".") and (entry.endswith(".old") or entry.endswith(".download")):
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(folder, entry))
+
+
 def version_tuple(text):
     match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(text or "").strip())
     return tuple(int(n) for n in match.groups()) if match else None
@@ -4393,27 +4437,18 @@ class Releases:
                 return False, "The download didn't match its checksum, so it wasn't installed."
             if not WINDOWS:
                 compile(data, PROGRAM_PATH, "exec")  # A broken script would leave no app to come back to.
-            downloaded = PROGRAM_PATH + ".download"
+            downloaded = f"{PROGRAM_PATH}.{secrets.token_hex(4)}.download"  # A fresh name: an old one may be held open.
             with open(downloaded, "wb") as handle:
                 handle.write(data)
             if WINDOWS:
-                # A running program can't be overwritten on Windows, but it can be moved out of the way.
-                previous = PROGRAM_PATH + ".old"
-                with contextlib.suppress(OSError):
-                    os.unlink(previous)
-                os.replace(PROGRAM_PATH, previous)
-                try:
-                    os.replace(downloaded, PROGRAM_PATH)
-                except OSError:
-                    os.replace(previous, PROGRAM_PATH)
-                    raise
+                replace_running_program(downloaded, PROGRAM_PATH)
             else:
                 os.chmod(downloaded, os.stat(PROGRAM_PATH).st_mode | 0o111)
                 os.replace(downloaded, PROGRAM_PATH)
             return True, f"Installed version {latest['version']}."
         except (OSError, ValueError, SyntaxError) as exc:
-            with contextlib.suppress(OSError):
-                os.unlink(PROGRAM_PATH + ".download")
+            with contextlib.suppress(OSError, NameError):
+                os.unlink(downloaded)
             return False, f"The update failed: {clean(exc)}"
         finally:
             self.lock.release()
@@ -7338,10 +7373,9 @@ def install_windows():
         temporary = target + ".download"
         shutil.copyfile(PROGRAM_PATH, temporary)
         if os.path.exists(target):
-            with contextlib.suppress(OSError):
-                os.unlink(target + ".old")
-            os.replace(target, target + ".old")  # It may be running.
-        os.replace(temporary, target)
+            replace_running_program(temporary, target)  # It may be running.
+        else:
+            os.replace(temporary, target)
     except OSError:
         return False  # Carry on from here instead.
     script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
@@ -7408,8 +7442,7 @@ def main():
         return run_session_host()
     wait_for_port = args.wait_for_port
     if WINDOWS:
-        with contextlib.suppress(OSError):
-            os.unlink(PROGRAM_PATH + ".old")  # Left behind by an update.
+        remove_old_copies(PROGRAM_PATH)  # Left behind by updates.
         if FROZEN and not (args.web or args.once):
             args.app = True  # There is no terminal view in the Windows build.
         if install_windows():
