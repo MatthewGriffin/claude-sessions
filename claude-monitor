@@ -6040,7 +6040,7 @@ async function sendPrinter(p,control,value,question){
   const d=await post('printer-control',{host:p.host,control,value});
   if(d.error){say(p,d.error,true);return false}
   if(d.message.print)p.device={...p.device,print:d.message.print};
-  say(p,d.message.text);return true;
+  say(p,'');return true;  // The readings and buttons show it worked; only problems need words.
  }catch(e){say(p,'Lost connection to claude-monitor.',true);return false}
  finally{p.busy=false;updatePrinterPanel(p)}
 }
