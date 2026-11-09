@@ -11,6 +11,7 @@ import hashlib
 import http.server
 import importlib.machinery
 import importlib.util
+import base64
 import io
 import json
 import os
@@ -522,6 +523,25 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(any("--context" in c for c in commands))
         self.assertIn("someone --else", commands)  # Other hooks in the same group stay.
         self.assertEqual(sum("--hook" in c for c in commands), 1)
+
+
+class ToolPictureTests(unittest.TestCase):
+    def test_a_picture_claude_opened_is_served(self):
+        path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "t.jsonl")
+        jpeg = b"\xff\xd8\xff\xe0 a camera frame"
+        with open(path, "w") as handle:
+            handle.write(json.dumps({"type": "assistant", "uuid": "1", "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/tmp/frame.jpg"}}]}}) + "\n")
+            handle.write(json.dumps({"type": "user", "uuid": "2", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(jpeg).decode()}}]}]}}) + "\n")
+        history = app.HistoryReader(path)
+        history.poll()
+        tool = next(m for m in history.messages if m.get("role") == "tool")
+        self.assertEqual(tool["images"], 1)
+        self.assertEqual(history.tool_image("toolu_1", 0), ("image/jpeg", jpeg))
+        self.assertIsNone(history.tool_image("toolu_1", 1))
+        self.assertIsNone(history.tool_image("toolu_9", 0))
 
 
 class StatusLineTests(unittest.TestCase):

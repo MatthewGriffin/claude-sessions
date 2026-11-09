@@ -1037,6 +1037,16 @@ class Monitor:
             except OSError:
                 return None
 
+    def tool_image(self, session_id, tool_id, number, agent_id=None):
+        with self.history_lock:
+            try:
+                reader = self._history_reader(session_id)
+                if reader and agent_id:
+                    reader = reader.subagent_reader(agent_id)
+                return reader.tool_image(tool_id, number) if reader else None
+            except OSError:
+                return None
+
     def subagents(self, session_id, open_ids, since=None):
         """This session's subagents, or just {"unchanged"} if they match revision `since`."""
         session = next((s for s in self.snapshot()["sessions"] if s["id"] == session_id), None)
@@ -2940,6 +2950,22 @@ class HistoryReader:
                     if source.get("type") == "base64" and source.get("media_type") in IMAGE_TYPES:
                         details["images"].append(f"data:{source['media_type']};base64,{source.get('data', '')}")
         return details
+
+    def tool_image(self, tool_id, number):
+        """(media type, bytes) of one picture a tool call returned, such as a photo Claude opened with Read, or None."""
+        tool = self.tools.get(tool_id)
+        if not tool or tool["result_at"] is None or not 0 <= number < MAX_TOOL_IMAGES:
+            return None
+        for block in (self._read_entry(tool["result_at"]).get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("tool_use_id") == tool_id:
+                images = tool_result_parts(block.get("content"))[1]
+                source = (images[number].get("source") or {}) if number < len(images) else {}
+                if source.get("type") == "base64" and source.get("media_type") in IMAGE_TYPES:
+                    try:
+                        return source["media_type"], base64.b64decode(source.get("data", ""), validate=True)
+                    except (ValueError, TypeError):
+                        return None
+        return None
 
     def subagent_reader(self, agent_id):
         """Reader for one subagent, caught up. The id comes from the page, so it's only matched, never used in a path."""
@@ -5381,6 +5407,9 @@ html:has(#hist[open]){overflow:hidden}
 .tool.failed summary{color:var(--bad)}
 .tool .showall{margin:4px 0}
 .tool img{display:block;max-width:min(100%,480px);margin:6px 0;border:1px solid var(--line)}
+.toolwrap{display:grid;gap:6px;min-width:0}
+.tpics{display:flex;flex-wrap:wrap;gap:8px}.tpics:empty{display:none}
+.tpics img{display:block;max-width:min(100%,480px);max-height:360px;border:1px solid var(--line);border-radius:4px;background:#000}
 .thinking{font-size:12px;color:var(--dim);border:0;padding:0;min-width:0}
 .thinking summary{font-style:italic}.thinking div{white-space:pre-wrap;overflow-wrap:anywhere;border-left:2px solid var(--line);padding:4px 0 4px 8px;margin-top:4px}
 #histEarlier{justify-self:center}
@@ -6210,7 +6239,7 @@ async function refresh(){
   if(histSession&&!cards.has(histSession)){
    const moved=d.sessions.find(s=>s.pid===histPid);
    if(moved){
-    histSession=moved.id;histRev=null;toolFull=new Map();keysFor=null;
+    histSession=moved.id;histRev=null;toolFull=new Map();toolPictures=new Map();keysFor=null;
     history.replaceState(null,'',pageHash(moved.id));
     $('histHint').textContent=moved.cwd+' · pid '+moved.pid+(moved.hosted?' · keeps running after you close this app':'');
     updateFoot(moved);loadHistory();
@@ -6372,12 +6401,36 @@ function applyToolDetails(d,details){
  d.querySelector('.tinput').textContent=details.input;
  d.querySelector('.tresult').textContent=details.result;
  d.querySelector('.timages')?.remove();
- if(details.images.length){
+ if(details.images.length&&!d.dataset.inline){
   const box=el('div','timages',d);
   for(const src of details.images){const i=el('img','',box);i.alt='Image from this tool';i.src=src}
  }
 }
+// Pictures a tool returned, such as a camera photo Claude opened with Read, shown in the chat as
+// they are in Claude's own apps. The same elements are reused on each redraw, so they never flicker.
+let toolPictures=new Map();
+function toolPictureBox(m,agent){
+ const box=el('div','tpics');
+ for(let n=0;n<Math.min(m.images,12);n++){
+  const url='/api/tool-image?id='+encodeURIComponent(histSession)+'&tool='+encodeURIComponent(m.id)+'&n='+n+(agent?'&agent='+encodeURIComponent(agent.id):'');
+  if(!toolPictures.has(url)){
+   const a=el('a','picture');a.href=url;a.target='_blank';a.rel='noopener';
+   const i=el('img','',a);i.src=url;i.alt='Picture from: '+m.text;i.loading='lazy';
+   i.addEventListener('error',()=>a.remove());
+   toolPictures.set(url,a);
+  }
+  box.append(toolPictures.get(url));
+ }
+ return box;
+}
 function toolRow(m,open,agent){
+ const row=toolDetailsRow(m,open,agent);
+ if(!m.images||m.error)return row;
+ row.dataset.inline='1';
+ const wrap=el('div','toolwrap');wrap.append(row,toolPictureBox(m,agent));
+ return wrap;
+}
+function toolDetailsRow(m,open,agent){
  const d=el('details','tool'+(m.error?' failed':''));d.dataset.seq=m.seq;d.open=open;
  const summary=el('summary','',d,(m.error?'✗ ':'')+m.text);
  // A session that ended mid-call never records a result, so this also needs it to be busy.
@@ -6388,7 +6441,7 @@ function toolRow(m,open,agent){
  const full=toolFull.get(m.id);
  if(full)applyToolDetails(d,full);
  else if(m.more){
-  const b=el('button','showall',d,m.images?'Show full output and '+m.images+' image'+(m.images>1?'s':''):'Show full output');b.type='button';
+  const b=el('button','showall',d,m.images&&m.error?'Show full output and '+m.images+' image'+(m.images>1?'s':''):'Show full output');b.type='button';
   b.addEventListener('click',async()=>{
    b.disabled=true;b.textContent='Loading…';
    try{
@@ -6656,7 +6709,7 @@ const pageHash=id=>'#session='+encodeURIComponent(id);
 let pagePushed=false;
 function openHistory(s,fromUrl){
  if(!fromUrl){history.pushState(null,'',pageHash(s.id));pagePushed=true}
- histSession=s.id;histPid=s.pid;histRev=null;histFollow=true;histLimit=400;histScrollTo=null;histCwd=s.cwd;toolFull=new Map();
+ histSession=s.id;histPid=s.pid;histRev=null;histFollow=true;histLimit=400;histScrollTo=null;histCwd=s.cwd;toolFull=new Map();toolPictures=new Map();
  setRenaming(false);
  $('histBody').replaceChildren();shownMessages=[];$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
@@ -7213,13 +7266,13 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
             settings = phone_settings()
             return settings["token"] if settings["enabled"] else ""
 
-        def respond(self, status, content_type, body, extra_headers=()):
+        def respond(self, status, content_type, body, extra_headers=(), cache="no-store"):
             self.send_response(status)
             for header, value in extra_headers:
                 self.send_header(header, value)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Claude-Sessions", "1")  # So a second copy knows this port is ours.
             self.send_header(
@@ -7322,6 +7375,17 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                     self.send_json(404, {"error": "That is no longer available."})
                 else:
                     self.send_json(200, details)
+            elif parts.path == "/api/tool-image":
+                try:
+                    number = int(query.get("n", ["0"])[0])
+                except ValueError:
+                    number = -1
+                image = monitor.tool_image(query.get("id", [""])[0], query.get("tool", [""])[0], number, query.get("agent", [None])[0])
+                if image is None:
+                    self.respond(404, "text/plain", b"not found")
+                else:
+                    # A tool call's result never changes, so the picture can be kept rather than fetched on each redraw.
+                    self.respond(200, image[0], image[1], cache="private, max-age=86400")
             elif parts.path == "/api/subagents":
                 open_ids = set(query.get("open", [""])[0].split(","))
                 agents = monitor.subagents(query.get("id", [""])[0], open_ids, query.get("since", [None])[0])
