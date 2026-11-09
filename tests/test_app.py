@@ -217,6 +217,34 @@ class UpdateTests(unittest.TestCase):
 
 
 @unittest.skipUnless(WINDOWS and os.environ.get("CLAUDE_SESSIONS_TEST_PROGRAM"), "needs the built Windows program")
+@unittest.skipUnless(WINDOWS and os.environ.get("CLAUDE_SESSIONS_TEST_PROGRAM"), "needs the built Windows program")
+class BuiltHookTests(unittest.TestCase):
+    """The built program, run as Claude Code runs a status line or hook: JSON in on stdin, text out."""
+
+    def run_program(self, flag, payload):
+        config = tempfile.mkdtemp(prefix="claude-sessions-built-hook-")
+        self.addCleanup(shutil.rmtree, config, True)
+        started = time.monotonic()
+        result = subprocess.run([os.environ["CLAUDE_SESSIONS_TEST_PROGRAM"], flag], input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                capture_output=True, timeout=60, env={**os.environ, "CLAUDE_CONFIG_DIR": config})
+        print(f"{flag}: {time.monotonic() - started:.2f} s, exit {result.returncode}, stdout {result.stdout[:200]!r}, stderr {result.stderr[-300:]!r}")
+        return result, os.path.join(config, "monitor")
+
+    def test_status_line_saves_the_figures_and_prints(self):
+        result, monitor = self.run_program("--statusline", {
+            "session_id": "abc-123", "cwd": "C:/Users/Zoë/project", "model": {"display_name": "Opus 5.5"},
+            "context_window": {"used_percentage": 42}, "rate_limits": {"five_hour": {"used_percentage": 10}}})
+        self.assertIn(b"Ctx 42%", result.stdout)
+        with open(os.path.join(monitor, "status", "abc-123.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["context_percent"], 42)
+
+    def test_hook_records_a_finished_turn(self):
+        result, monitor = self.run_program("--hook", {
+            "session_id": "abc-123", "hook_event_name": "Stop", "cwd": "C:/Users/Zoë/project", "last_assistant_message": "Done – all good"})
+        with open(os.path.join(monitor, "attention", "abc-123.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["kind"], "done")
+
+
 class BuiltUpdateTests(unittest.TestCase):
     """The built program updates itself from a stand-in release and comes back, twice in a row."""
 

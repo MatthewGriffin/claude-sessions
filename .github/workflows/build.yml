@@ -67,7 +67,7 @@ jobs:
         timeout-minutes: 10
         env:
           CLAUDE_SESSIONS_TEST_PROGRAM: ${{ github.workspace }}\dist\claude-sessions-windows.exe
-        run: python -m unittest test_app.TerminalTests test_app.BuiltUpdateTests -v
+        run: python -m unittest test_app.TerminalTests test_app.BuiltHookTests test_app.BuiltUpdateTests -v
         working-directory: tests
       - uses: actions/upload-artifact@v7
         if: startsWith(github.ref, 'refs/tags/v')
