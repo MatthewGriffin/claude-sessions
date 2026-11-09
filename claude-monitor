@@ -6757,6 +6757,8 @@ setInterval(loadHistory,2000);
 // Stay on the latest message, including when the prompt panel shrinks this pane, unless scrolled up.
 $('histBody').addEventListener('scroll',()=>{const b=$('histBody');histFollow=b.scrollHeight-b.scrollTop-b.clientHeight<40});
 new ResizeObserver(()=>{if(histFollow){const b=$('histBody');b.scrollTop=b.scrollHeight}}).observe($('histBody'));
+// Pictures in the chat load after it's drawn and push the end further down, so keep up with them.
+$('histBody').addEventListener('load',()=>{if(histFollow){const b=$('histBody');b.scrollTop=b.scrollHeight}},true);
 $('histTerm').addEventListener('click',()=>act('terminal',{id:histSession}));
 $('histRename').addEventListener('click',()=>setRenaming(true));
 $('renameCancel').addEventListener('click',()=>setRenaming(false));
