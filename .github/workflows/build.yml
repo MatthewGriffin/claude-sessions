@@ -1,4 +1,4 @@
-# Tests every push on Linux and Windows. A tag like v1.2.3 also builds both versions and
+# Tests every push on Linux and Windows. Only a tag like v1.2.3 builds both versions and
 # publishes them as a GitHub release, which the app offers to install.
 name: Build
 
@@ -30,6 +30,7 @@ jobs:
       - name: Check it compiles
         run: python -m py_compile claude-monitor
       - uses: actions/upload-artifact@v7
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: linux
           path: claude-monitor
@@ -41,24 +42,30 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Install requirements
+        run: python -m pip install -r requirements-windows.txt
       - name: Install build tools
-        run: python -m pip install -r requirements-windows.txt pyinstaller
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python -m pip install pyinstaller
       - name: Test from source
         run: python -m unittest discover -s tests -v
       - name: Stamp the version
         if: startsWith(github.ref, 'refs/tags/v')
         run: python .github/stamp_version.py "$env:GITHUB_REF_NAME" claude-monitor
       - name: Build the program
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           Copy-Item claude-monitor build_claude_sessions.py
           python -m PyInstaller --onefile --windowed --noconfirm --name claude-sessions-windows `
             --icon assets/claude-sessions.ico --collect-all winpty --collect-all pyte build_claude_sessions.py
       - name: Test the built program's session host
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           CLAUDE_SESSIONS_TEST_PROGRAM: ${{ github.workspace }}\dist\claude-sessions-windows.exe
         run: python -m unittest test_app.TerminalTests -v
         working-directory: tests
       - uses: actions/upload-artifact@v7
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: windows
           path: dist/claude-sessions-windows.exe
