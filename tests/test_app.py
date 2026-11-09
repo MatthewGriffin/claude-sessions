@@ -454,8 +454,13 @@ class SetupTests(unittest.TestCase):
                        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other --thing"}]}]}}, handle)
 
     def test_adds_hooks_once_and_keeps_everything_else(self):
-        self.assertEqual(app.run_setup(verbose=False), 0)
-        self.assertEqual(app.run_setup(verbose=False), 0)
+        original = app.CONTEXT_HOOK
+        app.CONTEXT_HOOK = True  # Left out on Windows; see the next test.
+        try:
+            self.assertEqual(app.run_setup(verbose=False), 0)
+            self.assertEqual(app.run_setup(verbose=False), 0)
+        finally:
+            app.CONTEXT_HOOK = original
         with open(self.settings) as handle:
             settings = json.load(handle)
         self.assertEqual(settings["model"], "opus")
@@ -469,15 +474,16 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn("async", context[0])  # Its output has to reach Claude.
 
     def test_windows_leaves_out_the_hook_claude_code_waits_for(self):
-        self.assertEqual(app.run_setup(verbose=False), 0)
-        with open(self.settings) as handle:
-            settings = json.load(handle)
-        settings["hooks"]["UserPromptSubmit"][-1]["hooks"].append({"type": "command", "command": "someone --else"})
-        with open(self.settings, "w") as handle:
-            json.dump(settings, handle)
         original = app.CONTEXT_HOOK
-        app.CONTEXT_HOOK = False
         try:
+            app.CONTEXT_HOOK = True  # As set up by an earlier version.
+            self.assertEqual(app.run_setup(verbose=False), 0)
+            with open(self.settings) as handle:
+                settings = json.load(handle)
+            settings["hooks"]["UserPromptSubmit"][-1]["hooks"].append({"type": "command", "command": "someone --else"})
+            with open(self.settings, "w") as handle:
+                json.dump(settings, handle)
+            app.CONTEXT_HOOK = False
             self.assertEqual(app.run_setup(verbose=False), 0)
             self.assertEqual(app.run_setup(verbose=False), 0)
         finally:
