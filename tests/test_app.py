@@ -202,6 +202,87 @@ class UpdateTests(unittest.TestCase):
             self.assertIn('APP_VERSION = "1.0.0"', handle.read())
 
 
+@unittest.skipUnless(WINDOWS and os.environ.get("CLAUDE_SESSIONS_TEST_PROGRAM"), "needs the built Windows program")
+class BuiltUpdateTests(unittest.TestCase):
+    """The built program updates itself from a stand-in release and comes back, twice in a row."""
+
+    NAME = "cs-update-test.exe"  # Its own name, so cleaning up can't stop a real copy.
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(prefix="claude-sessions-built-update-")
+        self.program = os.path.join(self.folder, self.NAME)
+        with open(os.environ["CLAUDE_SESSIONS_TEST_PROGRAM"], "rb") as handle:
+            self.body = handle.read()
+        with open(self.program, "wb") as handle:
+            handle.write(self.body)
+        files = self.files = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = files.get(self.path)
+                self.send_response(200 if body is not None else 404)
+                self.end_headers()
+                self.wfile.write(body or b"")
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.port = 21000 + secrets.randbelow(2000)
+        self.config = os.path.join(self.folder, "config")
+        self.addCleanup(self.stop)
+
+    def stop(self):
+        subprocess.run(["taskkill", "/F", "/T", "/IM", self.NAME], capture_output=True)
+        self.server.shutdown()
+        time.sleep(1)
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def publish(self, version):
+        self.files["/asset"] = self.body
+        self.files["/sums"] = f"{hashlib.sha256(self.body).hexdigest()}  claude-sessions-windows.exe\n".encode()
+        self.files["/latest"] = json.dumps({"tag_name": "v" + version, "html_url": self.base + "/page", "assets": [
+            {"name": "claude-sessions-windows.exe", "browser_download_url": self.base + "/asset"},
+            {"name": "SHA256SUMS", "browser_download_url": self.base + "/sums"}]}).encode()
+
+    def request(self, path, body=None):
+        import http.client
+        with open(os.path.join(self.config, "monitor", "token")) as handle:
+            token = handle.read().strip()
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Cookie": f"monitor_token={token}", "Origin": f"http://127.0.0.1:{self.port}", "Content-Type": "application/json"}
+        connection.request("POST" if body is not None else "GET", path, body=json.dumps(body) if body is not None else None, headers=headers)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read() or b"null")
+
+    def answers(self):
+        try:
+            return self.request("/api/sessions")[0] == 200
+        except (OSError, ValueError):
+            return False
+
+    def test_updates_and_restarts(self):
+        # Like a real start from the Start menu: none of PyInstaller's variables in the environment.
+        environment = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_") and k != "_MEIPASS2"}
+        environment.update(CLAUDE_CONFIG_DIR=self.config, CLAUDE_SESSIONS_RELEASES_URL=self.base + "/latest",
+                           CLAUDE_SESSIONS_NO_INSTALL="1")
+        self.publish("998.0.0")
+        first = subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
+        self.assertTrue(wait_for(self.answers, 60), "the program didn't start")
+        for attempt in ("first", "second"):
+            def offered():
+                status, state = self.request("/api/sessions")
+                return status == 200 and (state.get("release") or {}).get("version") == "998.0.0"
+            self.assertTrue(wait_for(offered, 30), f"the stand-in release wasn't offered before the {attempt} update")
+            status, reply = self.request("/api/sessions/update", {})
+            self.assertEqual(status, 200, reply)
+            time.sleep(3)
+            self.assertTrue(wait_for(self.answers, 60), f"the program didn't come back after the {attempt} update")
+        self.assertIsNotNone(first.poll(), "the first copy should have handed over and exited")
+
+
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.settings = os.path.join(CONFIG, "settings.json")

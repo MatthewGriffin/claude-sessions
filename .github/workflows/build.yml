@@ -45,24 +45,29 @@ jobs:
       - name: Install requirements
         run: python -m pip install -r requirements-windows.txt
       - name: Install build tools
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         run: python -m pip install pyinstaller
       - name: Test from source
         run: python -m unittest discover -s tests -v
       - name: Stamp the version
         if: startsWith(github.ref, 'refs/tags/v')
         run: python .github/stamp_version.py "$env:GITHUB_REF_NAME" claude-monitor
+      - name: Stamp a test version
+        # A run started by hand builds and tests the program without publishing it.
+        if: github.event_name == 'workflow_dispatch'
+        run: python .github/stamp_version.py v0.0.1 claude-monitor
       - name: Build the program
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         run: |
           Copy-Item claude-monitor build_claude_sessions.py
           python -m PyInstaller --onefile --windowed --noconfirm --name claude-sessions-windows `
             --icon assets/claude-sessions.ico --collect-all winpty --collect-all pyte build_claude_sessions.py
-      - name: Test the built program's session host
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Test the built program's session host and update
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        timeout-minutes: 10
         env:
           CLAUDE_SESSIONS_TEST_PROGRAM: ${{ github.workspace }}\dist\claude-sessions-windows.exe
-        run: python -m unittest test_app.TerminalTests -v
+        run: python -m unittest test_app.TerminalTests test_app.BuiltUpdateTests -v
         working-directory: tests
       - uses: actions/upload-artifact@v7
         if: startsWith(github.ref, 'refs/tags/v')
