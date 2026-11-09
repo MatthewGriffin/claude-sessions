@@ -1784,6 +1784,45 @@ def read_attention(session):
     }
 
 
+PASTED_CONTENT = re.compile(r'<pasted_content id="([^"]*)">\n?(.*?)\n?</pasted_content(?: id="\1")?>', re.S)
+PASTE_LINES, PASTE_CHARS = 4, 800  # Claude Code folds a paste this long into "[Pasted text]", and so does the page.
+
+
+def is_long_paste(text):
+    return text.count("\n") + 1 >= PASTE_LINES or len(text) > PASTE_CHARS
+
+
+def pasted_parts(text):
+    """Claude Code wraps a long paste in <pasted_content> tags. Returns the message without the
+    tags, and its parts ({"text"} or {"paste"}) when it holds a long paste, else None."""
+    parts, at = [], 0
+
+    def add_text(value):
+        if parts and "text" in parts[-1]:
+            parts[-1]["text"] += value
+        elif value:
+            parts.append({"text": value})
+
+    for match in PASTED_CONTENT.finditer(text):
+        add_text(text[at:match.start()])
+        body = match.group(2)
+        if is_long_paste(body):
+            parts.append({"paste": body})
+        else:
+            add_text(body)  # Short enough to read as part of the message.
+        at = match.end()
+    add_text(text[at:])
+    plain = "\n".join(part.get("text") or part.get("paste") for part in parts).strip() if parts else text
+    if not any("paste" in part for part in parts):
+        return plain, None
+    shown = []
+    for part in parts:
+        value = history_text(part.get("text", part.get("paste")), HISTORY_TEXT)
+        if value:
+            shown.append({"text": value} if "text" in part else {"paste": value, "lines": part["paste"].count("\n") + 1})
+    return plain, shown
+
+
 def history_text(value, limit):
     text = HISTORY_CONTROL_CHARS.sub(" ", str(value)).strip()
     if len(text) > limit:
@@ -2024,12 +2063,13 @@ class HistoryReader:
             # Slash commands are stored as tags. Show them as they were typed.
             arguments = SLASH_ARGS.search(text)
             text = f"{command.group(1)} {arguments.group(1) if arguments else ''}".strip()
+        text, parts = pasted_parts(text)
         text = history_text(text, HISTORY_TEXT)
         # A message typed while Claude was busy is recorded when queued and again when delivered.
         last = next((m for m in reversed(self.messages) if m["role"] != "tool" and not m.get("note")), None)
         if last and last["role"] == "you" and last["text"] == text:
             return
-        self.add({"role": "you", "text": text})
+        self.add({"role": "you", "text": text, **({"parts": parts} if parts else {})})
         if self.turn["files"]:
             self.changed_turn = self.turn
         at = entry_time(entry)
@@ -2379,7 +2419,7 @@ def kill_terminal(session_id):
 HOST_TOKEN_FILE = os.path.join(MONITOR_DIR, "host-token")
 TERMINAL_KEYS = {
     "Enter": "\r", "Escape": "\x1b", "Up": "\x1b[A", "Down": "\x1b[B", "Right": "\x1b[C", "Left": "\x1b[D",
-    "Tab": "\t", "BSpace": "\x7f", "Space": " ", "C-x": "\x18", "C-s": "\x13",
+    "Tab": "\t", "BSpace": "\x7f", "Space": " ", "C-x": "\x18", "C-s": "\x13", "C-j": "\n",
 }
 
 
@@ -3026,10 +3066,46 @@ def upload_path(name):
     return path if os.path.isfile(path) else None
 
 
-def type_into(session, text, images=()):
+TYPE_PIECE = 500  # Claude Code folds a paste over about 800 characters, or of 4 lines, into "[Pasted text]".
+TYPE_PAUSE = 0.03
+
+
+def type_plainly(target, text):
+    """Put text in the input box so Claude Code takes it as typed, not as a paste it would wrap
+    in <pasted_content>. Short pastes, line by line, keep "!", "@" or "/" from opening anything,
+    and Ctrl+J starts a new line without sending."""
+    for number, line in enumerate(text.split("\n")):
+        if number:
+            if not send_keys(target, "C-j"):
+                return False
+            time.sleep(TYPE_PAUSE)
+        for at in range(0, len(line), TYPE_PIECE):
+            if not paste_text(target, line[at:at + TYPE_PIECE]):
+                return False
+            time.sleep(TYPE_PAUSE)
+    return True
+
+
+def type_text(target, text, pasted=()):
+    """Type a message, where each of the pasted texts in it really was pasted, and is pasted whole."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    pasted = [p.replace("\r\n", "\n").replace("\r", "\n") for p in pasted if p]
+    while text:
+        found = [(text.find(p), p) for p in pasted if p in text]
+        if not found:
+            return type_plainly(target, text)
+        at, piece = min(found, key=lambda f: f[0])
+        if not type_plainly(target, text[:at]) or not paste_text(target, piece):
+            return False
+        time.sleep(0.2)
+        text = text[at + len(piece):]
+    return True
+
+
+def type_into(session, text, images=(), pasted=()):
     """Type a message into the input box without sending it. Each picture's path is pasted on
     its own, which is what makes Claude Code attach it as an image rather than leave it as text."""
-    if text and not paste_text(session["tmux"], text + ("\n" if images else "")):
+    if text and not type_text(session["tmux"], text + ("\n" if images else ""), pasted):
         return False
     for name in images:
         time.sleep(0.2)
@@ -3039,9 +3115,9 @@ def type_into(session, text, images=()):
     return True
 
 
-def type_message(session, text, images=()):
-    """Paste a message into a session and submit it. Returns (succeeded, message)."""
-    if not type_into(session, text, images):
+def type_message(session, text, images=(), pasted=()):
+    """Type a message into a session and submit it. Returns (succeeded, message)."""
+    if not type_into(session, text, images, pasted):
         return False, "Could not type into the session."
     send_keys(session["tmux"], "Enter")
     return True, "Sent."
@@ -3093,7 +3169,7 @@ def send_queued_now(monitor, request):
             before = input_box(session_screen(session["tmux"]))
             if before is None:
                 return False, "Its input box isn't showing right now, so nothing was typed. Try again in a moment."
-            if not type_into(session, item["text"], item.get("images", [])):
+            if not type_into(session, item["text"], item.get("images", []), item.get("pasted", [])):
                 return False, "Could not type into the session."
             time.sleep(0.1)
             after = input_box(session_screen(session["tmux"]))
@@ -3110,9 +3186,9 @@ def send_queued_now(monitor, request):
                 send_keys(session["tmux"], "C-x")
                 send_keys(session["tmux"], "C-s")
             state["sent"][session["id"]] = time.time()
-            state["checks"][session["id"]] = {"text": item["text"], "images": item.get("images", []), "count": monitor.human_messages(session["id"]), "at": time.time()}
+            state["checks"][session["id"]] = {"text": item["text"], "images": item.get("images", []), "pasted": item.get("pasted", []), "count": monitor.human_messages(session["id"]), "at": time.time()}
         else:
-            succeeded, message = send_tracked(monitor, session, item["text"], state, item.get("images", []))
+            succeeded, message = send_tracked(monitor, session, item["text"], state, item.get("images", []), item.get("pasted", []))
             if not succeeded:
                 return False, message
         items.remove(item)
@@ -3125,14 +3201,14 @@ def may_type_now(session, state):
     return session["status"] == "idle" and time.time() - state["sent"].get(session["id"], 0) >= QUEUE_GAP_SECONDS
 
 
-def send_tracked(monitor, session, text, state, images=()):
+def send_tracked(monitor, session, text, state, images=(), pasted=()):
     """Type a message and note what's needed to tell later whether it arrived."""
     before = monitor.human_messages(session["id"])
-    succeeded, message = type_message(session, text, images)
+    succeeded, message = type_message(session, text, images, pasted)
     if succeeded:
         state["sent"][session["id"]] = time.time()
         if not text.startswith("/"):  # Slash commands aren't recorded as messages.
-            state["checks"][session["id"]] = {"text": text, "images": list(images), "count": before, "at": time.time()}
+            state["checks"][session["id"]] = {"text": text, "images": list(images), "pasted": list(pasted), "count": before, "at": time.time()}
     return succeeded, message
 
 
@@ -3150,14 +3226,18 @@ def send_reply(monitor, request):
         return False, "Pictures can't go with a command."
     if len(text.encode()) > MAX_REPLY_BYTES:
         return False, "That message is too long."
+    # Long texts pasted into the reply box, which are pasted on as they are. The rest is typed.
+    pasted = request.get("pasted") or []
+    pasted = [HISTORY_CONTROL_CHARS.sub(" ", p).strip() for p in pasted[:20] if isinstance(p, str)] if isinstance(pasted, list) else []
+    pasted = [p for p in pasted if is_long_paste(p) and p in text]
     with queue_locked() as state:
         session = hosted_session(monitor, request)
         if not session:
             return False, NOT_HOSTED
         items = state["messages"].setdefault(session["id"], [])
-        item = {"id": secrets.token_hex(8), "text": text, **({"images": images} if images else {})}
+        item = {"id": secrets.token_hex(8), "text": text, **({"images": images} if images else {}), **({"pasted": pasted} if pasted else {})}
         if not items and may_type_now(session, state):
-            succeeded, message = send_tracked(monitor, session, text, state, images)
+            succeeded, message = send_tracked(monitor, session, text, state, images, pasted)
             if succeeded:
                 return True, message
             # Keep it, where it can be retried, instead of leaving it to be lost from the box.
@@ -3280,6 +3360,7 @@ def settle_retries_and_checks(state, sessions, monitor):
             state["messages"].setdefault(session_id, []).insert(0, {
                 "id": secrets.token_hex(8), "text": check["text"], "error": "It was typed in, but never reached the session.",
                 **({"images": check["images"]} if check.get("images") else {}),
+                **({"pasted": check["pasted"]} if check.get("pasted") else {}),
             })
     state["dismissed"] = {sid: at for sid, at in state["dismissed"].items() if sid in sessions}
 
@@ -3329,7 +3410,7 @@ def deliver_queued(monitor):
             if guard and guard not in monitor.last_said(session_id):
                 items[0]["error"] = "It didn't confirm that its progress was saved, so the chat wasn't cleared."
                 continue
-            succeeded, message = send_tracked(monitor, session, items[0]["text"], state, items[0].get("images", []))
+            succeeded, message = send_tracked(monitor, session, items[0]["text"], state, items[0].get("images", []), items[0].get("pasted", []))
             if succeeded:
                 items.pop(0)
             else:
@@ -4219,6 +4300,9 @@ button.deny{color:var(--bad)}
 .msg{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
 .msg b{display:block;font-size:12px;color:var(--dim)}
 .msg.you{background:#23304a;border-radius:4px;padding:8px 10px}
+.msg details.paste{margin:6px 0;border-left:2px solid var(--line);padding-left:8px;white-space:normal}
+.msg details.paste summary{cursor:pointer;font-size:12px;color:var(--dim)}
+.msg details.paste pre{white-space:pre-wrap;overflow-wrap:anywhere;margin:4px 0 0;max-height:60vh;overflow:auto;font-size:12px}
 .msg.system{color:var(--dim);font-size:12px;border-left:2px solid var(--line);padding-left:8px;max-height:9em;overflow:auto}
 .tool{font-size:12px;color:var(--dim);min-width:0}.tool summary{overflow-wrap:anywhere}
 .tool pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#14161f;padding:6px 8px;margin:4px 0;max-height:320px;overflow:auto}
@@ -4943,6 +5027,7 @@ function renderQueue(s){
   if(!item.refresh&&!item.retry)button('Edit',()=>{
    const t=$('replyText');t.value=t.value.trim()?t.value+'\n'+item.text:item.text;t.focus();
    for(const name of item.images||[])if(pendingImages.length<5)pendingImages.push({name,url:uploadUrl(name)});
+   pastedTexts.push(...(item.pasted||[]));
    renderPending();
   });
   // The steps of a refresh are cancelled together, so one button is enough.
@@ -5074,7 +5159,7 @@ function renderLive(s,live){
   ...tasks.map(t=>el('div','',null,'Background: '+t.description+(t.running!==null?' · running for '+age(t.running):''))));
  if(atEnd)output.scrollTop=output.scrollHeight;
 }
-function messageRow(m,open,agent){
+function messageRow(m,open,agent,openSet){
  if(m.role==='tool')return toolRow(m,open,agent);
  if(m.role==='thinking'){
   const d=el('details','thinking');d.dataset.seq=m.seq;d.open=open;
@@ -5087,7 +5172,14 @@ function messageRow(m,open,agent){
   const i=el('img','',a);i.src=uploadUrl(m.picture);i.alt='Picture you sent';i.loading='lazy';
   return r;
  }
- el('b','',r,{you:agent?'Sent to it':'You',claude:agent?'Subagent':'Claude',system:'System'}[m.role]);r.append(m.text);
+ el('b','',r,{you:agent?'Sent to it':'You',claude:agent?'Subagent':'Claude',system:'System'}[m.role]);
+ if(!m.parts){r.append(m.text);return r}
+ // A long paste starts folded, as logs can run to thousands of lines.
+ m.parts.forEach((p,i)=>{
+  if(p.text!==undefined){el('div','',r,p.text);return}
+  const d=el('details','paste',r);d.dataset.seq=m.seq+'p'+i;d.open=!!(openSet&&openSet.has(d.dataset.seq));
+  el('summary','',d,'Pasted text \u00b7 '+p.lines+' line'+(p.lines===1?'':'s'));el('pre','',d,p.paste);
+ });
  return r;
 }
 function renderHistory(h){
@@ -5100,7 +5192,7 @@ function renderHistory(h){
   rows.push(b);
  }
  for(const m of h.messages){
-  rows.push(messageRow(m,open.has(String(m.seq))));
+  rows.push(messageRow(m,open.has(String(m.seq)),undefined,open));
  }
  if(!rows.length)rows.push(el('div','note',null,'Nothing here yet.'));
  body.replaceChildren(...rows);
@@ -5194,7 +5286,7 @@ function agentCard(a,open){
  const list=el('div','',steps);
  if(a.messages){
   if(a.omitted)el('div','note',list,a.omitted+' earlier items not shown');
-  for(const m of a.messages)list.append(messageRow(m,open.has(String(m.seq)),a));
+  for(const m of a.messages)list.append(messageRow(m,open.has(String(m.seq)),a,open));
   if(!a.messages.length)el('div','note',list,'Nothing yet.');
  }else if(steps.open)el('div','note',list,'Loading…');
  steps.addEventListener('toggle',()=>{
@@ -5279,7 +5371,7 @@ function openHistory(s,fromUrl){
  setRenaming(false);
  $('histBody').replaceChildren();$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
- $('replyErr').textContent='';$('replyText').value='';pendingImages=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;
+ $('replyErr').textContent='';$('replyText').value='';pendingImages=[];pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;
  updateFoot(s);
  let saved=null;try{saved=localStorage.getItem('filesOpen')}catch(e){}
  setFilesOpen(saved?saved==='1':innerWidth>=1100,false);
@@ -5330,12 +5422,14 @@ $('histEnd').addEventListener('click',async()=>{
 });
 $('replyForm').addEventListener('submit',async e=>{
  e.preventDefault();
- const text=$('replyText').value,images=pendingImages.map(p=>p.name);
+ const text=$('replyText').value,images=pendingImages.map(p=>p.name),pasted=pastedTexts.filter(p=>text.includes(p));
  if(imagesLoading){$('replyErr').textContent='Still adding a picture. Send again in a moment.';return}
- if((text.trim()||images.length)&&await act('send',{id:histSession,text,images})){$('replyText').value='';pendingImages=[];renderPending()}
+ if((text.trim()||images.length)&&await act('send',{id:histSession,text,images,pasted})){$('replyText').value='';pendingImages=[];pastedTexts=[];renderPending()}
 });
 // Pictures to send with the next message. Each is shrunk here, then kept by the app until it's sent.
 var pendingImages=[],imagesLoading=0;
+// Long texts pasted into the reply box. Only these reach Claude as a paste; the rest is typed.
+var pastedTexts=[];
 const uploadUrl=name=>'/api/upload?name='+encodeURIComponent(name);
 function renderPending(){
  const box=$('replyImages');
@@ -5508,7 +5602,9 @@ $('replyAttach').addEventListener('click',()=>$('replyFile').click());
 $('replyFile').addEventListener('change',()=>{addImages($('replyFile').files);$('replyFile').value=''});
 $('replyText').addEventListener('paste',e=>{
  const files=[...(e.clipboardData&&e.clipboardData.files||[])].filter(f=>f.type.startsWith('image/'));
- if(files.length){e.preventDefault();addImages(files)}
+ if(files.length){e.preventDefault();addImages(files);return}
+ const text=(e.clipboardData&&e.clipboardData.getData('text/plain')||'').replace(/\r\n?/g,'\n').trim();
+ if(text.split('\n').length>=4||text.length>800)pastedTexts.push(text);
 });
 for(const id of ['replyForm','replyImages']){
  $(id).addEventListener('dragover',e=>{if([...e.dataTransfer.types].includes('Files'))e.preventDefault()});

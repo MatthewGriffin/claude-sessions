@@ -395,7 +395,7 @@ class PictureTests(unittest.TestCase):
         ok, _ = app.type_message({"tmux": "s1"}, "What is this?", names)
         self.assertTrue(ok)
         folder = app.uploads_dir()
-        self.assertEqual(self.typed, ["What is this?\n", os.path.join(folder, names[0]), os.path.join(folder, names[1]), "Enter"])
+        self.assertEqual(self.typed, ["What is this?", "C-j", os.path.join(folder, names[0]), os.path.join(folder, names[1]), "Enter"])
 
     def test_picture_alone(self):
         name = self.upload()[1]["name"]
@@ -593,6 +593,41 @@ class PortTests(unittest.TestCase):
     def test_choices_are_fixed(self):
         self.assertEqual(app.port_choices(8766), [8766, 18766, 28766, 38766, 48766])
         self.assertEqual(app.port_choices(30000), [30000, 40000, 50000, 60000])
+
+
+class PasteTests(unittest.TestCase):
+    """Replies are typed, so Claude Code only wraps what was really pasted, and the chat folds that."""
+
+    def setUp(self):
+        self.saved = {name: getattr(app, name) for name in ("send_keys", "paste_text", "TYPE_PAUSE")}
+        self.sent = []
+        app.send_keys = lambda target, *keys: self.sent.extend(("key", k) for k in keys) or True
+        app.paste_text = lambda target, text: self.sent.append(("paste", text)) or True
+        app.TYPE_PAUSE = 0
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+
+    def test_lines_typed_with_ctrl_j(self):
+        self.assertTrue(app.type_text("s", "one\r\ntwo\n\n" + "x" * 1200))
+        self.assertEqual(self.sent, [("paste", "one"), ("key", "C-j"), ("paste", "two"), ("key", "C-j"), ("key", "C-j"),
+                                     ("paste", "x" * 500), ("paste", "x" * 500), ("paste", "x" * 200)])
+
+    def test_real_paste_sent_whole(self):
+        log = "a\nb\nc\nd"
+        self.assertTrue(app.type_text("s", "look:\n" + log + "\nthanks", [log]))
+        self.assertEqual(self.sent, [("paste", "look:"), ("key", "C-j"), ("paste", log), ("key", "C-j"), ("paste", "thanks")])
+
+    def test_long_paste_folded_short_one_not(self):
+        log = "\n".join(f"line {i}" for i in range(10))
+        plain, parts = app.pasted_parts(f'look:\n\n<pasted_content id="ab12">\n{log}\n</pasted_content id="ab12">\n\nthanks')
+        self.assertEqual(parts, [{"text": "look:"}, {"paste": log, "lines": 10}, {"text": "thanks"}])
+        self.assertIn("line 9", plain)
+        self.assertNotIn("pasted_content", plain)
+        plain, parts = app.pasted_parts('\n\n<pasted_content id="d23c">\nyes\nclose it\n</pasted_content id="d23c">\n')
+        self.assertEqual((plain, parts), ("yes\nclose it", None))
+        self.assertEqual(app.pasted_parts("plain"), ("plain", None))
 
 
 if __name__ == "__main__":
