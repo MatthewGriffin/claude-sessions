@@ -829,5 +829,59 @@ class InstalledCommandTests(unittest.TestCase):
             app.installed_commands = saved
 
 
+class ModelTests(unittest.TestCase):
+    """The model in use, and changes to it shown in the chat."""
+
+    def transcript(self, entries):
+        path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "t.jsonl")
+        with open(path, "w") as handle:
+            for number, entry in enumerate(entries):
+                handle.write(json.dumps({"uuid": str(number), "timestamp": f"2026-11-09T10:{number:02d}:00Z", **entry}) + "\n")
+        return path
+
+    @staticmethod
+    def reply(model, text="ok"):
+        return {"type": "assistant", "message": {"model": model, "content": [{"type": "text", "text": text}]}}
+
+    @staticmethod
+    def said(text):
+        return {"type": "user", "message": {"content": text}}
+
+    def test_names(self):
+        for model, name in [("claude-sonnet-5-5", "Sonnet 5.5"), ("claude-opus-4-1-20250805", "Opus 4.1"),
+                            ("claude-3-5-sonnet-20241022", "Sonnet 3.5"), ("claude-opus-5-5[1m]", "Opus 5.5"), ("other", "other")]:
+            self.assertEqual(app.model_name(model), name)
+        self.assertEqual(app.model_change("Set model to `Sonnet 5.5` and saved as your default for new sessions"), ("you", "Sonnet 5.5"))
+        self.assertEqual(app.model_change("Switched to Sonnet 5.5 due to high demand for Opus 5.5"), ("auto", "Sonnet 5.5"))
+        self.assertIsNone(app.model_change("Kept model as Opus 5.5"))
+
+    def test_changes_in_the_chat(self):
+        path = self.transcript([
+            self.reply("claude-opus-5-5"),
+            self.reply("claude-sonnet-5-5"),  # Changed with nothing said: automatic.
+            self.said("<command-name>/model</command-name>\n<command-args>haiku</command-args>"),
+            self.said("<local-command-stdout>Set model to `Haiku 5.5` and saved as your default for new sessions</local-command-stdout>"),
+            self.reply("claude-haiku-5-5"),  # The user's own switch is already shown.
+            {"type": "system", "subtype": "informational", "content": "Switched to Sonnet 5.5 due to high demand for Haiku 5.5"},
+            self.reply("claude-sonnet-5-5"),
+            self.reply("<synthetic>"),
+            self.reply("claude-sonnet-5-5"),
+            self.said("<local-command-stdout>Kept model as Sonnet 5.5</local-command-stdout>"),
+        ])
+        history = app.HistoryReader(path)
+        history.poll()
+        changes = [(m["model"]["by"], m["model"]["to"], m["model"]["was"]) for m in history.messages if m.get("model")]
+        self.assertEqual(changes, [("auto", "Sonnet 5.5", "Opus 5.5"), ("you", "Haiku 5.5", ""), ("auto", "Sonnet 5.5", "Haiku 5.5")])
+        self.assertEqual(history.messages[-1], {"role": "system", "note": True, "text": "Kept model as Sonnet 5.5", "seq": len(history.messages)})
+        self.assertFalse(any(m["role"] == "you" and "local-command" in m["text"] for m in history.messages))
+
+    def test_current_model(self):
+        path = self.transcript([self.reply("claude-opus-5-5"),
+                                self.said("<local-command-stdout>Set model to `Sonnet 5.5`</local-command-stdout>")])
+        transcript = app.Transcript("t", path)
+        transcript.poll()
+        self.assertEqual(transcript.model, "Sonnet 5.5")
+
+
 if __name__ == "__main__":
     unittest.main()

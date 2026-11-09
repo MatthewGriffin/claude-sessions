@@ -135,6 +135,12 @@ SLASH_COMMAND = re.compile(r"<command-name>(.*?)</command-name>", re.S)
 SLASH_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
 SHOWN_SYSTEM_NOTES = {"away_summary", "compact_boundary", "informational"}
 COMMAND_OUTPUT = re.compile(r"<local-command-(?:stdout|stderr)>(.*?)</local-command-(?:stdout|stderr)>", re.S)
+ANSI_CODES = re.compile(r"\x1b\[[0-9;]*m")
+# What Claude Code says after /model (or a "switch to the fallback model" answer), checked against 2.1.319.
+MODEL_SET = re.compile(r"^(?:Set model to |Fast mode ON \u00b7 model set )`*([^`\n]+?)`*(?: and saved as your default for new sessions)?\s*$")
+# An automatic switch, e.g. "Switched to Sonnet 5.5 due to high demand for Opus 5.5".
+MODEL_SWITCHED = re.compile(r"^Switched to `*([^`\n]+?)`*(?=\s+(?:due to|for this session|\u2014|\u00b7)|\.(?:\s|$)|\s*$)")
+MODEL_ID = re.compile(r"^(?:claude-)?(?:(\d+)-(\d+)-)?([a-z]+)(?:-(\d+))?(?:-(\d{1,2}))?(?:-\d{8})?(?:\[.*\])?$")
 LIVE_RULE = re.compile(r"^\s*─{10,}")
 # One symbol, then words ending in an ellipsis: "✽ Moseying… (12m 13s · ↓ 8.8k tokens)".
 LIVE_STATUS = re.compile(r"^\s*[^\w\s●⎿❯─]\s+[^…]*…(\s.*)?$")
@@ -373,6 +379,7 @@ class Transcript:
         self.offset = None
         self.mtime = None
         self.title = self.prompt = self.text = self.model = self.branch = ""
+        self.model_at = 0  # When the model was last seen, to compare with the status line's.
         self.context = 0
         self.actions = collections.deque(maxlen=8)
         self.pending = {}
@@ -429,6 +436,10 @@ class Transcript:
 
     def _ingest(self, entry):
         kind = entry.get("type")
+        if kind in ("user", "system") and not entry.get("isSidechain") and not self.is_subagent:
+            change = model_change_in(entry)
+            if change:
+                self.model, self.model_at = change[1], entry_time(entry) or time.time()
         if kind == "ai-title":
             self.title = clean(entry.get("aiTitle", ""))
         elif kind == "attachment":
@@ -499,7 +510,7 @@ class Transcript:
     def _ingest_assistant(self, message, blocks, timestamp=None):
         model = message.get("model")
         if model and not model.startswith("<"):
-            self.model = model.removeprefix("claude-")
+            self.model, self.model_at = model_name(model), entry_time({"timestamp": timestamp}) or time.time()
         usage = message.get("usage") or {}
         total = sum(usage.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
         self.context = total or self.context
@@ -761,7 +772,7 @@ class Monitor:
                 self.refresh()
                 sessions = [self.session_state(s) for s in self.sessions]
                 queue_state = read_queue()
-                context_percents, usage = read_status_files()
+                context_percents, usage, models = read_status_files()
                 for session in sessions:
                     session["queue"] = queue_state["messages"].get(session["id"], [])
                     transcript = self.transcripts.get(session["id"])
@@ -769,6 +780,10 @@ class Monitor:
                     session["failure"] = None if failure and queue_state["dismissed"].get(session["id"]) == failure["at"] else failure
                     session["retryAt"] = (queue_state["retries"].get(session["id"]) or {}).get("at")
                     session["contextPercent"] = context_percents.get(session["id"])
+                    # The status line hears of a /model switch at once; the transcript only by the next reply.
+                    shown, saved = models.get(session["id"], ("", 0))
+                    if shown and saved >= (transcript.model_at if transcript else 0):
+                        session["model"] = shown
                 self.devices, self.adb = find_devices()
                 with self.frames_lock:
                     live = {device["serial"] for device in self.devices}
@@ -1014,15 +1029,16 @@ def usage_window(rate_limits, name):
 
 
 def read_status_files():
-    """Figures saved by the status line script: ({session id: context %}, account usage or None).
+    """Figures saved by the status line script: ({session id: context %}, account usage or None,
+    {session id: (model name, when saved)}).
 
     Usage limits are per account, so usage comes from whichever session reported most recently.
     """
-    percents, usage, newest = {}, None, 0
+    percents, usage, newest, models = {}, None, 0, {}
     try:
         names = os.listdir(STATUS_DIR)
     except OSError:
-        return percents, usage
+        return percents, usage, models
     for name in names:
         path = os.path.join(STATUS_DIR, name)
         if not name.endswith(".json") or name.startswith("."):
@@ -1040,12 +1056,14 @@ def read_status_files():
             continue
         if isinstance(state.get("context_percent"), (int, float)):
             percents[name[: -len(".json")]] = state["context_percent"]
+        if isinstance(state.get("model"), str) and state["model"].strip():
+            models[name[: -len(".json")]] = (clean(state["model"])[:60], modified)
         limits = state.get("rate_limits")
         if isinstance(limits, dict) and modified > newest:
             windows = {"five": usage_window(limits, "five_hour"), "seven": usage_window(limits, "seven_day")}
             if windows["five"] or windows["seven"]:
                 usage, newest = {**windows, "at": modified}, modified
-    return percents, usage
+    return percents, usage, models
 
 
 def proc_pids():
@@ -2243,6 +2261,43 @@ def pasted_parts(text):
     return plain, shown
 
 
+def model_name(model):
+    """A model id as Claude Code names it: "claude-sonnet-5-5" -> "Sonnet 5.5". Unknown forms are kept."""
+    model = str(model or "").strip()
+    match = MODEL_ID.match(model)
+    if not match or model.startswith("<"):
+        return model
+    old_major, old_minor, family, major, minor = match.groups()
+    if old_major:  # Older ids put the version first: claude-3-5-sonnet-20241022.
+        major, minor = old_major, old_minor
+    if not major:
+        return model
+    return f"{family.capitalize()} {major}" + (f".{minor}" if minor else "")
+
+
+def model_change(text):
+    """("you"/"auto", model name) if this command output or notice says the model changed, else None."""
+    text = ANSI_CODES.sub("", str(text or "")).strip()
+    chosen = MODEL_SET.match(text)
+    if chosen:
+        return "you", chosen.group(1).strip()
+    switched = MODEL_SWITCHED.match(text)
+    return ("auto", switched.group(1).strip()) if switched else None
+
+
+def model_change_in(entry):
+    """model_change() for a transcript entry: /model's output (a user or system entry) or a system notice."""
+    content = entry.get("content") if entry.get("type") == "system" else (entry.get("message") or {}).get("content")
+    if isinstance(content, list):
+        content = " ".join(str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str) or len(content) > 2000:
+        return None
+    output = COMMAND_OUTPUT.search(content)
+    if output:
+        return model_change(output.group(1))
+    return model_change(content) if entry.get("type") == "system" else None
+
+
 def history_text(value, limit):
     text = HISTORY_CONTROL_CHARS.sub(" ", str(value)).strip()
     if len(text) > limit:
@@ -2446,6 +2501,8 @@ class HistoryReader:
         self.instructions = None  # For a subagent: the first message, which is what it was asked to do.
         self.report = ""  # For a subagent: what it handed back when it finished.
         self.requests = []  # Tool rows for shell commands that sent requests to this computer.
+        self.model = ""  # The model of Claude's latest reply.
+        self.model_noted = False  # A switch was already shown, so the next reply's new model needs no note.
 
     @staticmethod
     def new_turn(prompt, at):
@@ -2478,6 +2535,10 @@ class HistoryReader:
         if self.is_subagent and self.instructions is None:
             self.instructions = history_text(text, HISTORY_TEXT)
             return
+        output = COMMAND_OUTPUT.fullmatch(text.strip())
+        if output:  # A slash command's output is recorded as a user message, but the user didn't write it.
+            self._add_note(ANSI_CODES.sub("", output.group(1)))
+            return
         command = SLASH_COMMAND.search(text) if text.lstrip().startswith("<command-") else None
         if command:
             # Slash commands are stored as tags. Show them as they were typed.
@@ -2501,9 +2562,30 @@ class HistoryReader:
         if str(text or "").strip():
             self.add({"role": "system", "note": True, "text": history_text(text, HISTORY_TEXT)})
 
+    def _model_note(self, by, name, was=""):
+        if by == "you":
+            text = f"You switched the model to {name}"
+        else:
+            text = f"Claude Code switched the model to {name}" + (f" (was {was})" if was else "")
+        self.add({"role": "system", "note": True, "model": {"by": by, "to": name, "was": was}, "text": text})
+
     def _ingest(self, entry, position):
         kind = entry.get("type")
         self.first_at = self.first_at or entry_time(entry)
+        if kind in ("user", "system") and not self.is_subagent and not entry.get("isSidechain"):
+            change = model_change_in(entry)
+            if change:
+                if not (change[0] == "auto" and self.model_noted):
+                    self._model_note(change[0], change[1], self.model if change[0] == "auto" else "")
+                self.model_noted = True
+                return
+        elif kind == "assistant" and not self.is_subagent and not entry.get("isSidechain"):
+            model = str((entry.get("message") or {}).get("model") or "")
+            if model and not model.startswith("<"):
+                name = model_name(model)
+                if self.model and name != self.model and not self.model_noted:
+                    self._model_note("auto", name, self.model)
+                self.model, self.model_noted = name, False
         if kind == "attachment":
             attachment = entry.get("attachment") or {}
             if attachment.get("type") == "queued_command" and str(attachment.get("prompt", "")).strip():
@@ -4906,6 +4988,8 @@ button.update svg{flex:none}
 #usage{margin-left:auto}#usage:not(:empty)+#devices{margin-left:0}
 #histUsage{margin-left:auto}#histUsage:not(:empty)+#histFiles{margin-left:0}
 #histCtx{color:var(--dim);font-size:12px}#histCtx:empty{display:none}
+#histModel{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:1px 8px;white-space:nowrap}#histModel:empty{display:none}
+.msg.system.model{color:var(--text);border-left-color:var(--warn);max-height:none}
 .devs{display:grid;gap:8px;padding:8px 12px;border-top:1px solid var(--line)}
 .dev{display:flex;gap:10px;align-items:flex-start;text-align:left;padding:6px;min-width:0;background:#14161f}
 .dev img{flex:none;display:block;width:96px;min-height:60px;background:#000;border-radius:3px}
@@ -5092,7 +5176,7 @@ textarea{min-height:110px;resize:vertical}
 <header><h1>Claude Sessions</h1><span id="summary">connecting…</span><span id="error"></span><button id="updateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="restartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><span id="usage" class="usage"></span><button id="devices">Devices</button><button id="phoneBtn" title="Use this app from your phone, on the same Wi-Fi" aria-label="Phone access"><svg viewBox="0 0 16 16" width="14" height="16" aria-hidden="true"><rect x="4" y="1.5" width="8" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 12h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="new" class="primary">New session</button></header>
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
-<dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="reqBox" aria-label="Requests to this computer" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
+<dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose">← Sessions</button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Write notes &amp; restart</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="reqBox" aria-label="Requests to this computer" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replyNote"></div><div id="queue" hidden></div>
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" hidden><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
@@ -5835,6 +5919,7 @@ function updateFoot(s){
  renderQueue(s);
  renderFailure(s);
  $('histCtx').textContent=contextText(s);
+ if($('histModel').textContent!==(s.model||''))$('histModel').textContent=s.model||'';
  const working=s.subagents.filter(a=>a.state==='working').length;
  const label='Subagents ('+(working?working+' working':s.subagents.length)+')';
  $('histAgents').hidden=!s.subagents.length;
@@ -5962,6 +6047,11 @@ function messageRow(m,open,agent,openSet){
   el('summary','',d,'Thinking');el('div','',d,m.text);return d;
  }
  const r=el('div','msg '+m.role);
+ if(m.model){
+  r.classList.add('model');
+  el('b','',r,m.model.by==='you'?'Model':'Model changed automatically');r.append(m.text);
+  return r;
+ }
  if(m.picture){
   el('b','',r,'Picture');
   const a=el('a','picture',r);a.href=uploadUrl(m.picture);a.target='_blank';a.rel='noopener';
@@ -6959,7 +7049,7 @@ def run_statusline():
     if SESSION_ID.match(session_id):
         with contextlib.suppress(OSError, TypeError, ValueError):
             figures = {"context_percent": (data.get("context_window") or {}).get("used_percentage"),
-                       "rate_limits": data.get("rate_limits")}
+                       "rate_limits": data.get("rate_limits"), "model": (data.get("model") or {}).get("display_name")}
             write_json_file(os.path.join(STATUS_DIR, session_id + ".json"), figures)
     parts = [str((data.get("model") or {}).get("display_name") or "Claude")]
     context = (data.get("context_window") or {}).get("used_percentage")
