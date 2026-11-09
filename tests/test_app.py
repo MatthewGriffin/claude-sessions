@@ -11,6 +11,7 @@ import hashlib
 import http.server
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
@@ -521,6 +522,22 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(any("--context" in c for c in commands))
         self.assertIn("someone --else", commands)  # Other hooks in the same group stay.
         self.assertEqual(sum("--hook" in c for c in commands), 1)
+
+
+class StatusLineTests(unittest.TestCase):
+    def test_saves_the_figures_into_a_new_folder(self):
+        folder = tempfile.mkdtemp(dir=CONFIG)
+        saved = app.STATUS_DIR, sys.stdin, sys.stdout
+        app.STATUS_DIR = os.path.join(folder, "status")
+        sys.stdin, sys.stdout = io.StringIO(json.dumps({"session_id": "abc-123", "context_window": {"used_percentage": 42}})), io.StringIO()
+        try:
+            app.run_statusline()
+            printed = sys.stdout.getvalue()
+        finally:
+            app.STATUS_DIR, sys.stdin, sys.stdout = saved
+        self.assertIn("Ctx 42%", printed)
+        with open(os.path.join(folder, "status", "abc-123.json")) as handle:
+            self.assertEqual(json.load(handle)["context_percent"], 42)
 
 
 class RequestTests(unittest.TestCase):

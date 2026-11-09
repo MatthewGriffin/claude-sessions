@@ -336,7 +336,7 @@ def read_names():
 
 
 def write_json_file(path, value):
-    os.makedirs(MONITOR_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)  # Such as monitor/status, which only the status line writes to.
     temporary = f"{path}.{os.getpid()}.{threading.get_ident()}"
     with open(temporary, "w") as handle:
         json.dump(value, handle)
