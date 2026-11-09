@@ -411,6 +411,24 @@ class PictureTests(unittest.TestCase):
         self.assertFalse(app.send_reply(None, {"id": "s1", "text": "hi", "images": ["../../etc/passwd"]})[0])
         self.assertFalse(app.send_reply(None, {"id": "s1", "text": "/clear", "images": [name]})[0])
 
+    def test_heic_converted_or_explained(self):
+        import base64
+        heic = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 64
+        self.assertTrue(app.is_heif(heic))
+        self.assertFalse(app.is_heif(PNG))
+        saved = app.heif_to_jpeg
+        try:
+            app.heif_to_jpeg = lambda data: b"\xff\xd8\xff\xe0 a jpeg"
+            ok, result = app.save_upload(None, {"data": base64.b64encode(heic).decode()})
+            self.assertTrue(ok, result)
+            self.assertTrue(result["name"].endswith(".jpg"))
+            app.heif_to_jpeg = lambda data: None
+            ok, result = app.save_upload(None, {"data": base64.b64encode(heic).decode()})
+            self.assertFalse(ok)
+            self.assertIn("HEIC", result)
+        finally:
+            app.heif_to_jpeg = saved
+
     def test_shown_in_the_chat(self):
         name = self.upload()[1]["name"]
         path = os.path.join(app.MONITOR_DIR, "t.jsonl")

@@ -44,6 +44,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -3032,17 +3033,51 @@ def image_type(data):
     return None
 
 
+HEIF_BRANDS = (b"heic", b"heix", b"heim", b"heis", b"hevc", b"hevx", b"mif1", b"msf1", b"avif", b"avis")
+
+
+def is_heif(data):
+    """HEIC or AVIF: what many phones save photos as, and what their browsers often can't open."""
+    return data[4:8] == b"ftyp" and any(brand in data[8:min(len(data), 64)] for brand in HEIF_BRANDS)
+
+
+def heif_to_jpeg(data):
+    """Turn a HEIC or AVIF photo into a JPEG at most 2000 pixels across, as the page does. None if it can't."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    with tempfile.TemporaryDirectory() as folder:
+        source, target = os.path.join(folder, "photo.heic"), os.path.join(folder, "photo.jpg")
+        with open(source, "wb") as handle:
+            handle.write(data)
+        try:
+            subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-i", source, "-frames:v", "1",
+                            "-vf", "scale=w='min(2000,iw)':h='min(2000,ih)':force_original_aspect_ratio=decrease",
+                            "-q:v", "3", target], capture_output=True, timeout=60)
+            with open(target, "rb") as handle:
+                converted = handle.read()
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return converted if image_type(converted) == "jpg" else None
+
+
 def save_upload(monitor, request):
     """Keep a picture the page sent, for a message to attach. Returns its name."""
     try:
         data = base64.b64decode(str(request.get("data", "")), validate=True)
     except ValueError:
         return False, "That picture couldn't be read."
-    kind = image_type(data)
-    if not kind:
-        return False, "Only JPEG, PNG, GIF and WebP pictures can be sent."
     if len(data) > MAX_UPLOAD_BYTES:
         return False, "That picture is too large."
+    if is_heif(data):
+        # The phone's browser couldn't open it to shrink it, so it sent the photo as it is.
+        data = heif_to_jpeg(data)
+        if not data:
+            return False, ("That photo is HEIC, which this computer can't convert without ffmpeg. "
+                           "Set the phone's camera to save JPEG (\u201cMost compatible\u201d), or send a screenshot of it.")
+    kind = image_type(data)
+    if not kind:
+        return False, "Only JPEG, PNG, GIF, WebP and HEIC pictures can be sent."
     folder = uploads_dir()
     os.makedirs(folder, mode=0o700, exist_ok=True)
     cutoff = time.time() - UPLOAD_KEEP_DAYS * 86400
@@ -5443,22 +5478,41 @@ function renderPending(){
 }
 async function shrinkImage(file){
  // Phones take very large photos. Claude scales them down anyway, so this saves the upload.
- const bitmap=await createImageBitmap(file,{imageOrientation:'from-image'}).catch(()=>null);
- if(!bitmap)throw new Error('That file isn\u2019t a picture this browser can open.');
+ // Browsers differ in what they open, and how, so try each way in turn. null if none can.
+ const bitmap=await createImageBitmap(file,{imageOrientation:'from-image'}).catch(()=>null)
+  ||await createImageBitmap(file).catch(()=>null)
+  ||await new Promise(done=>{
+   const img=new Image(),url=URL.createObjectURL(file);
+   img.onload=()=>{URL.revokeObjectURL(url);done(img.naturalWidth?img:null)};
+   img.onerror=()=>{URL.revokeObjectURL(url);done(null)};
+   img.src=url;
+  });
+ if(!bitmap)return null;
  const scale=Math.min(1,2000/Math.max(bitmap.width,bitmap.height));
  const c=document.createElement('canvas');c.width=Math.max(1,Math.round(bitmap.width*scale));c.height=Math.max(1,Math.round(bitmap.height*scale));
  const g=c.getContext('2d');g.fillStyle='#fff';g.fillRect(0,0,c.width,c.height);g.drawImage(bitmap,0,0,c.width,c.height);
  return c.toDataURL('image/jpeg',0.88);
 }
+function fileData(file){
+ return new Promise((done,fail)=>{
+  const r=new FileReader();
+  r.onload=()=>done(r.result.slice(r.result.indexOf(',')+1));
+  r.onerror=()=>fail(new Error('That picture couldn\u2019t be read.'));
+  r.readAsDataURL(file);
+ });
+}
 async function addImages(files){
  $('replyErr').textContent='';
- for(const file of [...files].filter(f=>f.type.startsWith('image/'))){
+ for(const file of [...files].filter(f=>f.type.startsWith('image/')||/\.(heic|heif|avif)$/i.test(f.name))){
   if(pendingImages.length+imagesLoading>=5){$('replyErr').textContent='Up to 5 pictures can go in one message.';break}
   imagesLoading++;
   try{
-   const url=await shrinkImage(file),d=await post('upload',{data:url.slice(url.indexOf(',')+1)});
+   const url=await shrinkImage(file);
+   // A photo this browser can't open, often HEIC from a phone, goes as it is for the computer to convert.
+   if(!url&&file.size>10*1024*1024)throw new Error('That picture is too large to send as it is.');
+   const d=await post('upload',{data:url?url.slice(url.indexOf(',')+1):await fileData(file)});
    if(d.error)throw new Error(d.error);
-   pendingImages.push({name:d.message.name,url});renderPending();
+   pendingImages.push({name:d.message.name,url:url||uploadUrl(d.message.name)});renderPending();
   }catch(e){$('replyErr').textContent=e.message||'Could not add that picture.'}
   finally{imagesLoading--}
  }
