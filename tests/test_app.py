@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SOURCE = os.path.join(ROOT, "claude-monitor")
@@ -379,6 +380,81 @@ class BuiltUpdateTests(unittest.TestCase):
         host.kill()
 
 
+@unittest.skipUnless(WINDOWS and os.environ.get("CLAUDE_SESSIONS_TEST_FOLDER"), "needs the built Windows programs")
+class BuiltFolderTests(BuiltUpdateTests):
+    """A one-file copy moves to the folder build of its own version, which then updates to a newer folder build."""
+
+    def zipped(self, version):
+        stem = f"claude-sessions-windows-{version}"
+        source = os.environ["CLAUDE_SESSIONS_TEST_FOLDER"]
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, "w", zipfile.ZIP_DEFLATED) as archive:
+            for root, _, names in os.walk(source):
+                for name in names:
+                    path = os.path.join(root, name)
+                    inside = os.path.relpath(path, source).replace(os.sep, "/")
+                    if inside == "claude-sessions-windows.exe":
+                        inside = stem + ".exe"
+                    archive.write(path, f"{stem}/{inside}")
+        return data.getvalue()
+
+    def publish_folder(self, version):
+        exe, folder = f"claude-sessions-windows-{version}.exe", f"claude-sessions-windows-{version}.zip"
+        self.files["/asset"], self.files["/zip"] = self.body, self.zipped(version)
+        self.files["/sums"] = (f"{hashlib.sha256(self.body).hexdigest()}  {exe}\n"
+                               f"{hashlib.sha256(self.files['/zip']).hexdigest()}  {folder}\n").encode()
+        self.files["/latest"] = json.dumps({"tag_name": "v" + version, "html_url": self.base + "/page", "assets": [
+            {"name": exe, "browser_download_url": self.base + "/asset"},
+            {"name": folder, "browser_download_url": self.base + "/zip"},
+            {"name": "SHA256SUMS", "browser_download_url": self.base + "/sums"}]}).encode()
+
+    def running_from(self, pattern):
+        script = "Get-Process | Where-Object { $_.Path -and $_.Path -like $env:CS_PATTERN } | ForEach-Object { $_.Path }"
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                                env={**os.environ, "CS_PATTERN": pattern}, capture_output=True, text=True, timeout=60)
+        return result.stdout.strip()
+
+    def test_updates_and_restarts(self):
+        version = subprocess.run([self.program, "--version"], capture_output=True, text=True, timeout=60).stdout.split()[-1]
+        environment = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_") and k != "_MEIPASS2"}
+        tools, installers, local = (os.path.join(self.folder, n) for n in ("tools", "installers", "local"))
+        for folder in (tools, installers, local):
+            os.makedirs(folder)
+        with open(os.path.join(tools, "claude.cmd"), "w") as handle:
+            handle.write("@echo []\n")
+        environment.update(CLAUDE_CONFIG_DIR=self.config, CLAUDE_SESSIONS_RELEASES_URL=self.base + "/latest",
+                           CLAUDE_SESSIONS_INSTALLERS_DIR=installers, LOCALAPPDATA=local,
+                           PATH=tools + os.pathsep + environment.get("PATH", ""),
+                           CLAUDE_SESSIONS_HOST_PORT=str(23000 + secrets.randbelow(2000)))
+        environment.pop("CLAUDE_SESSIONS_NO_INSTALL", None)
+        self.publish_folder(version)
+        first = subprocess.Popen([self.program, "--web", "--no-open", "--port", str(self.port)], env=environment)
+        self.assertTrue(wait_for(self.answers, 60), "the program didn't start")
+        moved = os.path.join(installers, f"claude-sessions-windows-{version}", "*")
+        self.assertTrue(wait_for(lambda: self.running_from(moved), 120), "the one-file copy didn't move to the folder build")
+        self.assertTrue(wait_for(lambda: first.poll() is not None, 60), "the one-file copy should have handed over and exited")
+        self.assertTrue(wait_for(self.answers, 60), "the folder build didn't take over")
+        started = time.time()
+        program = os.path.join(installers, f"claude-sessions-windows-{version}", f"claude-sessions-windows-{version}.exe")
+        result = subprocess.run([program, "--statusline"], input=b"{}", env=environment, capture_output=True, timeout=60)
+        print(f"\n  one status line run of the folder build took {time.time() - started:.2f} s", file=sys.stderr)
+        self.assertEqual(result.returncode, 0)
+        self.publish_folder("998.0.0")
+
+        def offered():
+            status, state = self.request("/api/sessions")
+            return status == 200 and (state.get("release") or {}).get("version") == "998.0.0"
+        self.assertTrue(wait_for(offered, 30), "the stand-in release wasn't offered")
+        status, reply = self.request("/api/sessions/update", {})
+        self.assertEqual(status, 200, reply)
+        newest = os.path.join(installers, "claude-sessions-windows-998.0.0", "*")
+        self.assertTrue(wait_for(lambda: self.running_from(newest), 120), "the newer folder build didn't start")
+        self.assertTrue(wait_for(self.answers, 60), "the newer folder build didn't take over")
+        # Once the earlier version has exited, only the newest folder is kept.
+        left = lambda: sorted(n for n in os.listdir(installers) if n.startswith("claude-sessions-windows-"))  # noqa: E731
+        self.assertTrue(wait_for(lambda: left() == ["claude-sessions-windows-998.0.0"], 90), left())
+
+
 class PrinterControlTests(unittest.TestCase):
     """Printer controls become the messages Anycubic's own slicer sends, and silly values are refused."""
 
@@ -556,6 +632,82 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(any("--context" in c for c in commands))
         self.assertIn("someone --else", commands)  # Other hooks in the same group stay.
         self.assertEqual(sum("--hook" in c for c in commands), 1)
+
+
+class FolderBuildTests(unittest.TestCase):
+    """The one-folder Windows build: unpacked from its zip, and earlier versions tidied away by folder."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(prefix="claude-sessions-folder-")
+        os.environ["CLAUDE_SESSIONS_INSTALLERS_DIR"] = self.folder
+
+    def tearDown(self):
+        os.environ.pop("CLAUDE_SESSIONS_INSTALLERS_DIR", None)
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def zipped(self, stem, extra=()):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, "w") as archive:
+            archive.writestr(f"{stem}/{stem}.exe", b"program")
+            archive.writestr(f"{stem}/_internal/base_library.zip", b"library")
+            for name in extra:
+                archive.writestr(name, b"x")
+        return data.getvalue()
+
+    def test_unpacks_beside_the_same_version(self):
+        stem = "claude-sessions-windows-1.2.0"
+        program = app.stage_folder_build(self.zipped(stem), stem + ".zip")
+        self.assertEqual(program, os.path.join(self.folder, stem, stem + ".exe"))
+        self.assertTrue(os.path.exists(os.path.join(self.folder, stem, "_internal", "base_library.zip")))
+        again = app.stage_folder_build(self.zipped(stem), stem + ".zip")
+        self.assertNotEqual(os.path.dirname(again), os.path.dirname(program))
+        self.assertTrue(os.path.exists(again))
+        self.assertEqual(sorted(os.listdir(self.folder))[0], stem)  # No unpacking folder left over.
+        self.assertEqual(len(os.listdir(self.folder)), 2)
+
+    def test_refuses_unexpected_contents(self):
+        stem = "claude-sessions-windows-1.2.0"
+        for data, name in ((self.zipped(stem, ["elsewhere.txt"]), stem + ".zip"), (self.zipped("other"), "other.zip"),
+                           (self.zipped(stem), "claude-sessions-windows-1.3.0.zip")):
+            with self.assertRaises(ValueError):
+                app.stage_folder_build(data, name)
+        self.assertEqual(os.listdir(self.folder), [])
+
+    def test_prefers_the_folder_build_on_windows(self):
+        assets = {n: "http://127.0.0.1/" + n for n in ("claude-sessions-windows-1.2.0.exe", "claude-sessions-windows-1.2.0.zip",
+                                                         "claude-monitor", "SHA256SUMS")}
+        listing = {"tag_name": "v1.2.0", "assets": [{"name": n, "browser_download_url": u} for n, u in assets.items()]}
+        saved = app.fetch
+        app.fetch = lambda url, limit, timeout=30: json.dumps(listing).encode()
+        try:
+            releases = app.Releases()
+            releases.check()
+        finally:
+            app.fetch = saved
+        self.assertEqual(releases.latest["asset"], "claude-sessions-windows-1.2.0.zip" if WINDOWS else "claude-monitor")
+
+    def test_folder_build_finds_earlier_versions(self):
+        names = {"claude-sessions-windows-1.1.0": "dir", "claude-sessions-windows-1.2.0": "dir", "claude-sessions-windows-1.3.0": "dir",
+                 "claude-sessions-windows-1.2.0-abc123": "mine", "claude-sessions-windows-1.2.0.1a2b.download": "dir",
+                 "claude-sessions-windows-1.1.0.exe": "file", "claude-sessions-windows-1.2.0.exe": "file", "other": "dir"}
+        for name, kind in names.items():
+            if kind == "file":
+                open(os.path.join(self.folder, name), "w").close()
+            else:
+                os.makedirs(os.path.join(self.folder, name))
+        mine = os.path.join(self.folder, "claude-sessions-windows-1.2.0-abc123", "claude-sessions-windows-1.2.0.exe")
+        open(mine, "w").close()
+        saved = app.PROGRAM_PATH, app.APP_VERSION, app.ONE_FOLDER
+        try:
+            app.PROGRAM_PATH, app.APP_VERSION, app.ONE_FOLDER = mine, "1.2.0", True
+            found = sorted(os.path.basename(p) for p in app.older_windows_builds())
+            app.ONE_FOLDER = False  # A one-file copy leaves folders alone.
+            found_by_file = sorted(os.path.basename(p) for p in app.older_windows_builds())
+        finally:
+            app.PROGRAM_PATH, app.APP_VERSION, app.ONE_FOLDER = saved
+        self.assertEqual(found, ["claude-sessions-windows-1.1.0", "claude-sessions-windows-1.1.0.exe", "claude-sessions-windows-1.2.0",
+                                 "claude-sessions-windows-1.2.0.1a2b.download", "claude-sessions-windows-1.2.0.exe"])
+        self.assertNotIn("claude-sessions-windows-1.1.0", found_by_file)
 
 
 class SessionFileTests(unittest.TestCase):

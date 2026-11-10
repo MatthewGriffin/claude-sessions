@@ -62,18 +62,27 @@ jobs:
           Copy-Item claude-monitor build_claude_sessions.py
           python -m PyInstaller --onefile --windowed --noconfirm --name claude-sessions-windows `
             --icon assets/claude-sessions.ico --collect-all winpty --collect-all pyte build_claude_sessions.py
+          # The folder build starts about six times faster; it's what updates install.
+          python -m PyInstaller --onedir --windowed --noconfirm --name claude-sessions-windows --distpath dist-folder `
+            --icon assets/claude-sessions.ico --collect-all winpty --collect-all pyte build_claude_sessions.py
       - name: Test the built program's session host and update
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         timeout-minutes: 10
         env:
           CLAUDE_SESSIONS_TEST_PROGRAM: ${{ github.workspace }}\dist\claude-sessions-windows.exe
-        run: python -m unittest test_app.TerminalTests test_app.BuiltHookTests test_app.BuiltUpdateTests -v
+          CLAUDE_SESSIONS_TEST_FOLDER: ${{ github.workspace }}\dist-folder\claude-sessions-windows
+        run: python -m unittest test_app.TerminalTests test_app.BuiltHookTests test_app.BuiltUpdateTests test_app.BuiltFolderTests -v
         working-directory: tests
       - uses: actions/upload-artifact@v7
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: windows
           path: dist/claude-sessions-windows.exe
+      - uses: actions/upload-artifact@v7
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: windows-folder
+          path: dist-folder/claude-sessions-windows
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -84,8 +93,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          merge-multiple: true
-          path: release
+          path: artifacts
+      - name: Gather the files
+        run: |
+          mkdir release
+          mv artifacts/linux/claude-monitor artifacts/windows/claude-sessions-windows.exe release/
+          mv artifacts/windows-folder folder
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -95,6 +108,12 @@ jobs:
           # The Windows download carries its version (the update button looks for that name since 0.1.21).
           versioned="claude-sessions-windows-${GITHUB_REF_NAME#v}.exe"
           mv claude-sessions-windows.exe "$versioned"
-          sha256sum claude-monitor "$versioned" > SHA256SUMS
+          # The folder build, as claude-sessions-windows-X.Y.Z/claude-sessions-windows-X.Y.Z.exe and its files.
+          stem="claude-sessions-windows-${GITHUB_REF_NAME#v}"
+          mv ../folder "$stem"
+          mv "$stem/claude-sessions-windows.exe" "$stem/$stem.exe"
+          zip -qr "$stem.zip" "$stem"
+          rm -r "$stem"
+          sha256sum claude-monitor "$versioned" "$stem.zip" > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes \
-            "$versioned" claude-monitor SHA256SUMS
+            "$versioned" "$stem.zip" claude-monitor SHA256SUMS

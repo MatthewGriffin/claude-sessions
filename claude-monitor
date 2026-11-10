@@ -33,6 +33,7 @@ import html
 import http.client
 import http.cookies
 import http.server
+import io
 import ipaddress
 import json
 import mmap
@@ -55,6 +56,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+import zipfile
 
 WINDOWS = sys.platform == "win32"
 FROZEN = bool(getattr(sys, "frozen", False))  # Built into a single program by PyInstaller.
@@ -307,6 +309,11 @@ MAX_REQUESTS = 50
 SCRIPT_PATH = os.path.abspath(__file__)
 # The file that is this app: the script, or for a Windows build the program PyInstaller made.
 PROGRAM_PATH = os.path.abspath(sys.executable) if FROZEN else SCRIPT_PATH
+# The Windows build comes as one file, which unpacks itself on every run (a second or more, longer
+# while antivirus scans it), and as a folder, which starts in about 0.2 s. Every hook and status line
+# run starts this program, so the folder one is what gets installed; a one-file copy moves to it.
+ONE_FOLDER = FROZEN and os.path.normcase(os.path.abspath(getattr(sys, "_MEIPASS", ""))) == os.path.normcase(
+    os.path.join(os.path.dirname(PROGRAM_PATH), "_internal"))
 
 
 def own_command(*arguments):
@@ -4561,6 +4568,43 @@ def stage_installer(data, name):
     raise OSError(f"couldn't save the new version in {folder}")
 
 
+def folder_asset(version):
+    """The release file holding the one-folder Windows build of a version."""
+    return f"claude-sessions-windows-{version}.zip"
+
+
+def stage_folder_build(data, name):
+    """Unpack a downloaded one-folder build (name.zip, holding name/name.exe and its files) into
+    installers_dir(). Returns the program in it."""
+    stem = os.path.basename(name)[: -len(".zip")]
+    if not WINDOWS_FOLDER_NAME.match(stem):
+        raise ValueError(f"unexpected download {name}")
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        names = archive.namelist()
+        if any(n.replace("\\", "/").split("/")[0] != stem for n in names) or f"{stem}/{stem}.exe" not in names:
+            raise ValueError("the download doesn't hold the expected program")
+        folder = installers_dir()
+        unpacked = os.path.join(folder, f"{stem}.{secrets.token_hex(4)}.download")
+        os.makedirs(unpacked)
+        try:
+            archive.extractall(unpacked)
+            for attempt in range(6):
+                # The same version may be there already, even running; then it goes beside it.
+                target = os.path.join(folder, stem if attempt == 0 else f"{stem}-{secrets.token_hex(3)}")
+                if os.path.exists(target):
+                    continue
+                try:
+                    os.rename(os.path.join(unpacked, stem), target)
+                    return os.path.join(target, stem + ".exe")
+                except OSError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(1)  # Antivirus often holds files it has just seen written.
+            raise OSError(f"couldn't save the new version in {folder}")
+        finally:
+            shutil.rmtree(unpacked, ignore_errors=True)
+
+
 def version_tuple(text):
     match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", str(text or "").strip())
     return tuple(int(n) for n in match.groups()) if match else None
@@ -4592,6 +4636,8 @@ class Releases:
         assets = {a.get("name"): a.get("browser_download_url") for a in release.get("assets", []) if isinstance(a, dict)}
         version = str(release.get("tag_name", "")).lstrip("v")
         name = versioned_asset(version) if assets.get(versioned_asset(version)) else RELEASE_ASSET
+        if WINDOWS and assets.get(folder_asset(version)):
+            name = folder_asset(version)
         if version_tuple(version) and assets.get(name) and assets.get("SHA256SUMS"):
             self.latest = {"version": version, "url": assets[name], "sums": assets["SHA256SUMS"], "asset": name,
                            "page": str(release.get("html_url", ""))}
@@ -4611,13 +4657,15 @@ class Releases:
             return {"version": latest["version"], "page": latest["page"]}
         return None
 
-    def install(self):
-        """Download the newer release over this app's own file. Returns (succeeded, message)."""
+    def install(self, same_version=False):
+        """Download the newer release over this app's own file. Returns (succeeded, message).
+        With same_version, this very version is installed again, as a one-file copy moving to the folder build."""
         if not self.lock.acquire(blocking=False):
             return False, "An update is already being installed."
         try:
             latest = self.latest
-            if not self.offer():
+            again = same_version and latest and version_tuple(latest["version"]) == version_tuple(APP_VERSION)
+            if not (self.offer() or again):
                 return False, "There is no newer version to install."
             sums = {}
             for line in fetch(latest["sums"], 64 * 1024).decode(errors="replace").splitlines():
@@ -4631,6 +4679,9 @@ class Releases:
                 return False, "The download didn't match its checksum, so it wasn't installed."
             if not WINDOWS:
                 compile(data, PROGRAM_PATH, "exec")  # A broken script would leave no app to come back to.
+            if WINDOWS and str(latest.get("asset", "")).endswith(".zip"):
+                self.staged = stage_folder_build(data, latest["asset"])
+                return True, f"Downloaded version {latest['version']}."
             if WINDOWS:
                 # Saved as an installer and run from there: it then installs itself, as the first download did.
                 self.staged = stage_installer(data, latest.get("asset") or RELEASE_ASSET)
@@ -4641,7 +4692,7 @@ class Releases:
             os.chmod(downloaded, os.stat(PROGRAM_PATH).st_mode | 0o111)
             os.replace(downloaded, PROGRAM_PATH)
             return True, f"Installed version {latest['version']}."
-        except (OSError, ValueError, SyntaxError) as exc:
+        except (OSError, ValueError, SyntaxError, zipfile.BadZipFile) as exc:
             with contextlib.suppress(OSError, NameError):
                 os.unlink(downloaded)
             return False, f"The update failed: {clean(exc)}"
@@ -4657,17 +4708,57 @@ def update_app(monitor, request):
     if not succeeded:
         return False, message
     if WINDOWS:
-        staged = releases.staged
-        try:
-            # It installs itself over this copy, then the installed one waits for this one's port.
-            subprocess.Popen([staged, *restart_arguments(), "--wait-for-port"], close_fds=True,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except OSError as exc:
-            return False, f"The new version is saved as {staged}, but Windows wouldn't start it ({clean(str(exc))}). Close this app, then run that file."
+        started, problem = start_staged(releases.staged)
+        if not started:
+            return False, problem
         threading.Timer(0.3, hand_over).start()  # After this request has been answered.
         return True, message
     threading.Timer(0.3, restart_server).start()  # After this request has been answered.
     return True, message
+
+
+def start_staged(staged):
+    """Start a downloaded Windows version, which waits for this one's port. Returns (started, problem)."""
+    try:
+        # A quick run first: one that can't start (blocked, or missing a file) would leave no app at all.
+        check = subprocess.run([staged, "--version"], capture_output=True, timeout=120, stdin=subprocess.DEVNULL)
+        if check.returncode != 0:
+            raise OSError(f"it stopped with code {check.returncode}")
+        subprocess.Popen([staged, *restart_arguments(), "--wait-for-port"], close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"The new version is saved as {staged}, but it wouldn't start ({clean(str(exc))}). Close this app, then run that file."
+    return True, ""
+
+
+FOLDER_BUILD_FILE = os.path.join(MONITOR_DIR, "folder-build.json")
+
+
+def move_to_folder_build():
+    """A one-file Windows copy installs the folder build of its own version and hands over to it.
+    Tried once per version, so a folder build that won't run leaves this copy running."""
+    if not version_tuple(APP_VERSION) or os.environ.get("CLAUDE_SESSIONS_NO_INSTALL"):
+        return
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        with open(FOLDER_BUILD_FILE, encoding="utf-8") as handle:
+            if json.load(handle).get("version") == APP_VERSION:
+                return
+    while serving_port is None:
+        time.sleep(1)
+    time.sleep(10)  # Until the window has opened and called, so it carries over.
+    for attempt in range(3):
+        try:
+            releases.check()
+            break
+        except Exception:
+            time.sleep(60)
+    latest = releases.latest
+    if not latest or latest["version"] != APP_VERSION or not latest["asset"].endswith(".zip"):
+        return  # A newer version is offered instead, and installing it brings the folder build.
+    write_json_file(FOLDER_BUILD_FILE, {"version": APP_VERSION, "at": time.time()})
+    succeeded, message = releases.install(same_version=True)
+    if succeeded and start_staged(releases.staged)[0]:
+        hand_over()
 
 
 def hand_over():
@@ -7708,6 +7799,7 @@ SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 # Where versions before 0.1.25 copied themselves to, as claude-sessions.exe. Now each version runs as downloaded.
 WINDOWS_INSTALL_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Claude Sessions")
 WINDOWS_BUILD_NAME = re.compile(r"^claude-sessions-windows-(\d+\.\d+\.\d+)(?:-[0-9a-f]+)?\.exe$", re.I)
+WINDOWS_FOLDER_NAME = re.compile(r"^claude-sessions-windows-(\d+\.\d+\.\d+)(?:-[0-9a-f]+)?$", re.I)
 
 
 def start_menu_shortcut():
@@ -7728,15 +7820,22 @@ def older_windows_builds():
     named = WINDOWS_BUILD_NAME.match(os.path.basename(PROGRAM_PATH))
     version = version_tuple(named.group(1) if named else APP_VERSION)  # What it was released as.
     found = []
-    for folder in {os.path.dirname(PROGRAM_PATH), installers_dir()}:
+    my_folder = os.path.normcase(os.path.dirname(mine)) if ONE_FOLDER else None
+    places = {os.path.dirname(PROGRAM_PATH), installers_dir()}
+    if ONE_FOLDER:
+        places.add(os.path.dirname(os.path.dirname(PROGRAM_PATH)))  # Beside this version's folder.
+    for folder in places:
         with contextlib.suppress(OSError):
             for name in os.listdir(folder):
                 path = os.path.join(folder, name)
-                match = WINDOWS_BUILD_NAME.match(name)
-                if os.path.normcase(os.path.abspath(path)) == mine:
+                if os.path.normcase(os.path.abspath(path)) in (mine, my_folder):
                     continue
+                # Only a folder build removes folders: a one-file copy of the same version, still
+                # running while it hands over, would otherwise take the folder it moved to.
+                match = WINDOWS_FOLDER_NAME.match(name) if os.path.isdir(path) and ONE_FOLDER else WINDOWS_BUILD_NAME.match(name)
                 newer = match and version and version_tuple(match.group(1)) > version
-                if (match and not newer) or (name.startswith("claude-sessions-windows-") and name.endswith(".download")):
+                if (match and not newer) or (name.startswith("claude-sessions-windows-") and name.endswith(".download")
+                                             and (ONE_FOLDER or not os.path.isdir(path))):
                     found.append(path)
     if os.environ.get("LOCALAPPDATA") and not mine.startswith(os.path.normcase(WINDOWS_INSTALL_DIR)):
         with contextlib.suppress(OSError):
@@ -7768,7 +7867,15 @@ def tidy_windows(monitor):
         left = []
         for path in older_windows_builds():
             try:
-                os.unlink(path)
+                if os.path.isdir(path):
+                    # Renamed first: Windows refuses while anything in it runs, so none of it goes then.
+                    if not path.endswith(".download"):
+                        moved = f"{path}.{secrets.token_hex(4)}.download"
+                        os.rename(path, moved)
+                        path = moved
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
             except OSError:
                 left.append(path)  # Still running: the session host, or a hook right now.
         with contextlib.suppress(OSError):
@@ -8113,6 +8220,8 @@ def main():
     monitor = Monitor()
     if WINDOWS and FROZEN:
         threading.Thread(target=tidy_windows, args=(monitor,), daemon=True).start()
+        if not ONE_FOLDER and (args.app or args.web):
+            threading.Thread(target=move_to_folder_build, daemon=True).start()
     if args.app:
         return run_app(monitor, args.port or APP_PORT, args.browser_pid, args.port is not None)
     if args.web:
