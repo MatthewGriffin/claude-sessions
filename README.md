@@ -33,10 +33,12 @@ Needs Claude Code's native install (`claude.exe`) and Microsoft Edge, Chrome or 
 
 Download `claude-sessions-windows-<version>.exe` from the [latest release](https://github.com/MatthewGriffin/claude-sessions/releases/latest)
 and open it. It runs from where it is, adds **Claude Sessions** to the Start menu, sets up Claude Code's
-hooks and opens.
+hooks and opens. A few seconds later it moves to the faster one-folder build of the same version
+(`claude-sessions-windows-<version>.zip` in the release), which starts in about 0.2 s instead of a
+second or more. That matters because Claude Code starts the program for every hook and status line.
 
-**Update** saves the new version beside it (or in `C:\installers`, if that folder exists, for workplaces
-that only allow programs from there) and runs it. The new version points the Start menu and Claude Code's
+**Update** unpacks the new version's folder beside it (or in `C:\installers`, if that folder exists, for
+workplaces that only allow programs from there) and runs it. The new version points the Start menu and Claude Code's
 hooks at itself, and deletes earlier versions once no session started before the update is still running.
 
 Windows has no tmux, so sessions started from the app run in a small background session host
