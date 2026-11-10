@@ -116,6 +116,10 @@ KNOWN_KEEP_SECONDS = 30 * 86400
 KNOWN_TOUCH_SECONDS = 60  # How often a live session's "last seen" time is saved.
 STATUS_DIR = os.path.join(MONITOR_DIR, "status")  # Written by the status line script.
 STATUS_KEEP_SECONDS = 8 * 86400  # Older than the longest usage window, so of no further use.
+# Someone's own status line, which this app's runs after saving the figures (see wrap_status_line).
+STATUS_LINE_AFTER_FILE = os.path.join(MONITOR_DIR, "statusline-after.json")
+STATUS_LINE_SECONDS = 15
+STATUS_BY = "claude-sessions"  # Marks the figures this app's status line saved, as opposed to someone's own script.
 MAX_QUEUED = 50
 QUEUE_POLL_SECONDS = 2
 # After sending, the session can still report idle for a moment before it shows as busy.
@@ -7630,7 +7634,7 @@ def icon_svg():
 
 
 def run_setup(verbose=True):
-    """Add this app's hooks to Claude Code, and its status line if there is none. Leaves everything else as it is."""
+    """Add this app's hooks to Claude Code, and its status line (in front of any other that doesn't feed it). Leaves everything else as it is."""
     say = print if verbose and sys.stdout else (lambda *a: None)
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as handle:
@@ -7671,6 +7675,8 @@ def run_setup(verbose=True):
     if "statusLine" not in settings:
         settings["statusLine"] = {"type": "command", "command": own_command_line("--statusline")}
         added.append("statusLine")
+    elif wrap_status_line(settings["statusLine"]):
+        added.append("status line (yours still shows; this app now saves its figures first)")
     if added:
         os.makedirs(CONFIG_DIR, exist_ok=True)
         if original is not None:
@@ -7753,18 +7759,113 @@ def point_commands_here(settings):
     return changed
 
 
-def run_statusline():
-    """A status line for Claude Code that also saves the figures this app shows. Used when there was none."""
+def other_status_writer():
+    """Whether something other than this app's status line saved figures lately, such as a script of the user's own."""
     try:
-        data = json.load(sys.stdin)
+        names = [n for n in os.listdir(STATUS_DIR) if n.endswith(".json") and not n.startswith(".")]
+    except OSError:
+        return False
+    for name in names:
+        path = os.path.join(STATUS_DIR, name)
+        try:
+            if time.time() - os.path.getmtime(path) > STATUS_KEEP_SECONDS:
+                continue
+            with open(path, encoding="utf-8") as handle:
+                state = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if isinstance(state, dict) and state.get("by") != STATUS_BY:
+            return True
+    return False
+
+
+def wrap_status_line(entry):
+    """Put this app's status line in front of someone's own one that doesn't save the figures this app shows.
+
+    Their command is kept in STATUS_LINE_AFTER_FILE, and this app's status line runs it with the same
+    input and prints what it printed, so their status line looks just as before. Returns whether it changed.
+    """
+    command = entry.get("command") if isinstance(entry, dict) else None
+    if entry.get("type", "command") != "command" or not isinstance(command, str) or not command.strip():
+        return False
+    if is_own_command(command, "--statusline") or other_status_writer():
+        return False
+    write_json_file(STATUS_LINE_AFTER_FILE, {"command": command})
+    entry["command"] = own_command_line("--statusline")
+    return True
+
+
+def status_line_after():
+    try:
+        with open(STATUS_LINE_AFTER_FILE, encoding="utf-8") as handle:
+            command = json.load(handle).get("command")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return command if isinstance(command, str) and command.strip() else None
+
+
+def git_bash():
+    """Git for Windows' bash, which Claude Code runs commands with on Windows. Never WSL's bash in System32."""
+    candidates = [os.environ.get("CLAUDE_CODE_GIT_BASH_PATH")]
+    git = shutil.which("git")
+    if git:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(git)))  # Git\cmd\git.exe or Git\mingw64\bin\git.exe
+        candidates += [os.path.join(root, "bin", "bash.exe"), os.path.join(os.path.dirname(root), "bin", "bash.exe")]
+    for variable in ("ProgramFiles", "ProgramW6432", "LOCALAPPDATA"):
+        if os.environ.get(variable):
+            candidates += [os.path.join(os.environ[variable], "Git", "bin", "bash.exe"),
+                           os.path.join(os.environ[variable], "Programs", "Git", "bin", "bash.exe")]
+    bash = shutil.which("bash")
+    if bash and "system32" not in bash.lower():
+        candidates.append(bash)
+    return next((c for c in candidates if c and os.path.isfile(c)), None)
+
+
+def run_other_status_line(command, raw):
+    """Run someone's own status line as Claude Code would, and print what it printed. None if it couldn't run."""
+    bash = git_bash() if WINDOWS else None
+    try:
+        result = subprocess.run([bash, "-c", command] if bash else command, shell=not bash, input=raw,
+                                capture_output=True, timeout=STATUS_LINE_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream:
+        stream.write(result.stdout)
+        stream.flush()
+    else:
+        sys.stdout.write(result.stdout.decode("utf-8", "replace"))
+    return result.returncode
+
+
+def run_statusline():
+    """A status line for Claude Code that also saves the figures this app shows.
+
+    Used when there was none, and in front of someone's own one that didn't save them (see wrap_status_line).
+    """
+    stream = getattr(sys.stdin, "buffer", None) if sys.stdin else None
+    try:
+        raw = stream.read() if stream else (sys.stdin.read() if sys.stdin else "").encode("utf-8")
+    except (OSError, ValueError):
+        raw = b""
+    try:
+        data = json.loads(raw.decode("utf-8", "replace") or "{}")
     except ValueError:
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     session_id = str(data.get("session_id", ""))
     if SESSION_ID.match(session_id):
-        with contextlib.suppress(OSError, TypeError, ValueError):
+        with contextlib.suppress(OSError, TypeError, ValueError, AttributeError):
             figures = {"context_percent": (data.get("context_window") or {}).get("used_percentage"),
-                       "rate_limits": data.get("rate_limits"), "model": (data.get("model") or {}).get("display_name")}
+                       "rate_limits": data.get("rate_limits"), "model": (data.get("model") or {}).get("display_name"),
+                       "by": STATUS_BY}
             write_json_file(os.path.join(STATUS_DIR, session_id + ".json"), figures)
+    after = status_line_after()
+    if after:
+        code = run_other_status_line(after, raw)
+        if code is not None:
+            return code
     parts = [str((data.get("model") or {}).get("display_name") or "Claude")]
     context = (data.get("context_window") or {}).get("used_percentage")
     if isinstance(context, (int, float)):

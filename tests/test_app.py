@@ -240,6 +240,21 @@ class BuiltHookTests(unittest.TestCase):
         with open(os.path.join(monitor, "status", "abc-123.json"), encoding="utf-8") as handle:
             self.assertEqual(json.load(handle)["context_percent"], 42)
 
+    def test_status_line_runs_the_users_own_after_saving(self):
+        config = tempfile.mkdtemp(prefix="claude-sessions-built-status-")
+        self.addCleanup(shutil.rmtree, config, True)
+        os.makedirs(os.path.join(config, "monitor"))
+        with open(os.path.join(config, "monitor", "statusline-after.json"), "w") as handle:
+            json.dump({"command": "echo \"theirs $(cat | wc -c)\""}, handle)
+        payload = json.dumps({"session_id": "abc-123", "context_window": {"used_percentage": 42}}).encode()
+        started = time.monotonic()
+        result = subprocess.run([os.environ["CLAUDE_SESSIONS_TEST_PROGRAM"], "--statusline"], input=payload,
+                                capture_output=True, timeout=60, env={**os.environ, "CLAUDE_CONFIG_DIR": config})
+        print(f"wrapped status line: {time.monotonic() - started:.2f} s, stdout {result.stdout!r}, stderr {result.stderr[-300:]!r}")
+        self.assertEqual(result.stdout.strip(), f"theirs {len(payload)}".encode())
+        with open(os.path.join(config, "monitor", "status", "abc-123.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["context_percent"], 42)
+
     def test_hook_records_a_finished_turn(self):
         result, monitor = self.run_program("--hook", {
             "session_id": "abc-123", "hook_event_name": "Stop", "cwd": "C:/Users/Zoë/project", "last_assistant_message": "Done – all good"})
@@ -483,6 +498,10 @@ class SetupTests(unittest.TestCase):
         with open(self.settings, "w") as handle:
             json.dump({"model": "opus", "statusLine": {"type": "command", "command": "mine"},
                        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other --thing"}]}]}}, handle)
+        folder = tempfile.mkdtemp(dir=CONFIG)
+        saved = app.STATUS_DIR, app.STATUS_LINE_AFTER_FILE
+        app.STATUS_DIR, app.STATUS_LINE_AFTER_FILE = os.path.join(folder, "status"), os.path.join(folder, "statusline-after.json")
+        self.addCleanup(lambda: (setattr(app, "STATUS_DIR", saved[0]), setattr(app, "STATUS_LINE_AFTER_FILE", saved[1])))
 
     def test_adds_hooks_once_and_keeps_everything_else(self):
         original = app.CONTEXT_HOOK
@@ -495,7 +514,9 @@ class SetupTests(unittest.TestCase):
         with open(self.settings) as handle:
             settings = json.load(handle)
         self.assertEqual(settings["model"], "opus")
-        self.assertEqual(settings["statusLine"]["command"], "mine")
+        # Their own status line runs after this app's, which saves the figures first.
+        self.assertEqual(settings["statusLine"]["command"], app.own_command_line("--statusline"))
+        self.assertEqual(app.status_line_after(), "mine")
         for event in app.HOOK_EVENTS:
             ours = [h for g in settings["hooks"][event] for h in g["hooks"] if "--hook" in h["command"]]
             self.assertEqual(len(ours), 1, event)
@@ -503,6 +524,15 @@ class SetupTests(unittest.TestCase):
         context = [h for g in settings["hooks"]["UserPromptSubmit"] for h in g["hooks"] if "--context" in h["command"]]
         self.assertEqual(len(context), 1)
         self.assertNotIn("async", context[0])  # Its output has to reach Claude.
+
+    def test_a_status_line_that_already_feeds_the_app_stays(self):
+        os.makedirs(app.STATUS_DIR)
+        with open(os.path.join(app.STATUS_DIR, "abc.json"), "w") as handle:
+            json.dump({"context_percent": 5}, handle)  # Saved by the user's own script.
+        self.assertEqual(app.run_setup(verbose=False), 0)
+        with open(self.settings) as handle:
+            self.assertEqual(json.load(handle)["statusLine"]["command"], "mine")
+        self.assertIsNone(app.status_line_after())
 
     def test_windows_leaves_out_the_hook_claude_code_waits_for(self):
         original = app.CONTEXT_HOOK
@@ -559,6 +589,24 @@ class StatusLineTests(unittest.TestCase):
         self.assertIn("Ctx 42%", printed)
         with open(os.path.join(folder, "status", "abc-123.json")) as handle:
             self.assertEqual(json.load(handle)["context_percent"], 42)
+
+    def test_runs_the_users_own_status_line_after_saving(self):
+        folder = tempfile.mkdtemp(dir=CONFIG)
+        saved = app.STATUS_DIR, app.STATUS_LINE_AFTER_FILE, sys.stdin, sys.stdout
+        app.STATUS_DIR, app.STATUS_LINE_AFTER_FILE = os.path.join(folder, "status"), os.path.join(folder, "after.json")
+        app.write_json_file(app.STATUS_LINE_AFTER_FILE, {"command": "cat; echo ' mine'"})  # Through Git Bash on Windows, as Claude Code does.
+        given = json.dumps({"session_id": "abc-123", "context_window": {"used_percentage": 42}, "cwd": "C:/Zoë"}, ensure_ascii=False)
+        sys.stdin, sys.stdout = io.StringIO(given), io.StringIO()
+        try:
+            code = app.run_statusline()
+            printed = sys.stdout.getvalue()
+        finally:
+            app.STATUS_DIR, app.STATUS_LINE_AFTER_FILE, sys.stdin, sys.stdout = saved
+        self.assertEqual(code, 0)
+        self.assertEqual(printed.strip(), given + " mine")  # Theirs, given the same input, and not this app's.
+        with open(os.path.join(folder, "status", "abc-123.json")) as handle:
+            figures = json.load(handle)
+        self.assertEqual((figures["context_percent"], figures["by"]), (42, app.STATUS_BY))
 
 
 class RequestTests(unittest.TestCase):
