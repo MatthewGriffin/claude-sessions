@@ -558,6 +558,67 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(sum("--hook" in c for c in commands), 1)
 
 
+class SessionFileTests(unittest.TestCase):
+    """Sessions are listed from Claude Code's own files, asking `claude agents` only when they come or go."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(prefix="claude-sessions-files-")
+        self.saved = app.SESSIONS_DIR, app.subprocess.run, app.hosted_panes, app.Transcript.poll
+        app.SESSIONS_DIR = self.folder
+        app.hosted_panes = lambda: {}
+        app.Transcript.poll = lambda transcript: None
+        self.agents = []
+        self.calls = 0
+
+        def run(command, *args, **kwargs):
+            self.calls += 1
+            return subprocess.CompletedProcess(command, 0, json.dumps(self.agents), "")
+
+        app.subprocess.run = run
+
+    def tearDown(self):
+        app.SESSIONS_DIR, app.subprocess.run, app.hosted_panes, app.Transcript.poll = self.saved
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def write(self, pid, **entry):
+        with open(os.path.join(self.folder, f"{pid}.json"), "w") as handle:
+            json.dump({"pid": pid, **entry}, handle)
+
+    def test_status_from_files(self):
+        self.agents = [{"pid": 11, "sessionId": "aaa", "status": "idle", "name": "one", "startedAt": 1, "cwd": "/"}]
+        self.write(11, sessionId="aaa", status="idle", name="one")
+        monitor = app.Monitor()
+        monitor.refresh()
+        self.assertEqual(self.calls, 1)
+        self.write(11, sessionId="aaa", status="shell", name="renamed")
+        monitor.refresh()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual([(s["status"], s["name"]) for s in monitor.sessions], [("busy", "renamed")])
+        self.write(11, sessionId="bbb", status="waiting")  # After /clear.
+        monitor.refresh()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual([(s["sessionId"], s["status"]) for s in monitor.sessions], [("bbb", "waiting")])
+
+    def test_asks_again_when_sessions_change(self):
+        self.write(11, sessionId="aaa", status="idle")
+        monitor = app.Monitor()
+        monitor.refresh()
+        self.write(12, sessionId="ccc", status="busy")
+        self.agents = [{"pid": 12, "sessionId": "ccc", "status": "busy", "startedAt": 2, "cwd": "/"}]
+        monitor.refresh()
+        self.assertEqual(self.calls, 2)
+        self.write(12, sessionId="ccc", status="something new")
+        monitor.refresh()
+        self.assertEqual(self.calls, 3)
+        monitor.agents_at -= app.AGENTS_RECHECK_SECONDS + 1
+        self.write(12, sessionId="ccc", status="idle")
+        monitor.refresh()
+        self.assertEqual(self.calls, 4)
+        shutil.rmtree(self.folder)
+        monitor.refresh()
+        self.assertEqual(self.calls, 5)
+
+
 class NewSessionModelTests(unittest.TestCase):
     def setUp(self):
         saved = app.KNOWN_FILE, app.launch_session

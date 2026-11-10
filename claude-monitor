@@ -706,6 +706,34 @@ class Transcript:
         return states
 
 
+SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
+AGENTS_RECHECK_SECONDS = 30
+# Statuses in Claude Code's session files, as `claude agents` reports them.
+SESSION_FILE_STATUS = {"idle": "idle", "busy": "busy", "shell": "busy", "waiting": "waiting"}
+
+
+def read_session_files():
+    """{pid: contents} of Claude Code's own file for each running session, or None if they can't be read."""
+    try:
+        names = os.listdir(SESSIONS_DIR)
+    except OSError:
+        return None
+    files = {}
+    for name in names:
+        stem, dot, extension = name.partition(".")
+        if extension != "json" or not stem.isdigit() or str(int(stem)) != stem:
+            continue
+        try:
+            with open(os.path.join(SESSIONS_DIR, name), encoding="utf-8") as handle:
+                entry = json.load(handle)
+        except (OSError, ValueError):
+            return None  # Mid-write, most likely: ask Claude Code instead.
+        if not isinstance(entry, dict):
+            return None
+        files[int(stem)] = entry
+    return files
+
+
 class Monitor:
     def __init__(self):
         self.sessions = []
@@ -727,16 +755,25 @@ class Monitor:
         self.adb = None
         self.frames = {}
         self.frames_lock = threading.Lock()
+        self.raw_sessions = []  # As `claude agents` last listed them.
+        self.agents_at = 0
+        self.agents_files = None  # The session files there were then.
 
     def refresh(self):
         try:
-            with timed("listing sessions (claude agents)"):
-                result = subprocess.run(
-                    ["claude", "agents", "--json"], capture_output=True, text=True, timeout=15
-                )
-            if result.returncode != 0:
-                raise RuntimeError(clean(result.stderr) or f"exit code {result.returncode}")
-            self.sessions = sorted(json.loads(result.stdout), key=lambda s: s.get("startedAt", 0))
+            files = read_session_files()
+            listed = None if files is None else self._from_session_files(files)
+            if listed is None:
+                with timed("listing sessions (claude agents)"):
+                    result = subprocess.run(
+                        ["claude", "agents", "--json"], capture_output=True, text=True, timeout=15
+                    )
+                if result.returncode != 0:
+                    raise RuntimeError(clean(result.stderr) or f"exit code {result.returncode}")
+                listed = sorted(json.loads(result.stdout), key=lambda s: s.get("startedAt", 0))
+                self.raw_sessions = [dict(s) for s in listed]
+                self.agents_at, self.agents_files = time.monotonic(), files
+            self.sessions = listed
             names = read_names()
             for session in self.sessions:
                 session["name"] = clean(names.get(session["sessionId"], "")) or session.get("name")
@@ -750,6 +787,30 @@ class Monitor:
         self.transcripts = {sid: t for sid, t in self.transcripts.items() if sid in live}
         for sid in live:
             self.transcripts.setdefault(sid, Transcript(sid)).poll()
+
+    def _from_session_files(self, files):
+        """The last `claude agents` list with each session's status and name as its own file has them now.
+
+        Starting Claude Code to list sessions takes a second or more on Windows, and the page asks every
+        1.5 s, so that list is only taken again when a session's file comes or goes, a status isn't one
+        this knows, or AGENTS_RECHECK_SECONDS have passed. Returns None when it needs taking again.
+        """
+        if self.agents_files is None or time.monotonic() - self.agents_at > AGENTS_RECHECK_SECONDS:
+            return None
+        if set(files) != set(self.agents_files):
+            return None
+        sessions = []
+        for session in self.raw_sessions:
+            entry = files.get(session.get("pid"))
+            if entry is None:
+                return None
+            status = SESSION_FILE_STATUS.get(entry.get("status"))
+            session_id = entry.get("sessionId")
+            if status is None or not isinstance(session_id, str) or not SESSION_ID.match(session_id):
+                return None
+            name = entry.get("name") if isinstance(entry.get("name"), str) else session.get("name")
+            sessions.append({**session, "sessionId": session_id, "status": status, "name": name})
+        return sessions
 
     def _notice_new_ids(self):
         """/clear gives a session a new id but keeps its process, so follow it across the change."""
