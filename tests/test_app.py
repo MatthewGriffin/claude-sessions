@@ -440,6 +440,11 @@ class BuiltFolderTests(BuiltUpdateTests):
         print(f"\n  one status line run of the folder build took {time.time() - started:.2f} s", file=sys.stderr)
         self.assertEqual(result.returncode, 0)
         self.publish_folder("998.0.0")
+        # It looks for releases as it starts, which was before this one, so it's restarted.
+        status, reply = self.request("/api/sessions/restart-app", {})
+        self.assertEqual(status, 200, reply)
+        time.sleep(3)
+        self.assertTrue(wait_for(self.answers, 60), "the folder build didn't come back after a restart")
 
         def offered():
             status, state = self.request("/api/sessions")
