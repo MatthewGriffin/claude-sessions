@@ -238,6 +238,8 @@ UPLOAD_TYPES = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "we
 DONE_BANNER_SECONDS = 600
 # bypassPermissions and dontAsk are deliberately not offered from the browser.
 NEW_SESSION_MODES = {"manual", "acceptEdits", "plan", "auto"}
+# Claude Code's model aliases, which always mean the latest of each. "" leaves it to Claude Code's own setting.
+NEW_SESSION_MODELS = {"", "fable", "opus", "sonnet", "haiku", "opusplan"}
 ADB_TIMEOUT_SECONDS = 5
 SCREENCAP_TIMEOUT_SECONDS = 10
 # Captures run on the emulator's own CPUs: about 10 per second uses up one of them.
@@ -3615,8 +3617,13 @@ def start_session(monitor, request):
         return False, "Enter what the session should do."
     if mode not in NEW_SESSION_MODES:
         return False, f"Permission mode not available here: {mode}"
+    model = str(request.get("model") or "")
+    if model not in NEW_SESSION_MODELS:
+        return False, f"Model not available here: {model}"
     session_id = str(uuid.uuid4())
     command = ["claude", "--session-id", session_id, f"--permission-mode={mode}"]
+    if model:
+        command.append(f"--model={model}")
     if name:
         command.append(f"--name={name}")
     command += ["--", prompt]
@@ -5569,6 +5576,7 @@ textarea{min-height:110px;resize:vertical}
 <label>Folder<input id="newCwd" list="cwds" required placeholder="/path/to/project" autocomplete="off"><datalist id="cwds"></datalist></label>
 <label>What should it do?<textarea id="newPrompt" required></textarea></label>
 <label>Name (optional)<input id="newName" autocomplete="off"></label>
+<label>Model<select id="newModel"><option value="">Default (your Claude Code setting)</option><option value="fable">Fable (most capable)</option><option value="opus">Opus</option><option value="sonnet">Sonnet (faster, uses less of your limit)</option><option value="haiku">Haiku (fastest, for simple tasks)</option><option value="opusplan">Opus to plan, Sonnet to do the work</option></select></label>
 <label>Permissions<select id="newMode"><option value="manual">Ask me first</option><option value="acceptEdits">Accept file edits automatically</option><option value="plan">Plan only</option><option value="auto">Auto (Claude Code decides what needs asking)</option></select></label>
 <p class="note">It runs without a terminal and works directly in this folder. You can reply and approve from this app, and it keeps running after you close the window. If the folder isn't trusted yet, you'll be asked first.</p>
 <div id="trustAsk" role="alert" hidden><p><b>Trust this folder?</b> <code id="trustPath"></code></p><p>Claude Code will be able to read, edit and run files here, and any hooks or settings the folder defines will apply. Only trust a project you created or know is safe. This is remembered for future sessions.</p><div class="row"><button type="button" id="trustNo">Don't trust</button><button type="button" id="trustYes" class="deny">Trust and start session</button></div></div>
@@ -7179,17 +7187,19 @@ async function startNew(trust){
  start.disabled=yes.disabled=true;start.textContent=yes.textContent='Starting…';$('newErr').textContent='';
  try{
   const r=await fetch('/api/sessions/new',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({cwd:$('newCwd').value,prompt:$('newPrompt').value,name:$('newName').value,mode:$('newMode').value,trust})});
+   body:JSON.stringify({cwd:$('newCwd').value,prompt:$('newPrompt').value,name:$('newName').value,mode:$('newMode').value,model:$('newModel').value,trust})});
   const d=await r.json().catch(()=>({error:'Unexpected response (HTTP '+r.status+').'}));
   if(d.needsTrust){askTrust(d.cwd);return}
   askTrust(null);
   if(!r.ok){$('newErr').textContent=d.error||'Could not start the session.';return}
+  try{localStorage.setItem('newModel',$('newModel').value)}catch(e){}  // Offered again next time.
   $('newPrompt').value='';$('newName').value='';$('newDlg').close();
   refresh();
  }catch(err){$('newErr').textContent='Lost connection to claude-monitor.'}
  finally{start.disabled=yes.disabled=false;start.textContent='Start session';yes.textContent='Trust and start session'}
 }
-$('new').addEventListener('click',()=>{$('newErr').textContent='';askTrust(null);loadFolders();$('newDlg').showModal();$('newCwd').focus()});
+$('new').addEventListener('click',()=>{$('newErr').textContent='';
+ try{const m=localStorage.getItem('newModel');if(m!==null&&[...$('newModel').options].some(o=>o.value===m))$('newModel').value=m}catch(e){}askTrust(null);loadFolders();$('newDlg').showModal();$('newCwd').focus()});
 $('newCancel').addEventListener('click',()=>$('newDlg').close());
 // An approval is for the path it named, so changing the path takes it back.
 $('newCwd').addEventListener('input',()=>askTrust(null));

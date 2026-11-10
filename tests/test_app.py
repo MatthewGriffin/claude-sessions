@@ -557,6 +557,26 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(sum("--hook" in c for c in commands), 1)
 
 
+class NewSessionModelTests(unittest.TestCase):
+    def start(self, **fields):
+        given = []
+        saved = app.launch_session
+        app.launch_session = lambda monitor, session_id, command, cwd, trust: (given.append(command), (True, "Started."))[1]
+        try:
+            result = app.start_session(None, {"cwd": CONFIG, "prompt": "hello", **fields})
+        finally:
+            app.launch_session = saved
+        return result, given[0] if given else None
+
+    def test_the_chosen_model_is_passed_on(self):
+        self.assertIn("--model=sonnet", self.start(model="sonnet")[1])
+        self.assertIn("--model=opusplan", self.start(model="opusplan")[1])
+        self.assertFalse(any(a.startswith("--model") for a in self.start()[1]))  # Claude Code's own setting.
+        self.assertEqual(self.start(model="--dangerously-skip-permissions"), ((False, "Model not available here: --dangerously-skip-permissions"), None))
+        command = self.start(model="haiku")[1]
+        self.assertLess(command.index("--model=haiku"), command.index("--"))  # Before the prompt, not part of it.
+
+
 class MessageTimeTests(unittest.TestCase):
     def test_messages_say_when_and_tools_how_long(self):
         path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "t.jsonl")
