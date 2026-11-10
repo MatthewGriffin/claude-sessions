@@ -241,6 +241,7 @@ DONE_BANNER_SECONDS = 600
 # bypassPermissions and dontAsk are deliberately not offered from the browser.
 NEW_SESSION_MODES = {"manual", "acceptEdits", "plan", "auto"}
 # Claude Code's model aliases, which always mean the latest of each. "" leaves it to Claude Code's own setting.
+OPUS_PLAN_LABEL = "Opus Plan"  # Opus while planning, Sonnet for the rest.
 NEW_SESSION_MODELS = {"", "fable", "opus", "sonnet", "haiku", "opusplan"}
 ADB_TIMEOUT_SECONDS = 5
 SCREENCAP_TIMEOUT_SECONDS = 10
@@ -758,6 +759,7 @@ class Monitor:
         self.retired_ids = set()
         self.previous = []
         self.remember = True
+        self.chosen_models = {}  # Session id -> the model alias it was started with or set to with /model.
         self.devices = []
         self.adb = None
         self.frames = {}
@@ -854,6 +856,7 @@ class Monitor:
         self.remember = known["remember"]
         if not self.remember:
             self.previous = []
+            self.chosen_models = {}
             return
         entries, changed, now = known["sessions"], False, time.time()
         for sid in self.retired_ids & set(entries):
@@ -879,6 +882,7 @@ class Monitor:
             changed = entries.pop(sid, None) is not None or changed
         if changed:
             write_known(known)
+        self.chosen_models = {sid: e["model"] for sid, e in entries.items() if isinstance(e.get("model"), str)}
         live = {s["id"] for s in sessions}
         self.previous = sorted(
             ({k: e.get(k) for k in ("id", "name", "cwd", "title", "seen")}
@@ -908,6 +912,8 @@ class Monitor:
                     shown, saved = models.get(session["id"], ("", 0))
                     if shown and saved >= (transcript.model_at if transcript else 0):
                         session["model"] = shown
+                    chosen = transcript.resume_model if transcript and transcript.resume_model is not None else self.chosen_models.get(session["id"], "")
+                    session["modelNow"], session["model"] = session["model"], model_label(session["model"], chosen)
                 self.devices, self.adb = find_devices()
                 with self.frames_lock:
                     live = {device["serial"] for device in self.devices}
@@ -2550,6 +2556,11 @@ def model_name(model):
     if not major:
         return model
     return f"{family.capitalize()} {major}" + (f".{minor}" if minor else "")
+
+
+def model_label(model, chosen):
+    """The model to show: Claude Code names whichever of Opus or Sonnet is answering, so Opus Plan is named instead."""
+    return OPUS_PLAN_LABEL if chosen == "opusplan" else model
 
 
 def model_change(text):
@@ -6611,11 +6622,16 @@ function renderFailure(s){
  if(future)$('failReset').textContent='Retry after it resets ('+clockText(f.resets)+')';
  $('failCancel').hidden=!s.retryAt;
 }
+function modelTitle(s){
+ if(s.model!==s.modelNow&&s.modelNow)return 'Opus to plan, Sonnet to do the work. Answering now: '+s.modelNow;
+ return 'The model this session is using';
+}
 function updateFoot(s){
  renderQueue(s);
  renderFailure(s);
  $('histCtx').textContent=contextText(s);
  if($('histModel').textContent!==(s.model||''))$('histModel').textContent=s.model||'';
+ $('histModel').title=modelTitle(s);
  const working=s.subagents.filter(a=>a.state==='working').length;
  const label='Subagents ('+(working?working+' working':s.subagents.length)+')';
  $('histAgents').hidden=!s.subagents.length;

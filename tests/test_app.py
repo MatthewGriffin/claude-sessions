@@ -811,6 +811,21 @@ class NewSessionModelTests(unittest.TestCase):
         transcript._ingest({"type": "system", "content": "Switched to Sonnet 5.5 due to high demand."})  # Not the user's choice.
         self.assertEqual(transcript.resume_model, "haiku")
 
+    def test_opus_plan_is_named(self):
+        self.assertEqual(app.model_label("Opus 5.5", "opusplan"), "Opus Plan")
+        self.assertEqual(app.model_label("Sonnet 5.5", "opusplan"), "Opus Plan")
+        self.assertEqual(app.model_label("Sonnet 5.5", "sonnet"), "Sonnet 5.5")
+        self.assertEqual(app.model_label("Opus 5.5", ""), "Opus 5.5")
+        self.start(model="opusplan")
+        session_id = self.given[0][0]
+        monitor = app.Monitor()
+        monitor.transcripts[session_id] = types.SimpleNamespace(path=__file__, permission_mode="plan", resume_model=None)
+        monitor._update_known([{"id": session_id, "name": "test", "cwd": CONFIG, "title": ""}])
+        self.assertEqual(monitor.chosen_models[session_id], "opusplan")
+        monitor.transcripts[session_id].resume_model = "sonnet"  # Changed with /model.
+        monitor._update_known([{"id": session_id, "name": "test", "cwd": CONFIG, "title": ""}])
+        self.assertEqual(monitor.chosen_models[session_id], "sonnet")
+
     def test_the_chosen_model_is_passed_on(self):
         self.assertIn("--model=sonnet", self.start(model="sonnet")[1])
         self.assertIn("--model=opusplan", self.start(model="opusplan")[1])
