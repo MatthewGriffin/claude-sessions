@@ -14,6 +14,7 @@ import importlib.machinery
 import importlib.util
 import base64
 import io
+import datetime
 import json
 import os
 import re
@@ -554,6 +555,26 @@ class SetupTests(unittest.TestCase):
         self.assertFalse(any("--context" in c for c in commands))
         self.assertIn("someone --else", commands)  # Other hooks in the same group stay.
         self.assertEqual(sum("--hook" in c for c in commands), 1)
+
+
+class MessageTimeTests(unittest.TestCase):
+    def test_messages_say_when_and_tools_how_long(self):
+        path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "t.jsonl")
+        with open(path, "w") as handle:
+            for entry in (
+                {"type": "user", "uuid": "1", "timestamp": "2026-11-10T10:00:00.000Z", "message": {"role": "user", "content": "check it"}},
+                {"type": "assistant", "uuid": "2", "timestamp": "2026-11-10T10:00:05.000Z", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Checking"}, {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "sleep 12"}}]}},
+                {"type": "user", "uuid": "3", "timestamp": "2026-11-10T10:00:17.500Z", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}]}},
+            ):
+                handle.write(json.dumps(entry) + "\n")
+        history = app.HistoryReader(path)
+        history.poll()
+        start = datetime.datetime(2026, 11, 10, 10, tzinfo=datetime.timezone.utc).timestamp()
+        you, claude, tool = history.messages
+        self.assertEqual((you["at"], claude["at"]), (start, start + 5))
+        self.assertEqual((tool["at"], tool["done"]), (start + 5, start + 17.5))
 
 
 class ToolPictureTests(unittest.TestCase):
@@ -1354,7 +1375,8 @@ class ModelTests(unittest.TestCase):
         history.poll()
         changes = [(m["model"]["by"], m["model"]["to"], m["model"]["was"]) for m in history.messages if m.get("model")]
         self.assertEqual(changes, [("auto", "Sonnet 5.5", "Opus 5.5"), ("you", "Haiku 5.5", ""), ("auto", "Sonnet 5.5", "Haiku 5.5")])
-        self.assertEqual(history.messages[-1], {"role": "system", "note": True, "text": "Kept model as Sonnet 5.5", "seq": len(history.messages)})
+        self.assertEqual({k: v for k, v in history.messages[-1].items() if k != "at"},
+                         {"role": "system", "note": True, "text": "Kept model as Sonnet 5.5", "seq": len(history.messages)})
         self.assertFalse(any(m["role"] == "you" and "local-command" in m["text"] for m in history.messages))
 
     def test_current_model(self):

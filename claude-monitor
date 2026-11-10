@@ -2705,6 +2705,7 @@ class HistoryReader:
         self.requests = []  # Tool rows for shell commands that sent requests to this computer.
         self.model = ""  # The model of Claude's latest reply.
         self.model_noted = False  # A switch was already shown, so the next reply's new model needs no note.
+        self.entry_at = 0  # When the transcript entry being read was written, for the page to show.
 
     @staticmethod
     def new_turn(prompt, at):
@@ -2712,6 +2713,8 @@ class HistoryReader:
 
     def add(self, message):
         message["seq"] = len(self.messages) + 1
+        if self.entry_at:
+            message["at"] = round(self.entry_at, 1)
         self.messages.append(message)
         return message
 
@@ -2773,7 +2776,8 @@ class HistoryReader:
 
     def _ingest(self, entry, position):
         kind = entry.get("type")
-        self.first_at = self.first_at or entry_time(entry)
+        self.entry_at = entry_time(entry)
+        self.first_at = self.first_at or self.entry_at
         if kind in ("user", "system") and not self.is_subagent and not entry.get("isSidechain"):
             change = model_change_in(entry)
             if change:
@@ -2906,6 +2910,8 @@ class HistoryReader:
         tool["result_at"] = position
         message = tool["message"]
         message["pending"] = False
+        if entry_time(entry):
+            message["done"] = round(entry_time(entry), 1)  # With "at", how long the tool took.
         message["result"] = preview(text)
         message["error"] = bool(block.get("is_error"))
         message["images"] = len(images)
@@ -5482,6 +5488,17 @@ button.deny{color:var(--bad)}
 #histBody{flex:1;overflow-y:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1000px);grid-auto-rows:max-content;justify-content:center;gap:10px;align-content:start}
 .msg{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
 .msg b{display:block;font-size:12px;color:var(--dim)}
+.stamp{font-weight:normal;opacity:.8}
+.tool summary .stamp{margin-left:8px;font-size:11px;white-space:nowrap}
+#picDlg{padding:0;border:0;background:transparent;max-width:100vw;max-height:100vh;width:100vw;height:100vh;color:var(--text)}
+#picDlg::backdrop{background:rgba(0,0,0,.88)}
+#picBar{position:fixed;top:0;left:0;right:0;display:flex;gap:8px;align-items:center;padding:10px 16px;background:linear-gradient(rgba(0,0,0,.7),transparent);z-index:1}
+#picBar span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:#ddd}
+#picBar a{color:var(--text);font-size:13px;text-decoration:none;border:1px solid var(--line);background:var(--card);border-radius:6px;padding:5px 12px}
+#picBox{width:100%;height:100%;display:flex;align-items:center;justify-content:center;overflow:auto}
+#picBox img{max-width:100%;max-height:100%;object-fit:contain;cursor:zoom-in}
+#picBox.full{display:block}#picBox.full img{max-width:none;max-height:none;cursor:zoom-out}
+.tpics a.picture,.msg a.picture,.timages img{cursor:zoom-in}
 .msg.you{background:#23304a;border-radius:4px;padding:8px 10px}
 .msg.you.pending{opacity:.65}
 .msg.you.pending small{display:block;margin-top:4px;color:#9aa4b5}
@@ -5539,6 +5556,7 @@ textarea{min-height:110px;resize:vertical}
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
 <ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p></section></dialog>
+<dialog id="picDlg" aria-label="Picture"><div id="picBar"><span id="picName"></span><a id="picSave" download>Save</a><button id="picClose" type="button">Close</button></div><div id="picBox"><img id="picImg" alt=""></div></dialog>
 <dialog id="viewDlg" aria-labelledby="viewName"><div class="dhead"><h2 id="viewName"></h2><button id="viewClose">Close</button></div><div id="viewInfo"></div><img id="viewImg" alt="Live screen of the device"></dialog>
 <dialog id="phoneDlg" aria-labelledby="phoneTitle"><div class="dhead"><h2 id="phoneTitle">Phone access</h2><button id="phoneClose" style="margin-left:auto">Close</button></div><div id="phoneBody">
 <p>Use this app from your phone while it's on the same Wi-Fi as this computer, including taking photos for Claude with its camera.</p>
@@ -5703,6 +5721,17 @@ function usageWindow(box,label,w,at){
  row.append(label+' left ');el('b','',row,left+'%');
  if(w.resets)row.append(' ('+untilText(w.resets)+')');
  row.title=Math.round(w.used)+'% used';
+}
+// When a chat message was written: the time with seconds, and the date too if it wasn't today.
+function stampText(at){
+ const d=new Date(at*1000),time=d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit',second:'2-digit'});
+ return d.toDateString()===new Date().toDateString()?time:d.toLocaleDateString([],{day:'numeric',month:'short'})+' '+time;
+}
+function spanText(sec){return sec<1?'under 1s':sec<60?Math.round(sec)+'s':age(Math.round(sec))}
+function addStamp(label,m,after){
+ if(!m.at)return;
+ const s=el('span','stamp',label,' \u00b7 '+stampText(m.at)+(after>=1?' \u00b7 '+spanText(after)+' after your message':''));
+ s.title=new Date(m.at*1000).toLocaleString();
 }
 function ageText(at){return age(Math.max(0,Math.round(Date.now()/1000-at)))+' ago'}
 async function resumeSession(id,trust){
@@ -6442,7 +6471,7 @@ function toolPictureBox(m,agent){
  for(let n=0;n<Math.min(m.images,12);n++){
   const url='/api/tool-image?id='+encodeURIComponent(histSession)+'&tool='+encodeURIComponent(m.id)+'&n='+n+(agent?'&agent='+encodeURIComponent(agent.id):'');
   if(!toolPictures.has(url)){
-   const a=el('a','picture');a.href=url;a.target='_blank';a.rel='noopener';
+   const a=el('a','picture');a.href=url;
    const i=el('img','',a);i.src=url;i.alt='Picture from: '+m.text;i.loading='lazy';
    i.addEventListener('error',()=>a.remove());
    toolPictures.set(url,a);
@@ -6461,6 +6490,10 @@ function toolRow(m,open,agent){
 function toolDetailsRow(m,open,agent){
  const d=el('details','tool'+(m.error?' failed':''));d.dataset.seq=m.seq;d.open=open;
  const summary=el('summary','',d,(m.error?'✗ ':'')+m.text);
+ if(m.at){
+  const s=el('span','stamp',summary,stampText(m.at)+(m.done?' \u00b7 took '+spanText(Math.max(0,m.done-m.at)):''));
+  s.title='Started '+new Date(m.at*1000).toLocaleString()+(m.done?', finished '+new Date(m.done*1000).toLocaleString():'');
+ }
  // A session that ended mid-call never records a result, so this also needs it to be busy.
  const live=cards.get(histSession)&&cards.get(histSession).session;
  if(m.pending&&(agent?agent.state==='working':live&&live.status!=='idle'))el('span','trunning',summary,'running');
@@ -6503,7 +6536,7 @@ function renderLive(s,live){
 function questionRow(m){
  // A question Claude asked, and the answers given, as chat rather than a tool call.
  const box=el('div','qa'),q=el('div','msg claude',box);
- el('b','',q,'Claude asked');
+ addStamp(el('b','',q,'Claude asked'),m);
  for(const item of m.question){
   const d=el('div','qitem',q);
   el('div','qtext',d,item.question);
@@ -6519,6 +6552,7 @@ function questionRow(m){
  });
  return box;
 }
+let youAt=0;  // When the latest message of yours before the row being drawn was sent.
 function messageRow(m,open,agent,openSet){
  if(m.role==='tool'&&m.question&&m.question.length)return questionRow(m);
  if(m.role==='tool')return toolRow(m,open,agent);
@@ -6529,16 +6563,16 @@ function messageRow(m,open,agent,openSet){
  const r=el('div','msg '+m.role);
  if(m.model){
   r.classList.add('model');
-  el('b','',r,m.model.by==='you'?'Model':'Model changed automatically');r.append(m.text);
+  addStamp(el('b','',r,m.model.by==='you'?'Model':'Model changed automatically'),m);r.append(m.text);
   return r;
  }
  if(m.picture){
-  el('b','',r,'Picture');
-  const a=el('a','picture',r);a.href=uploadUrl(m.picture);a.target='_blank';a.rel='noopener';
+  addStamp(el('b','',r,'Picture'),m);
+  const a=el('a','picture',r);a.href=uploadUrl(m.picture);
   const i=el('img','',a);i.src=uploadUrl(m.picture);i.alt='Picture you sent';i.loading='lazy';
   return r;
  }
- el('b','',r,{you:agent?'Sent to it':'You',claude:agent?'Subagent':'Claude',system:'System'}[m.role]);
+ addStamp(el('b','',r,{you:agent?'Sent to it':'You',claude:agent?'Subagent':'Claude',system:'System'}[m.role]),m,m.role==='claude'&&m.at&&youAt?m.at-youAt:0);
  if(!m.parts){r.append(m.text);return r}
  // A long paste starts folded, as logs can run to thousands of lines.
  m.parts.forEach((p,i)=>{
@@ -6557,8 +6591,10 @@ function renderHistory(h){
   b.addEventListener('click',()=>{histLimit+=400;histRev=null;histScrollTo='keep';loadHistory()});
   rows.push(b);
  }
+ youAt=0;
  for(const m of h.messages){
   rows.push(messageRow(m,open.has(String(m.seq)),undefined,open));
+  if(m.role==='you'&&m.at)youAt=m.at;
  }
  if(!rows.length)rows.push(el('div','note',null,'Nothing here yet.'));
  body.replaceChildren(...rows);
@@ -6656,7 +6692,8 @@ function agentCard(a,open){
  const list=el('div','',steps);
  if(a.messages){
   if(a.omitted)el('div','note',list,a.omitted+' earlier items not shown');
-  for(const m of a.messages)list.append(messageRow(m,open.has(String(m.seq)),a,open));
+  youAt=0;
+  for(const m of a.messages){list.append(messageRow(m,open.has(String(m.seq)),a,open));if(m.role==='you'&&m.at)youAt=m.at}
   if(!a.messages.length)el('div','note',list,'Nothing yet.');
  }else if(steps.open)el('div','note',list,'Loading…');
  steps.addEventListener('toggle',()=>{
@@ -6774,6 +6811,26 @@ $('histBody').addEventListener('load',()=>{if(histFollow){const b=$('histBody');
 $('histTerm').addEventListener('click',()=>act('terminal',{id:histSession}));
 $('histRename').addEventListener('click',()=>setRenaming(true));
 $('renameCancel').addEventListener('click',()=>setRenaming(false));
+// Pictures in the chat open over the app, not in a browser window. Ctrl-click still opens a new one.
+function openPicture(src,name){
+ $('picImg').src=src;$('picImg').alt=name||'Picture';$('picName').textContent=name||'';
+ $('picSave').href=src;$('picBox').classList.remove('full');
+ if(!$('picDlg').open)$('picDlg').showModal();
+}
+document.addEventListener('click',e=>{
+ if(e.button||e.ctrlKey||e.metaKey||e.shiftKey||e.altKey)return;
+ const a=e.target.closest&&e.target.closest('a.picture');
+ const img=a?a.querySelector('img'):e.target.closest&&e.target.closest('.timages img');
+ if(!img)return;
+ e.preventDefault();
+ openPicture(a?a.href:img.src,img.alt);
+});
+$('picClose').addEventListener('click',()=>$('picDlg').close());
+$('picBox').addEventListener('click',e=>{
+ if(e.target===$('picImg'))$('picBox').classList.toggle('full');  // Actual size, to look closely.
+ else $('picDlg').close();
+});
+$('picDlg').addEventListener('close',()=>{$('picImg').removeAttribute('src')});
 $('renameText').addEventListener('keydown',e=>{if(e.key==='Escape'){e.preventDefault();setRenaming(false)}});
 $('renameForm').addEventListener('submit',async e=>{
  e.preventDefault();
