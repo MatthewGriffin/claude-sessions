@@ -1665,5 +1665,41 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(transcript.model, "Sonnet 5.5")
 
 
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class MarkdownTests(unittest.TestCase):
+    """Claude's replies drawn from Markdown, run in node with a small stand-in for the page."""
+
+    STUB = """
+class Node{constructor(tag){this.tag=tag;this.children=[];this.attrs={};this.dataset={};this.style={};this.classList={add:c=>this.className=(this.className?this.className+' ':'')+c}}
+ append(...xs){for(const x of xs)this.children.push(typeof x==='string'?x:x)}appendChild(x){this.children.push(x);return x}
+ setAttribute(k,v){this.attrs[k]=v}set textContent(t){this.children=[String(t)]}}
+const document={createElement:t=>new Node(t)};
+function show(n){if(typeof n==='string')return n;const inner=n.children.map(show).join('');
+ const extra=(n.href?' href='+n.href:'')+(n.start?' start='+n.start:'');return '<'+n.tag+extra+'>'+inner+'</'+n.tag+'>'}
+"""
+
+    def render(self, text):
+        page = app.PAGE
+        start = page.index("const MD_FENCE=")
+        code = page[page.index("function el("):].split("\n", 1)[0] + "\n" + page[start:page.index("let youAt=0;", start)]
+        script = self.STUB + code + f"\nconst r=new Node('div');markdown({json.dumps(text)},r);console.log(r.children.map(show).join(''));"
+        result = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_blocks_and_inline(self):
+        self.assertEqual(self.render("## Plan\nSome **bold**, *it*, `x<y>`, 2*3*4 and snake_case.\n\n- a\n  - b\n1. c\n"),
+                         "<div>Plan</div><p>Some <strong>bold</strong>, <em>it</em>, <code>x<y></code>, 2*3*4 and snake_case.</p>"
+                         "<ul><li>a<ul><li>b</li></ul></li></ul><ol><li>c</li></ol>")
+        self.assertEqual(self.render("```\n**not bold**\n"), "<pre><code>**not bold**</code></pre>")  # Cut off before it closes.
+        self.assertEqual(self.render("| a | b |\n|---|--:|\n| 1 | 2 |"),
+                         "<div><table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table></div>")
+
+    def test_links(self):
+        self.assertEqual(self.render("See https://example.com/a. and [x](https://e.org) and [f](src/app.py:3) and [j](javascript:alert(1))"),
+                         "<p>See <a href=https://example.com/a>https://example.com/a</a>. and <a href=https://e.org>x</a> and "
+                         "<span>f</span> and <span>j</span>)</p>")
+
+
 if __name__ == "__main__":
     unittest.main()

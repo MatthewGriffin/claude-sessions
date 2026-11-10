@@ -5708,6 +5708,16 @@ button.deny{color:var(--bad)}
 #histHint{padding:6px 16px;color:var(--dim);font-size:12px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 #histBody{flex:1;overflow-y:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1000px);grid-auto-rows:max-content;justify-content:center;gap:10px;align-content:start}
 .msg{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}
+.md{white-space:normal}.md p{white-space:pre-wrap;margin:.35em 0}.md>b+p,.md>p:first-child{margin-top:0}.md>:last-child{margin-bottom:0}
+.md code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:.92em;background:#14161f;border-radius:3px;padding:0 4px}
+.md pre.mdcode{white-space:pre;overflow:auto;background:#14161f;border-radius:4px;padding:8px 10px;margin:.5em 0;max-height:60vh;font-size:12px}
+.md pre.mdcode code{background:none;padding:0;font-size:inherit}
+.md ul,.md ol{margin:.35em 0;padding-left:1.8em}.md li{white-space:pre-wrap;margin:.15em 0}.md li>ul,.md li>ol{margin:.15em 0}.md li.task{list-style:none;margin-left:-1.2em}
+.md .mdh{font-weight:600;margin:.8em 0 .3em}.md .mdh1{font-size:1.3em}.md .mdh2{font-size:1.15em}.md .mdh3{font-size:1.05em}
+.md blockquote{margin:.4em 0;padding-left:10px;border-left:3px solid var(--line);color:var(--dim)}
+.md hr{border:0;border-top:1px solid var(--line);margin:.8em 0}
+.md .mdtable{overflow-x:auto;margin:.5em 0}.md table{border-collapse:collapse;font-size:.95em}.md th,.md td{border:1px solid var(--line);padding:3px 8px;vertical-align:top;white-space:normal;overflow-wrap:normal}.md th{text-align:left}
+.md a{color:#7aa2f7}.md .mdpath{text-decoration:underline dotted;text-underline-offset:2px}
 .msg b{display:block;font-size:12px;color:var(--dim)}
 .stamp{font-weight:normal;opacity:.8}
 .tool summary .stamp{margin-left:8px;font-size:11px;white-space:nowrap}
@@ -6779,13 +6789,118 @@ function questionRow(m){
  });
  return box;
 }
+// Markdown in Claude's replies, built as elements (never as HTML), so nothing in a reply can run or restyle the page.
+const MD_FENCE=/^ {0,3}(`{3,}|~{3,})\s*([^`\s]*)/,MD_HEAD=/^ {0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/,MD_RULE=/^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
+const MD_ITEM=/^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/,MD_QUOTE=/^ {0,3}>\s?/,MD_ALIGN=/^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+const MD_INLINE=/(`+)([\s\S]*?[^`])\1(?!`)|\*\*(?=\S)([\s\S]*?\S)\*\*|(?<!\w)__(?=\S)([\s\S]*?\S)__(?!\w)|~~(?=\S)([\s\S]*?\S)~~|(?<![\w*])\*(?=[^\s*])([\s\S]*?[^\s*])\*(?![\w*])|(?<![\w\\])_(?=[^\s_])([\s\S]*?[^\s_])_(?!\w)|\[([^\]\n]+)\]\(<?([^)\s>]+)>?\)|(https?:\/\/[^\s<>()]+[^\s<>().,;:!?'"\]*_`])/g;
+function mdLink(parent,url,text){
+ // Only web addresses open; a link to a file in the project is shown as its text, with the path on hover.
+ const web=/^https?:\/\//i.test(url),a=el(web?'a':'span',web?'':'mdpath',parent);a.title=url;
+ if(web){a.href=url;a.target='_blank';a.rel='noopener noreferrer'}
+ if(text===undefined)a.textContent=url;else mdInline(text,a);
+}
+function mdInline(text,parent){
+ let at=0;MD_INLINE.lastIndex=0;
+ const found=[...text.matchAll(MD_INLINE)];
+ for(const m of found){
+  if(m.index>at)parent.append(text.slice(at,m.index));
+  at=m.index+m[0].length;
+  if(m[1]){const t=m[2];el('code','',parent,/^ .* $/.test(t)?t.slice(1,-1):t)}
+  else if(m[3]!==undefined||m[4]!==undefined)mdInline(m[3]??m[4],el('strong','',parent));
+  else if(m[5]!==undefined)mdInline(m[5],el('del','',parent));
+  else if(m[6]!==undefined||m[7]!==undefined)mdInline(m[6]??m[7],el('em','',parent));
+  else if(m[8]!==undefined)mdLink(parent,m[9],m[8]);
+  else mdLink(parent,m[10]);
+ }
+ if(at<text.length)parent.append(text.slice(at));
+}
+function mdCells(line){
+ let t=line.trim();if(t.startsWith('|'))t=t.slice(1);if(t.endsWith('|')&&!t.endsWith('\\|'))t=t.slice(0,-1);
+ return t.split(/(?<!\\)\|/).map(c=>c.trim().replace(/\\\|/g,'|'));
+}
+function mdStarts(line,next){
+ return MD_FENCE.test(line)||MD_HEAD.test(line)||MD_RULE.test(line)||MD_ITEM.test(line)||MD_QUOTE.test(line)||(line.includes('|')&&next!==undefined&&MD_ALIGN.test(next)&&next.includes('-'));
+}
+function mdList(lines,parent){
+ // Items nest by how far they are indented; other indented lines carry on the item above.
+ const stack=[];let item=null;
+ for(const line of lines){
+  const m=line.match(MD_ITEM);
+  if(!m){if(item&&line.trim()){item.append('\n');mdInline(line.trim(),item)}continue}
+  const indent=m[1].replace(/\t/g,'    ').length,ordered=/\d/.test(m[2]);
+  while(stack.length&&(indent<stack[stack.length-1].indent||(indent===stack[stack.length-1].indent&&stack[stack.length-1].ordered!==ordered)))stack.pop();
+  let top=stack[stack.length-1];
+  if(!top||indent>top.indent){
+   const list=el(ordered?'ol':'ul','',top?item:parent);
+   if(ordered&&parseInt(m[2])!==1)list.start=parseInt(m[2]);
+   top={indent,ordered,list};stack.push(top);
+  }
+  item=el('li','',top.list);
+  const task=m[3].match(/^\[([ xX])\]\s+(.*)$/);
+  if(task){item.classList.add('task');el('span','mdbox',item,task[1]===' '?'☐ ':'☑ ');mdInline(task[2],item)}
+  else mdInline(m[3],item);
+ }
+}
+function markdown(text,parent){
+ const lines=String(text).replace(/\r\n?/g,'\n').split('\n');
+ let i=0;
+ while(i<lines.length){
+  const line=lines[i];
+  if(!line.trim()){i++;continue}
+  let m=line.match(MD_FENCE);
+  if(m){
+   const close=new RegExp('^ {0,3}'+m[1][0]+'{'+m[1].length+',}\\s*$'),body=[];
+   for(i++;i<lines.length&&!close.test(lines[i]);i++)body.push(lines[i]);
+   i++;
+   const pre=el('pre','mdcode',parent);if(m[2])pre.dataset.lang=m[2];el('code','',pre,body.join('\n').replace(/\n+$/,''));
+   continue;
+  }
+  if((m=line.match(MD_HEAD))){
+   const h=el('div','mdh mdh'+m[1].length,parent);h.setAttribute('role','heading');h.setAttribute('aria-level',String(Math.min(6,m[1].length+2)));
+   mdInline(m[2],h);i++;continue;
+  }
+  if(MD_RULE.test(line)){el('hr','',parent);i++;continue}
+  if(line.includes('|')&&i+1<lines.length&&MD_ALIGN.test(lines[i+1])&&lines[i+1].includes('-')){
+   const aligns=mdCells(lines[i+1]).map(c=>c.startsWith(':')&&c.endsWith(':')?'center':c.endsWith(':')?'right':'');
+   const wrap=el('div','mdtable',parent),table=el('table','',wrap),head=el('tr','',el('thead','',table)),body=el('tbody','',table);
+   mdCells(line).forEach((c,k)=>{const th=el('th','',head);if(aligns[k])th.style.textAlign=aligns[k];mdInline(c,th)});
+   for(i+=2;i<lines.length&&lines[i].includes('|')&&lines[i].trim();i++){
+    const tr=el('tr','',body);
+    mdCells(lines[i]).forEach((c,k)=>{const td=el('td','',tr);if(aligns[k])td.style.textAlign=aligns[k];mdInline(c,td)});
+   }
+   continue;
+  }
+  if(MD_QUOTE.test(line)){
+   const body=[];
+   for(;i<lines.length&&MD_QUOTE.test(lines[i]);i++)body.push(lines[i].replace(MD_QUOTE,''));
+   markdown(body.join('\n'),el('blockquote','',parent));
+   continue;
+  }
+  if(MD_ITEM.test(line)){
+   const body=[];
+   for(;i<lines.length;i++){
+    const l=lines[i];
+    if(MD_ITEM.test(l)||(l.trim()&&/^\s/.test(l)&&!MD_FENCE.test(l))){body.push(l);continue}
+    // A blank line inside a list keeps it going when the next line is still part of it.
+    if(!l.trim()&&i+1<lines.length&&(MD_ITEM.test(lines[i+1])||/^\s+\S/.test(lines[i+1]))&&!MD_FENCE.test(lines[i+1]))continue;
+    break;
+   }
+   mdList(body,parent);
+   continue;
+  }
+  const body=[];
+  for(;i<lines.length&&lines[i].trim()&&!(body.length&&mdStarts(lines[i],lines[i+1]));i++)body.push(lines[i]);
+  mdInline(body.join('\n'),el('p','',parent));
+ }
+ return parent;
+}
 let youAt=0;  // When the latest message of yours before the row being drawn was sent.
 function messageRow(m,open,agent,openSet){
  if(m.role==='tool'&&m.question&&m.question.length)return questionRow(m);
  if(m.role==='tool')return toolRow(m,open,agent);
  if(m.role==='thinking'){
   const d=el('details','thinking');d.dataset.seq=m.seq;d.open=open;
-  el('summary','',d,'Thinking');el('div','',d,m.text);return d;
+  el('summary','',d,'Thinking');markdown(m.text,el('div','md',d));return d;
  }
  const r=el('div','msg '+m.role);
  if(m.model){
@@ -6800,7 +6915,7 @@ function messageRow(m,open,agent,openSet){
   return r;
  }
  addStamp(el('b','',r,{you:agent?'Sent to it':'You',claude:agent?'Subagent':'Claude',system:'System'}[m.role]),m,m.role==='claude'&&m.at&&youAt?m.at-youAt:0);
- if(!m.parts){r.append(m.text);return r}
+ if(!m.parts){if(m.role==='claude'){r.classList.add('md');markdown(m.text,r)}else r.append(m.text);return r}
  // A long paste starts folded, as logs can run to thousands of lines.
  m.parts.forEach((p,i)=>{
   if(p.text!==undefined){el('div','',r,p.text);return}
