@@ -16,6 +16,7 @@ import base64
 import io
 import datetime
 import json
+import types
 import os
 import re
 import secrets
@@ -558,15 +559,39 @@ class SetupTests(unittest.TestCase):
 
 
 class NewSessionModelTests(unittest.TestCase):
+    def setUp(self):
+        saved = app.KNOWN_FILE, app.launch_session
+        app.KNOWN_FILE = os.path.join(tempfile.mkdtemp(dir=CONFIG), "known.json")
+        self.addCleanup(lambda: (setattr(app, "KNOWN_FILE", saved[0]), setattr(app, "launch_session", saved[1])))
+        self.given = []
+        app.launch_session = lambda monitor, session_id, command, cwd, trust: (self.given.append((session_id, command)), (True, "Started."))[1]
+        self.monitor = types.SimpleNamespace(lock=threading.RLock(), current=lambda sid: None)
+
     def start(self, **fields):
-        given = []
-        saved = app.launch_session
-        app.launch_session = lambda monitor, session_id, command, cwd, trust: (given.append(command), (True, "Started."))[1]
-        try:
-            result = app.start_session(None, {"cwd": CONFIG, "prompt": "hello", **fields})
-        finally:
-            app.launch_session = saved
-        return result, given[0] if given else None
+        self.given.clear()
+        result = app.start_session(self.monitor, {"cwd": CONFIG, "prompt": "hello", **fields})
+        return result, self.given[0][1] if self.given else None
+
+    def test_resume_uses_the_model_it_was_started_with(self):
+        self.start(model="sonnet")
+        session_id = self.given[0][0]
+        known = app.read_known()
+        known["sessions"][session_id].update(cwd=CONFIG, mode="default", path=__file__)
+        app.write_known(known)
+        app.resume_session(self.monitor, {"id": session_id})
+        self.assertIn("--model=sonnet", self.given[-1][1])
+        self.assertEqual(self.given[-1][1][:2], ["claude", "--resume"])
+
+    def test_model_picked_with_slash_model(self):
+        self.assertEqual([app.model_alias(n) for n in ("Opus 5.5", "Sonnet 5.5 (1M context)", "Default (recommended)", "Opus Plan Mode", "Something new")],
+                         ["opus", "sonnet[1m]", "", "opusplan", None])
+        self.assertEqual(app.resume_model_flag("sonnet[1m]"), ["--model=sonnet[1m]"])
+        self.assertEqual(app.resume_model_flag("--evil"), [])
+        self.assertEqual(app.resume_model_flag(""), [])
+        transcript = app.Transcript("abc")
+        transcript._ingest({"type": "system", "content": "Set model to `Haiku 5.5`"})
+        transcript._ingest({"type": "system", "content": "Switched to Sonnet 5.5 due to high demand."})  # Not the user's choice.
+        self.assertEqual(transcript.resume_model, "haiku")
 
     def test_the_chosen_model_is_passed_on(self):
         self.assertIn("--model=sonnet", self.start(model="sonnet")[1])

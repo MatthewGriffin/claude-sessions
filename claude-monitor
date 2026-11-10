@@ -403,6 +403,7 @@ class Transcript:
         self.mtime = None
         self.title = self.prompt = self.text = self.model = self.branch = ""
         self.model_at = 0  # When the model was last seen, to compare with the status line's.
+        self.resume_model = None  # The model alias the user last picked with /model ("" for the default), for Resume.
         self.context = 0
         self.actions = collections.deque(maxlen=8)
         self.pending = {}
@@ -464,6 +465,8 @@ class Transcript:
             change = model_change_in(entry)
             if change:
                 self.model, self.model_at = change[1], entry_time(entry) or time.time()
+                if change[0] == "you" and model_alias(change[1]) is not None:
+                    self.resume_model = model_alias(change[1])
         if kind == "ai-title":
             self.title = clean(entry.get("aiTitle", ""))
         elif kind == "attachment":
@@ -793,11 +796,13 @@ class Monitor:
             transcript = self.transcripts.get(session["id"])
             if not transcript or not transcript.path:
                 continue
+            old = entries.get(session["id"], {})
             entry = {
                 "id": session["id"], "name": session["name"], "cwd": session["cwd"], "title": session["title"],
                 "mode": transcript.permission_mode, "path": transcript.path,
+                # Chosen when it was started here, unless changed with /model since.
+                "model": transcript.resume_model if transcript.resume_model is not None else old.get("model", ""),
             }
-            old = entries.get(session["id"], {})
             if {k: old.get(k) for k in entry} != entry or now - old.get("seen", 0) >= KNOWN_TOUCH_SECONDS:
                 entries[session["id"]] = {**entry, "seen": now}
                 changed = True
@@ -2489,6 +2494,26 @@ def model_change(text):
     return ("auto", switched.group(1).strip()) if switched else None
 
 
+def model_alias(name):
+    """The Claude Code alias for a model name /model shows, such as "Opus 5.5" -> "opus", or None if unknown."""
+    words = str(name or "").lower()
+    if "default" in words:
+        return ""
+    if "plan" in words:
+        return "opusplan"
+    match = re.match(r"(fable|opus|sonnet|haiku)\b", words)
+    if not match:
+        return None
+    return match.group(1) + ("[1m]" if "1m" in words else "")
+
+
+def resume_model_flag(model):
+    """--model for resuming with a remembered alias, or nothing for Claude Code's own default."""
+    model = model if isinstance(model, str) else ""
+    base = model[: -len("[1m]")] if model.endswith("[1m]") else model
+    return [f"--model={model}"] if model and base in NEW_SESSION_MODELS else []
+
+
 def model_change_in(entry):
     """model_change() for a transcript entry: /model's output (a user or system entry) or a system notice."""
     content = entry.get("content") if entry.get("type") == "system" else (entry.get("message") or {}).get("content")
@@ -3627,7 +3652,20 @@ def start_session(monitor, request):
     if name:
         command.append(f"--name={name}")
     command += ["--", prompt]
-    return launch_session(monitor, session_id, command, cwd, trust_approved)
+    started, message = launch_session(monitor, session_id, command, cwd, trust_approved)
+    if started and model:
+        remember_model(monitor, session_id, model)
+    return started, message
+
+
+def remember_model(monitor, session_id, model):
+    """Keep the model a session was started with, so that Resume brings it back with the same one."""
+    with monitor.lock:
+        known = read_known()
+        if known["remember"]:
+            # "seen" keeps it from expiring before the session's transcript appears and fills in the rest.
+            known["sessions"].setdefault(session_id, {"id": session_id, "seen": time.time()})["model"] = model
+            write_known(known)
 
 
 def launch_session(monitor, session_id, command, cwd, trust_approved):
@@ -3676,7 +3714,7 @@ def resume_session(monitor, request):
     # such as bypassPermissions, also falls back to asking first.
     mode = {"default": "manual"}.get(entry.get("mode"), entry.get("mode"))
     mode = mode if mode in NEW_SESSION_MODES else "manual"
-    command = ["claude", "--resume", session_id, f"--permission-mode={mode}"]
+    command = ["claude", "--resume", session_id, f"--permission-mode={mode}", *resume_model_flag(entry.get("model"))]
     return launch_session(monitor, session_id, command, cwd, bool(cwd) and request.get("trust") == cwd)
 
 
