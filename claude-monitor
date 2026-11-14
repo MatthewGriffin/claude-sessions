@@ -995,11 +995,13 @@ class Monitor:
                 if transcript:
                     for source in (transcript, *transcript.subagents.values()):
                         used_at = source.device_uses.get(device["serial"], 0)
-                        if device.get("kind") == "printer":
+                        if device.get("kind") in ("printer", "camera"):  # Cameras watch the printer too.
                             used_at = max(used_at, source.device_uses.get("printer", 0))
+                        if device.get("kind") == "camera":  # Its address named in a command.
+                            used_at = max(used_at, source.device_uses.get(f"printer-{device.get('host')}", 0))
                         if used_at and used_at >= device["started"]:
                             used[sid] = max(used.get(sid, 0), used_at)
-                if device.get("kind") == "printer" and PRINTING_WORDS.search(names[sid]) and sid not in used:
+                if device.get("kind") in ("printer", "camera") and PRINTING_WORDS.search(names[sid]) and sid not in used:
                     used[sid] = 1  # Named for printing, such as "3D Printing", and listed after the ones that used it.
             linked = []
             if starter:
@@ -1023,10 +1025,13 @@ class Monitor:
         with frame["lock"]:
             if time.time() - frame["at"] >= frame["gap"]:
                 started, previous = time.time(), frame["image"]
-                browser = serial.startswith(("browser-", "printer-"))
+                browser = serial.startswith(("browser-", "printer-", "camera-"))
                 # JPEG is several times faster, but only newer system images have it.
                 if serial.startswith("printer-"):
                     frame["image"] = printer_camera(serial[len("printer-"):]).frame()
+                elif serial.startswith("camera-"):
+                    feed = network_camera(serial[len("camera-"):])
+                    frame["image"] = feed.frame() if feed else None
                 elif browser:
                     frame["image"] = capture_browser(int(serial[len("browser-"):]))
                 else:
@@ -1306,7 +1311,7 @@ def find_adb(emulators):
 def find_devices():
     """Emulators, adb devices, browsers with a debugging port and printer cameras. Returns (devices, adb path)."""
     devices, adb = find_android_devices()
-    return sorted(devices + browser_devices(), key=lambda d: d["serial"]) + printer_devices(), adb
+    return sorted(devices + browser_devices(), key=lambda d: d["serial"]) + printer_devices() + camera_devices(), adb
 
 
 def session_ancestor(pid):
@@ -2154,7 +2159,186 @@ def printer_settings(monitor, request):
 
 
 def printers_view():
-    return {"printers": read_printers(), "shares": share_view()}
+    return {"printers": read_printers(), "shares": share_view(), "cameras": cameras_view()}
+
+
+# ---- Other cameras: any RTSP camera on this network, such as one watching a print ----
+# Shown like a printer's own camera: beside sessions doing 3D printing work, on only while watched.
+CAMERAS_FILE = os.path.join(MONITOR_DIR, "cameras.json")  # Holds camera passwords, so only this user can read it.
+MAX_CAMERAS = 8
+CAMERA_FPS = 10
+CAMERA_CHECK_SECONDS = 15
+
+
+def camera_url(text):
+    """An rtsp:// address the user typed, if it points at an IP address on a local network."""
+    text = str(text or "").strip()
+    if not text or len(text) > 500 or any(c.isspace() or ord(c) < 32 for c in text):
+        return None
+    try:
+        parts = urllib.parse.urlsplit(text)
+        parts.port  # noqa: B018 - raises ValueError on a bad port.
+    except ValueError:
+        return None
+    if parts.scheme.lower() != "rtsp" or not printer_address(parts.hostname or ""):
+        return None
+    return text
+
+
+def camera_host_port(url):
+    parts = urllib.parse.urlsplit(url)
+    return parts.hostname, parts.port or 554
+
+
+def camera_shown_url(url):
+    """The address without its password, for showing on a page."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.password is None:
+        return url
+    user = parts.netloc.rsplit("@", 1)[0].split(":", 1)[0]
+    return urllib.parse.urlunsplit(parts._replace(netloc=f"{user}:•••@{parts.netloc.rsplit('@', 1)[1]}"))
+
+
+def camera_id(url):
+    return hashlib.sha256(url.encode()).hexdigest()[:12]
+
+
+def read_cameras():
+    try:
+        with open(CAMERAS_FILE) as handle:
+            saved = json.load(handle).get("cameras", [])
+    except (OSError, ValueError, AttributeError):
+        return []
+    cameras = []
+    for item in saved if isinstance(saved, list) else []:
+        url = camera_url(item.get("url")) if isinstance(item, dict) else None
+        if url:
+            cameras.append({"id": camera_id(url), "url": url, "name": clean(str(item.get("name") or ""))[:60] or "Camera"})
+    return cameras[:MAX_CAMERAS]
+
+
+def save_cameras(cameras):
+    os.makedirs(MONITOR_DIR, exist_ok=True)
+    temporary = f"{CAMERAS_FILE}.{os.getpid()}"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump({"cameras": [{"url": c["url"], "name": c["name"]} for c in cameras]}, handle)
+    os.replace(temporary, CAMERAS_FILE)
+
+
+def cameras_view():
+    return [{"id": c["id"], "name": c["name"], "url": camera_shown_url(c["url"])} for c in read_cameras()]
+
+
+class NetworkCamera(PrinterCamera):
+    """An RTSP camera, read by ffmpeg into JPEG frames. Shares the printer camera's frames and retries."""
+
+    def __init__(self, url):
+        super().__init__(camera_host_port(url)[0])
+        self.url = url
+
+    def current_status(self):
+        return None  # A camera knows nothing about the print.
+
+    def _stream_once(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise OSError("ffmpeg isn't installed, and it's needed to show the camera")
+        self.process = process = subprocess.Popen(
+            [ffmpeg, "-nostdin", "-v", "error", "-protocol_whitelist", "rtsp,rtp,tcp,udp", "-rtsp_transport", "tcp",
+             "-timeout", "5000000",  # Give up on a camera that stops answering, in microseconds.
+             # Without these, ffmpeg studies the stream for a few seconds first. (-fflags nobuffer cut the frame rate.)
+             "-probesize", "65536", "-analyzeduration", "500000", "-i", self.url,
+             "-an", "-vf", f"fps={CAMERA_FPS}", "-c:v", "mjpeg", "-q:v", "5", "-f", "image2pipe", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+        )
+        errors = collections.deque(maxlen=5)  # Read all along, so a chatty ffmpeg never fills the pipe and stalls.
+        threading.Thread(target=lambda: errors.extend(process.stderr), daemon=True).start()
+        threading.Thread(target=self._read_frames, args=(process,), daemon=True).start()
+        try:
+            while self._wanted() and process.poll() is None:
+                time.sleep(0.5)
+            if process.poll() is not None:
+                time.sleep(0.2)  # Its last words.
+                said = clean(errors[-1].decode(errors="replace")).replace(self.url, "the camera") if errors else ""
+                raise OSError("the camera stream stopped" + (f": {said}" if said else ""))
+        finally:
+            self._stop_ffmpeg()
+
+
+camera_state = {"feeds": {}, "checks": {}, "lock": threading.Lock()}
+
+
+def network_camera(camera_id_):
+    """The feed of a saved camera, or None if no saved camera has that id."""
+    camera = next((c for c in read_cameras() if c["id"] == camera_id_), None)
+    if not camera:
+        return None
+    with camera_state["lock"]:
+        feed = camera_state["feeds"].get(camera_id_)
+        if not feed:
+            feed = camera_state["feeds"][camera_id_] = NetworkCamera(camera["url"])
+        return feed
+
+
+def check_camera(camera_id_, url):
+    try:
+        with socket.create_connection(camera_host_port(url), timeout=2):
+            answered = True
+    except OSError:
+        answered = False
+    with camera_state["lock"]:
+        camera_state["checks"][camera_id_] = {"at": time.monotonic(), "answered": answered, "checking": False}
+
+
+def camera_devices():
+    """The saved cameras as devices. Whether each answers is checked in the background."""
+    devices = []
+    for camera in read_cameras():
+        with camera_state["lock"]:
+            known = camera_state["checks"].get(camera["id"])
+            if not known or (not known["checking"] and time.monotonic() - known["at"] > CAMERA_CHECK_SECONDS):
+                camera_state["checks"][camera["id"]] = {**(known or {"answered": False, "at": 0}), "checking": True}
+                threading.Thread(target=check_camera, args=(camera["id"], camera["url"]), daemon=True).start()
+            feed = camera_state["feeds"].get(camera["id"])
+        state = "checking" if not known or not known["at"] else "device" if known["answered"] else "camera offline"
+        if state == "device" and not shutil.which("ffmpeg"):
+            state = "no ffmpeg"
+        devices.append({
+            "serial": f"camera-{camera['id']}", "label": camera["name"], "state": state, "host": camera_host_port(camera["url"])[0],
+            "starter": "", "starter_pid": None, "started": 0, "kind": "camera",
+            "problem": feed.problem if feed else "", "print": None, "shared": False,
+        })
+    return devices
+
+
+def camera_settings(monitor, request):
+    """Add or remove a camera. Answers with the same lists as the printer settings."""
+    action, cameras = request.get("action"), read_cameras()
+    if action == "add":
+        url = camera_url(request.get("url"))
+        if not url:
+            return False, "Type the camera's rtsp:// address on your network, such as rtsp://admin:password@192.168.0.82:554/1."
+        if any(c["url"] == url for c in cameras):
+            return False, "That camera is already added."
+        if len(cameras) >= MAX_CAMERAS:
+            return False, "That's as many cameras as the app keeps."
+        host, port = camera_host_port(url)
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                pass
+        except OSError:
+            return False, f"Nothing answered at {host} on port {port}. Check the camera is on and the address is right."
+        cameras.append({"id": camera_id(url), "url": url, "name": clean(str(request.get("name") or ""))[:60] or "Camera"})
+    elif action == "remove":
+        cameras = [c for c in cameras if c["id"] != request.get("id")]
+        with camera_state["lock"]:
+            camera_state["feeds"].pop(request.get("id"), None)
+            camera_state["checks"].pop(request.get("id"), None)
+    else:
+        return False, "Unknown action."
+    save_cameras(cameras)
+    return True, printers_view()
 
 
 # ---- Sharing a printer camera on the internet ----
@@ -4797,6 +4981,7 @@ POST_ROUTES = {
     "/api/sessions/key": press_key,
     "/api/sessions/end": end_session,
     "/api/sessions/printers": printer_settings,
+    "/api/sessions/cameras": camera_settings,
     "/api/sessions/printer-control": printer_control,
     "/api/sessions/terminal": open_terminal,
 }
@@ -4903,10 +5088,11 @@ def session_previews(monitor, query):
             found.append(item)
             continue
         printer = device["kind"] == "printer"
-        image, deadline = None, time.time() + (PREVIEW_WAIT_SECONDS if printer else 3)
-        # A printer's camera is asked directly: just after the app starts, it may still be "checking".
-        while printer or device["state"] == "device":
-            frame = printer_camera(device["serial"][len("printer-"):]).frame() if printer else monitor.device_frame(device["serial"])
+        camera = network_camera(device["serial"][len("camera-"):]) if device["kind"] == "camera" else None
+        image, deadline = None, time.time() + (PREVIEW_WAIT_SECONDS if printer or camera else 3)
+        # A camera is asked directly: just after the app starts, it may still be "checking".
+        while printer or camera or device["state"] == "device":
+            frame = printer_camera(device["serial"][len("printer-"):]).frame() if printer else camera.frame() if camera else monitor.device_frame(device["serial"])
             image = frame[1] if isinstance(frame, tuple) else frame
             if image or time.time() > deadline:
                 break
@@ -5548,7 +5734,8 @@ button.update svg{flex:none}
 #devEmpty{padding:24px 16px;color:var(--dim)}
 #printerBox{padding:0 16px 16px;border-top:1px solid var(--line,#8884)}#printerBox h3{margin:12px 0 4px;font-size:14px}
 #printerList{list-style:none;padding:0;margin:8px 0}#printerList li,#printerFound div{display:flex;gap:8px;align-items:center;margin:4px 0}
-#printerForm{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}#printerHost{flex:1 1 220px;min-width:0}
+#printerForm,#cameraForm{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}#printerHost,#cameraUrl{flex:1 1 220px;min-width:0}#cameraName{flex:0 1 160px;min-width:0}
+#cameraList{list-style:none;padding:0;margin:8px 0}#cameraList li{display:flex;gap:8px;align-items:center;margin:4px 0;flex-wrap:wrap}#cameraList code{overflow-wrap:anywhere}#cameraErr{color:var(--bad)}
 #printerErr{color:var(--bad)}#printerErr:empty{display:none}
 #viewDlg{max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:hidden}
 #viewDlg .dhead button{margin-left:auto}
@@ -5786,7 +5973,9 @@ textarea{min-height:110px;resize:vertical}
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
-<ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p></section></dialog>
+<ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p>
+<h3 id="cameraTitle">Other cameras</h3><p class="note">Any camera with an rtsp:// address on this network, such as one watching the print. It shows beside sessions doing 3D printing work, next to the printer's own camera, and is only on while you're watching it.</p>
+<ul id="cameraList" aria-labelledby="cameraTitle"></ul><form id="cameraForm"><input id="cameraName" aria-label="Camera name" placeholder="Name, such as Enclosure" autocomplete="off" maxlength="60"><input id="cameraUrl" aria-label="Camera rtsp:// address" placeholder="rtsp://user:password@192.168.0.82:554/1" autocomplete="off" spellcheck="false"><button type="submit">Add camera</button></form><p id="cameraErr" role="alert"></p></section></dialog>
 <dialog id="picDlg" aria-label="Picture"><div id="picBar"><span id="picName"></span><a id="picSave" download>Save</a><button id="picClose" type="button">Close</button></div><div id="picBox"><img id="picImg" alt=""></div></dialog>
 <dialog id="viewDlg" aria-labelledby="viewName"><div class="dhead"><h2 id="viewName"></h2><button id="viewClose">Close</button></div><div id="viewInfo"></div><img id="viewImg" alt="Live screen of the device"></dialog>
 <dialog id="phoneDlg" aria-labelledby="phoneTitle"><div class="dhead"><h2 id="phoneTitle">Phone access</h2><button id="phoneClose" style="margin-left:auto">Close</button></div><div id="phoneBody">
@@ -6110,7 +6299,7 @@ function feed(img,serial,interval,paused,onStatus){
  tick();
  return ()=>{live=false;clearTimeout(timer);img.onload=img.onerror=null;img.removeAttribute('src')};
 }
-const STATES={'printer offline':'printer not answering; is it on, with LAN mode turned on?',checking:'looking for the printer','no ffmpeg':'ffmpeg is needed to show this camera; install it, then restart the app',device:'running',offline:'offline, may still be booting',starting:'starting',unauthorized:'not authorized for adb','no adb':'adb not found; set ANDROID_HOME to see its screen'};
+const STATES={'printer offline':'printer not answering; is it on, with LAN mode turned on?','camera offline':'camera not answering; is it on?',checking:'looking for the printer','no ffmpeg':'ffmpeg is needed to show this camera; install it, then restart the app',device:'running',offline:'offline, may still be booting',starting:'starting',unauthorized:'not authorized for adb','no adb':'adb not found; set ANDROID_HOME to see its screen'};
 function linkText(d){
  if(!d.sessions.length)return'no session linked';
  return d.sessions.map(l=>(l.how==='started'?'started by ':'used by ')+l.name).join(', ');
@@ -6143,7 +6332,7 @@ function updateTile(t,d){
   t.note.textContent=STATES[d.state]||d.state;
   if(d.state==='device')t.stop=feed(t.img,d.serial,t.delay,t.paused,ok=>{
    t.root.classList.toggle('nopic',!ok);
-   t.note.textContent=ok?'view only':t.device.kind==='printer'?(t.device.problem||'starting the camera\u2026 this takes a few seconds'):'no picture yet; it may still be booting';
+   t.note.textContent=ok?'view only':(t.device.kind==='printer'||t.device.kind==='camera')?(t.device.problem||'starting the camera\u2026 this takes a few seconds'):'no picture yet; it may still be booting';
   });
  }
 }
@@ -6211,7 +6400,7 @@ function showPrinters(list,shares){
  if(Object.keys(shares).length&&$('devDlg').open)shareTimer=setTimeout(loadPrinters,Object.values(shares).some(x=>!x.url&&!x.error)?1500:10000);
 }
 async function loadPrinters(){
- try{const r=await fetch('/api/printers',{cache:'no-store'});if(r.ok){const d=await r.json();showPrinters(d.printers,d.shares)}}
+ try{const r=await fetch('/api/printers',{cache:'no-store'});if(r.ok){const d=await r.json();showPrinters(d.printers,d.shares);showCameras(d.cameras)}}
  catch(e){$('printerErr').textContent='Lost connection to claude-monitor.'}
 }
 async function printerAction(action,host){
@@ -6237,6 +6426,28 @@ $('printerFind').addEventListener('click',async()=>{
   const add=el('button','primary',row,'Add');add.type='button';
   add.addEventListener('click',async()=>{if(await printerAction('add',p.host))row.remove()});
  }
+});
+// Other cameras: saved by their rtsp:// address. The page only ever sees it without its password.
+function showCameras(list){
+ const ul=$('cameraList');ul.textContent='';
+ if(!list||!list.length){el('li','note',ul,'No other cameras added yet.');return}
+ for(const c of list){
+  const li=el('li','',ul);el('span','',li,c.name);el('code','note',li,c.url);
+  const r=el('button','',li,'Remove');r.type='button';r.addEventListener('click',()=>cameraAction({action:'remove',id:c.id}));
+ }
+}
+async function cameraAction(body){
+ $('cameraErr').textContent='';
+ const d=await post('cameras',body).catch(()=>({error:'Lost connection to claude-monitor.'}));
+ if(d.error){$('cameraErr').textContent=d.error;return null}
+ showCameras(d.message.cameras);
+ return d.message;
+}
+$('cameraForm').addEventListener('submit',async e=>{
+ e.preventDefault();
+ const b=$('cameraForm').querySelector('button[type=submit]');b.disabled=true;
+ if(await cameraAction({action:'add',name:$('cameraName').value,url:$('cameraUrl').value})){$('cameraName').value='';$('cameraUrl').value=''}
+ b.disabled=false;
 });
 $('devClose').addEventListener('click',()=>$('devDlg').close());
 function renderDevices(sessions){

@@ -1292,6 +1292,8 @@ class PrinterTests(unittest.TestCase):
     def setUp(self):
         with contextlib.suppress(OSError):
             os.remove(app.PRINTERS_FILE)
+        with contextlib.suppress(OSError):
+            os.remove(app.CAMERAS_FILE)
 
     def test_aes_matches_the_standard(self):
         # NIST SP 800-38A, F.2.2 (CBC-AES128 decrypt), first two blocks.
@@ -1332,9 +1334,9 @@ class PrinterTests(unittest.TestCase):
             app.printer_info = lambda host, timeout=3: None
             self.assertFalse(app.printer_settings(None, {"action": "add", "host": "192.168.0.66"})[0])
             app.printer_info = lambda host, timeout=3: {"token": "x" * 32, "modelName": "Anycubic Kobra X"}
-            self.assertEqual(app.printer_settings(None, {"action": "add", "host": "192.168.0.66"}), (True, {"printers": ["192.168.0.66"], "shares": {}}))
+            self.assertEqual(app.printer_settings(None, {"action": "add", "host": "192.168.0.66"}), (True, {"printers": ["192.168.0.66"], "shares": {}, "cameras": []}))
             self.assertEqual(app.read_printers(), ["192.168.0.66"])
-            self.assertEqual(app.printer_settings(None, {"action": "remove", "host": "192.168.0.66"}), (True, {"printers": [], "shares": {}}))
+            self.assertEqual(app.printer_settings(None, {"action": "remove", "host": "192.168.0.66"}), (True, {"printers": [], "shares": {}, "cameras": []}))
         finally:
             app.printer_info = original
 
@@ -1397,6 +1399,64 @@ class PrinterTests(unittest.TestCase):
         monitor = app.Monitor()
         monitor.devices = [{"serial": "printer-192.168.0.66", "label": "Kobra X camera", "state": "device", "kind": "printer",
                             "starter": "", "starter_pid": None, "started": 0}]
+        sessions = [{"id": "a", "name": "3D Printing", "pid": 1}, {"id": "b", "name": "Meal Planner", "pid": 2}]
+        self.assertEqual([l["id"] for l in monitor.linked_devices(sessions)[0]["sessions"]], ["a"])
+
+
+class CameraTests(unittest.TestCase):
+    """Other cameras: rtsp:// addresses on this network, shown beside printing sessions like a printer's camera."""
+
+    URL = "rtsp://admin:secret@192.168.0.82:554/1"
+
+    def setUp(self):
+        with contextlib.suppress(OSError):
+            os.remove(app.CAMERAS_FILE)
+        original = app.socket.create_connection
+        self.addCleanup(setattr, app.socket, "create_connection", original)
+        self.answering = True
+        def connect(address, timeout=None):
+            if not self.answering:
+                raise OSError("refused")
+            return contextlib.nullcontext()
+        app.socket.create_connection = connect
+
+    def test_only_rtsp_on_this_network(self):
+        for good in (self.URL, " rtsp://192.168.0.82/live ", "rtsp://10.0.0.5:8554/stream?channel=1"):
+            self.assertEqual(app.camera_url(good), good.strip())
+        for bad in ("http://192.168.0.82/1", "rtsp://8.8.8.8/1", "rtsp://127.0.0.1/1", "rtsp://cam.local/1",
+                    "rtsp://192.168.0.82:99999/1", "rtsp://192.168.0.82/a b", "-i rtsp://192.168.0.82/1", "file:///etc/passwd", "", None):
+            self.assertIsNone(app.camera_url(bad), bad)
+
+    def test_password_never_shown(self):
+        self.assertEqual(app.camera_shown_url(self.URL), "rtsp://admin:\u2022\u2022\u2022@192.168.0.82:554/1")
+        self.assertEqual(app.camera_shown_url("rtsp://192.168.0.82/1"), "rtsp://192.168.0.82/1")
+
+    def test_settings(self):
+        self.assertFalse(app.camera_settings(None, {"action": "add", "url": "rtsp://8.8.8.8/1"})[0])
+        self.answering = False
+        self.assertFalse(app.camera_settings(None, {"action": "add", "url": self.URL})[0])
+        self.answering = True
+        ok, view = app.camera_settings(None, {"action": "add", "url": self.URL, "name": "Enclosure"})
+        self.assertTrue(ok)
+        [camera] = view["cameras"]
+        self.assertEqual((camera["name"], camera["url"]), ("Enclosure", "rtsp://admin:\u2022\u2022\u2022@192.168.0.82:554/1"))
+        self.assertNotIn("secret", json.dumps(view))
+        self.assertFalse(app.camera_settings(None, {"action": "add", "url": self.URL})[0])  # Already there.
+        self.assertEqual(app.read_cameras()[0]["url"], self.URL)
+        if not WINDOWS:
+            self.assertEqual(os.stat(app.CAMERAS_FILE).st_mode & 0o777, 0o600)
+        self.assertEqual(app.camera_settings(None, {"action": "remove", "id": camera["id"]})[1]["cameras"], [])
+
+    def test_listed_and_linked_like_a_printer_camera(self):
+        app.camera_settings(None, {"action": "add", "url": self.URL, "name": "Enclosure"})
+        app.camera_devices()  # Starts the background check.
+        [device] = wait_for(lambda: [d for d in app.camera_devices() if d["state"] != "checking"])
+        self.assertEqual((device["kind"], device["label"]), ("camera", "Enclosure"))
+        self.assertIn(device["state"], ("device", "no ffmpeg"))
+        self.assertIsInstance(app.network_camera(device["serial"][len("camera-"):]), app.NetworkCamera)
+        self.assertIsNone(app.network_camera("nothing"))
+        monitor = app.Monitor()
+        monitor.devices = [device]
         sessions = [{"id": "a", "name": "3D Printing", "pid": 1}, {"id": "b", "name": "Meal Planner", "pid": 2}]
         self.assertEqual([l["id"] for l in monitor.linked_devices(sessions)[0]["sessions"]], ["a"])
 
