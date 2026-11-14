@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1501,6 +1502,55 @@ class QuestionTests(unittest.TestCase):
         text = 'User has answered your questions: "Which colour?"="Green, please", "Which size?"="L".'
         self.assertEqual(app.given_answers(asked, None, text, False), {"list": ["Green, please", "L"]})
         self.assertEqual(app.given_answers(asked, None, "The user declined to answer.", True)["note"], "Not answered: The user declined to answer.")
+
+
+class TickBoxAnswerTests(unittest.TestCase):
+    """Typed answers on tick-box questions: typed into "Type something", then Next or Submit is pressed."""
+
+    def screen(self, here, typed, ticked, step="Next"):
+        rows = [("1", " ", "Apple"), ("2", " ", "Pear"), ("3", "✔" if ticked else " ", typed or "Type something")]
+        lines = ["←  ☐ Fruit  ☐ Veg  ✔ Submit  →", "", "Which fruits?", ""]
+        for n, (key, tick, label) in enumerate(rows):
+            lines.append(("❯ " if here == n else "  ") + f"{key}. [{tick}] {label}")
+            if n < 2:
+                lines.append("         " + label)
+        lines.append(("❯    " if here == 3 else "     ") + step)
+        lines += ["─" * 40, "  4. Chat about this", "", "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"]
+        return "\n".join(lines)
+
+    def test_highlight_on_next_still_reads_the_menu(self):
+        options = app.menu_options(self.screen(3, "all of them", True))
+        self.assertEqual([o["label"] for o in options], ["Apple", "Pear", "all of them", "Next", "Chat about this"])
+        self.assertTrue(options[3]["highlighted"])
+        self.assertEqual(app.menu_options(self.screen(3, "", True, "Submit"))[3]["label"], "Submit")
+
+    def test_typed_answer_moves_on_to_next(self):
+        state = {"here": 0, "typed": "", "ticked": True, "pressed": []}  # "Type something" ticked but empty.
+
+        def keys(target, *pressed):
+            for key in pressed:
+                state["pressed"].append(key)
+                if key == "Down":
+                    state["here"] = min(state["here"] + 1, 3)
+                elif key == "Up":
+                    state["here"] = max(state["here"] - 1, 0)
+                elif key == "Enter":
+                    state["entered_on"] = state["here"]
+                else:
+                    self.fail(f"pressed {key!r}, which would tick or untick an answer")
+            return True
+
+        def text(target, typed):
+            state["typed"] += typed
+            state["ticked"] = True
+            return True
+
+        screen = lambda target: self.screen(state["here"], state["typed"], state["ticked"])
+        with mock.patch.object(app, "session_screen", screen), mock.patch.object(app, "send_keys", keys), \
+                mock.patch.object(app, "send_text", text), mock.patch.object(app.time, "sleep"):
+            answer = next(o for o in app.menu_options(screen(None)) if o["label"] == "Type something")
+            self.assertTrue(app.choose_answer("t", answer, "all of them"))
+        self.assertEqual((state["typed"], state["ticked"], state["entered_on"]), ("all of them", True, 3))
 
 
 class PreviewTests(unittest.TestCase):

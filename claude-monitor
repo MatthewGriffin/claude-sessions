@@ -3827,6 +3827,12 @@ def menu_options(screen):
     # further up, such as a numbered list in an earlier message, has the input box below it.
     at_bottom = lambda end: sum(1 for line in lines[end + 1:] if line.strip()) <= MENU_BELOW
     numbered = MENU_NUMBERED.match(lines[here])
+    step = lambda line: line.strip().lstrip("❯").strip() in ("Submit", "Next")
+    anchor = here
+    if not numbered and step(lines[here]):
+        # The highlight is on a tick-box question's Next or Submit line, below its numbered answers.
+        anchor = next((i for i in range(here - 1, -1, -1) if MENU_NUMBERED.match(lines[i])), here)
+        numbered = MENU_NUMBERED.match(lines[anchor])
     if not numbered:
         # No numbers: the answers are the lines around the highlighted one that start in the same column.
         column = MENU_HIGHLIGHT.match(lines[here]).start(2)
@@ -3840,8 +3846,9 @@ def menu_options(screen):
                 for n in range(start, end + 1)] if end > start and at_bottom(end) else []
     # Numbered: answers, their descriptions (indented under the label) and dividers, up and down from the highlight.
     column = numbered.end(1) + 2
-    part = lambda line: MENU_NUMBERED.match(line) or MENU_DIVIDER.match(line) or len(line) - len(line.lstrip()) >= column
-    start, end = here, here
+    part = lambda line: (MENU_NUMBERED.match(line) or MENU_DIVIDER.match(line) or step(line)
+                         or len(line) - len(line.lstrip()) >= column)
+    start, end = anchor, anchor
     while start > 0 and part(lines[start - 1]):
         start -= 1
     while end + 1 < len(lines) and part(lines[end + 1]):
@@ -3853,8 +3860,8 @@ def menu_options(screen):
             tick = match.group(2)
             options.append({"key": match.group(1), "label": match.group(3), "description": "",
                             "checked": None if tick is None else tick.strip() != "", "highlighted": n == here})
-        elif line.strip() == "Submit":
-            options.append({"key": "", "label": "Submit", "description": "", "checked": None, "highlighted": n == here})
+        elif step(line):  # Tick-box questions end in Next, the last one in Submit.
+            options.append({"key": "", "label": line.strip().lstrip("❯").strip(), "description": "", "checked": None, "highlighted": n == here})
         elif line.strip() and not MENU_DIVIDER.match(line) and options:
             options[-1]["description"] = (options[-1]["description"] + " " + line.strip()).strip()
     keys = [o["key"] for o in options if o["key"]]
@@ -3864,13 +3871,16 @@ def menu_options(screen):
 
 def choose_answer(target, answer, text=None):
     """Pick one answer of the menu on a session's screen: by its number, or by moving the highlight
-    onto it and pressing Enter. With text, the answer is "Type something" and the text is typed in."""
+    onto it and pressing Enter. With text, the answer is "Type something" and the text is typed in.
+
+    On a tick-box question Enter would only tick or untick, and typing ticks "Type something" by itself,
+    so after the text the highlight moves on to the Next or Submit line and Enter is pressed there."""
     send = lambda *keys: send_keys(target, *keys)
     same = lambda option: option["key"] == answer["key"] and option["label"] == answer["label"]
     if answer["key"] and text is None:
         return send(answer["key"])
-    if answer["key"]:
-        send(answer["key"])  # This only moves the highlight onto "Type something".
+    if answer["key"] and answer["checked"] is None:
+        send(answer["key"])  # This only moves the highlight onto "Type something". On tick boxes it would tick it.
     for _ in range(MENU_STEPS):
         time.sleep(0.15)
         options = menu_options(session_screen(target))
@@ -3881,8 +3891,25 @@ def choose_answer(target, answer, text=None):
         if at == to:
             if text is not None and not send_text(target, text):
                 return False
+            if text is not None and answer["checked"] is not None:
+                return move_to_next(target)
             return send("Enter")
         send("Down" if to > at else "Up")
+    return False
+
+
+def move_to_next(target):
+    """Move a tick-box question's highlight down onto its Next or Submit line and press Enter there."""
+    for _ in range(MENU_STEPS):
+        time.sleep(0.15)
+        options = menu_options(session_screen(target))
+        at = next((n for n, o in enumerate(options) if o["highlighted"]), None)
+        to = next((n for n, o in enumerate(options) if not o["key"] and o["label"] in ("Next", "Submit")), None)
+        if at is None or to is None or to < at:
+            return False
+        if at == to:
+            return send_keys(target, "Enter")
+        send_keys(target, "Down")
     return False
 
 
@@ -4651,7 +4678,7 @@ def press_key(monitor, request):
         text = None
         if action == "type":
             text = CONTROL_CHARS.sub(" ", str(request.get("text", ""))).strip()
-            if not TYPE_SOMETHING.match(answer["label"]) or not text or any(o["checked"] is not None for o in options):
+            if not TYPE_SOMETHING.match(answer["label"]) or not text:
                 return False, "That answer can't take typed text here."
         if not choose_answer(session["tmux"], answer, text):
             return False, "Could not pick that answer. Check the screen and try again."
@@ -6947,7 +6974,7 @@ function updateFoot(s){
  $('screen').hidden=!(s.hosted&&waiting);
  const options=waiting&&menuOptions.at===String(a.at)?menuOptions.list:[];
  // A question that takes its own answer is answered from the reply box, not a box of its own.
- const own=s.hosted&&!options.some(o=>o.checked!==null)&&options.find(o=>/^Type something\b/.test(o.label));
+ const own=s.hosted&&options.find(o=>/^Type something\b/.test(o.label));
  answerFor=own?{prompt:a.at,key:own.key,label:own.label}:null;
  const sendsNow=s.status==='idle'&&!(s.queue&&s.queue.length);
  $('replySend').textContent=answerFor?'Answer':sendsNow?'Send':'Queue';
@@ -6960,11 +6987,11 @@ function updateFoot(s){
  // A button for each answer on Claude Code's menu, for permissions and questions alike.
  // Until the menu has been read, or if it can't be, permissions get Yes and No and other prompts the keys.
  if(options.length){
-  const ticks=options.some(o=>o.checked!==null);
   for(const o of options){
    const [label,...more]=o.label.split(' · '),no=/^No\b/.test(label);
    const body={prompt:a.at,key:o.key,label:o.label};
-   if(/^Type something\b/.test(o.label)&&!ticks)continue;  // Typed in the reply box instead.
+   // Typed in the reply box instead. A tick on its own adds an empty answer, so it only shows to take one off.
+   if(/^Type something\b/.test(o.label)&&!o.checked)continue;
    const tick=o.checked===null?'':o.checked?'☑ ':'☐ ';
    const strong=permission?o.key==='1':/^Submit/.test(label);
    const b=keyButton(tick+label,strong?'primary':no||/^Cancel$/.test(label)?'deny':'',{action:'choose',...body});
