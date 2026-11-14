@@ -2213,8 +2213,28 @@ def read_cameras():
     for item in saved if isinstance(saved, list) else []:
         url = camera_url(item.get("url")) if isinstance(item, dict) else None
         if url:
-            cameras.append({"id": camera_id(url), "url": url, "name": clean(str(item.get("name") or ""))[:60] or "Camera"})
+            cameras.append({"id": camera_id(url), "url": url, "name": clean(str(item.get("name") or ""))[:60] or "Camera",
+                            "crop": camera_crop(item.get("crop"))})
     return cameras[:MAX_CAMERAS]
+
+
+def camera_crop(value):
+    """A zoom box as [left, top, width, height], each a fraction of the whole picture, or None for the full view."""
+    try:
+        x, y, w, h = (round(float(n), 4) for n in value)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= x < 1 and 0 <= y < 1 and 0.05 <= w <= 1 and 0.05 <= h <= 1 and x + w <= 1.0001 and y + h <= 1.0001):
+        return None
+    return None if (x, y, w, h) == (0, 0, 1, 1) else [x, y, min(w, 1 - x), min(h, 1 - y)]
+
+
+def camera_filter(crop):
+    """ffmpeg's video filter for a camera: its zoom box (even sizes, which JPEG needs), then the frame rate."""
+    if not crop:
+        return f"fps={CAMERA_FPS}"
+    x, y, w, h = crop
+    return f"crop=trunc(iw*{w}/2)*2:trunc(ih*{h}/2)*2:trunc(iw*{x}):trunc(ih*{y}),fps={CAMERA_FPS}"
 
 
 def save_cameras(cameras):
@@ -2222,20 +2242,21 @@ def save_cameras(cameras):
     temporary = f"{CAMERAS_FILE}.{os.getpid()}"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w") as handle:
-        json.dump({"cameras": [{"url": c["url"], "name": c["name"]} for c in cameras]}, handle)
+        json.dump({"cameras": [{"url": c["url"], "name": c["name"], "crop": c.get("crop")} for c in cameras]}, handle)
     os.replace(temporary, CAMERAS_FILE)
 
 
 def cameras_view():
-    return [{"id": c["id"], "name": c["name"], "url": camera_shown_url(c["url"])} for c in read_cameras()]
+    return [{"id": c["id"], "name": c["name"], "url": camera_shown_url(c["url"]), "crop": c["crop"]} for c in read_cameras()]
 
 
 class NetworkCamera(PrinterCamera):
     """An RTSP camera, read by ffmpeg into JPEG frames. Shares the printer camera's frames and retries."""
 
-    def __init__(self, url):
+    def __init__(self, url, crop=None):
         super().__init__(camera_host_port(url)[0])
         self.url = url
+        self.crop = crop
 
     def current_status(self):
         return None  # A camera knows nothing about the print.
@@ -2249,7 +2270,7 @@ class NetworkCamera(PrinterCamera):
              "-timeout", "5000000",  # Give up on a camera that stops answering, in microseconds.
              # Without these, ffmpeg studies the stream for a few seconds first. (-fflags nobuffer cut the frame rate.)
              "-probesize", "65536", "-analyzeduration", "500000", "-i", self.url,
-             "-an", "-vf", f"fps={CAMERA_FPS}", "-c:v", "mjpeg", "-q:v", "5", "-f", "image2pipe", "-"],
+             "-an", "-vf", camera_filter(self.crop), "-c:v", "mjpeg", "-q:v", "5", "-f", "image2pipe", "-"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
         )
         errors = collections.deque(maxlen=5)  # Read all along, so a chatty ffmpeg never fills the pipe and stalls.
@@ -2276,9 +2297,27 @@ def network_camera(camera_id_):
         return None
     with camera_state["lock"]:
         feed = camera_state["feeds"].get(camera_id_)
-        if not feed:
-            feed = camera_state["feeds"][camera_id_] = NetworkCamera(camera["url"])
+        if not feed or feed.crop != camera["crop"]:
+            if feed:
+                feed.wanted_at = 0  # The old zoom's ffmpeg stops at its next check.
+            feed = camera_state["feeds"][camera_id_] = NetworkCamera(camera["url"], camera["crop"])
         return feed
+
+
+def camera_whole_picture(camera_id_):
+    """One JPEG of a camera's whole view, ignoring its zoom, for choosing a new zoom box. Or None."""
+    camera = next((c for c in read_cameras() if c["id"] == camera_id_), None)
+    ffmpeg = shutil.which("ffmpeg")
+    if not camera or not ffmpeg:
+        return None
+    with contextlib.suppress(subprocess.SubprocessError, OSError):
+        done = subprocess.run(
+            [ffmpeg, "-nostdin", "-v", "error", "-protocol_whitelist", "rtsp,rtp,tcp,udp", "-rtsp_transport", "tcp",
+             "-timeout", "5000000", "-i", camera["url"], "-an", "-frames:v", "1", "-c:v", "mjpeg", "-q:v", "4", "-f", "image2pipe", "-"],
+            capture_output=True, timeout=20, stdin=subprocess.DEVNULL)
+        if done.stdout[:2] == b"\xff\xd8":
+            return done.stdout
+    return None
 
 
 def check_camera(camera_id_, url):
@@ -2329,7 +2368,15 @@ def camera_settings(monitor, request):
                 pass
         except OSError:
             return False, f"Nothing answered at {host} on port {port}. Check the camera is on and the address is right."
-        cameras.append({"id": camera_id(url), "url": url, "name": clean(str(request.get("name") or ""))[:60] or "Camera"})
+        cameras.append({"id": camera_id(url), "url": url, "name": clean(str(request.get("name") or ""))[:60] or "Camera", "crop": None})
+    elif action == "zoom":
+        camera = next((c for c in cameras if c["id"] == request.get("id")), None)
+        if not camera:
+            return False, "That camera isn't added any more."
+        crop = camera_crop(request.get("crop"))
+        if request.get("crop") is not None and not crop:
+            return False, "That zoom box is too small. Drag a larger box over the picture."
+        camera["crop"] = crop
     elif action == "remove":
         cameras = [c for c in cameras if c["id"] != request.get("id")]
         with camera_state["lock"]:
@@ -5735,6 +5782,8 @@ button.update svg{flex:none}
 #printerBox{padding:0 16px 16px;border-top:1px solid var(--line,#8884)}#printerBox h3{margin:12px 0 4px;font-size:14px}
 #printerList{list-style:none;padding:0;margin:8px 0}#printerList li,#printerFound div{display:flex;gap:8px;align-items:center;margin:4px 0}
 #printerForm,#cameraForm{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}#printerHost,#cameraUrl{flex:1 1 220px;min-width:0}#cameraName{flex:0 1 160px;min-width:0}
+#zoomArea{position:relative;display:inline-block;overflow:hidden;max-width:100%;touch-action:none;cursor:crosshair;user-select:none;line-height:0}#zoomImg{max-width:100%;max-height:60vh;display:block;-webkit-user-drag:none}
+#zoomSel{position:absolute;border:2px solid var(--accent,#4c9);box-shadow:0 0 0 9999px #0008;pointer-events:none}#zoomBtns{display:flex;gap:8px;margin:8px 0;flex-wrap:wrap}
 #cameraList{list-style:none;padding:0;margin:8px 0}#cameraList li{display:flex;gap:8px;align-items:center;margin:4px 0;flex-wrap:wrap}#cameraList code{overflow-wrap:anywhere}#cameraErr{color:var(--bad)}
 #printerErr{color:var(--bad)}#printerErr:empty{display:none}
 #viewDlg{max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:hidden}
@@ -5975,7 +6024,8 @@ textarea{min-height:110px;resize:vertical}
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
 <ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p>
 <h3 id="cameraTitle">Other cameras</h3><p class="note">Any camera with an rtsp:// address on this network, such as one watching the print. It shows beside sessions doing 3D printing work, next to the printer's own camera, and is only on while you're watching it.</p>
-<ul id="cameraList" aria-labelledby="cameraTitle"></ul><form id="cameraForm"><input id="cameraName" aria-label="Camera name" placeholder="Name, such as Enclosure" autocomplete="off" maxlength="60"><input id="cameraUrl" aria-label="Camera rtsp:// address" placeholder="rtsp://user:password@192.168.0.82:554/1" autocomplete="off" spellcheck="false"><button type="submit">Add camera</button></form><p id="cameraErr" role="alert"></p></section></dialog>
+<ul id="cameraList" aria-labelledby="cameraTitle"></ul><form id="cameraForm"><input id="cameraName" aria-label="Camera name" placeholder="Name, such as Enclosure" autocomplete="off" maxlength="60"><input id="cameraUrl" aria-label="Camera rtsp:// address" placeholder="rtsp://user:password@192.168.0.82:554/1" autocomplete="off" spellcheck="false"><button type="submit">Add camera</button></form><p id="cameraErr" role="alert"></p>
+<div id="zoomBox" hidden><p class="note" id="zoomNote">Drag a box over the part of the picture to show. The stream is cropped before it reaches you, so a zoomed picture keeps the camera's full detail.</p><div id="zoomArea"><img id="zoomImg" alt="The camera's whole view"><div id="zoomSel" hidden></div></div><div id="zoomBtns"><button type="button" id="zoomSave" class="primary">Save zoom</button><button type="button" id="zoomFull">Full view</button><button type="button" id="zoomCancel">Cancel</button></div></div></section></dialog>
 <dialog id="picDlg" aria-label="Picture"><div id="picBar"><span id="picName"></span><a id="picSave" download>Save</a><button id="picClose" type="button">Close</button></div><div id="picBox"><img id="picImg" alt=""></div></dialog>
 <dialog id="viewDlg" aria-labelledby="viewName"><div class="dhead"><h2 id="viewName"></h2><button id="viewClose">Close</button></div><div id="viewInfo"></div><img id="viewImg" alt="Live screen of the device"></dialog>
 <dialog id="phoneDlg" aria-labelledby="phoneTitle"><div class="dhead"><h2 id="phoneTitle">Phone access</h2><button id="phoneClose" style="margin-left:auto">Close</button></div><div id="phoneBody">
@@ -6433,9 +6483,36 @@ function showCameras(list){
  if(!list||!list.length){el('li','note',ul,'No other cameras added yet.');return}
  for(const c of list){
   const li=el('li','',ul);el('span','',li,c.name);el('code','note',li,c.url);
+  if(c.crop)el('span','note',li,'zoomed');
+  const z=el('button','',li,'Zoom\u2026');z.type='button';z.title='Choose the part of the picture to show';z.addEventListener('click',()=>openZoom(c));
   const r=el('button','',li,'Remove');r.type='button';r.addEventListener('click',()=>cameraAction({action:'remove',id:c.id}));
  }
 }
+// Zoom: the camera's whole view, with a box dragged over it. The box is kept as fractions of the picture.
+let zoomCam=null,zoomCrop=null;
+function drawZoom(){
+ const sel=$('zoomSel'),img=$('zoomImg');sel.hidden=!zoomCrop;if(!zoomCrop)return;
+ const [x,y,w,h]=zoomCrop;
+ Object.assign(sel.style,{left:x*img.clientWidth+'px',top:y*img.clientHeight+'px',width:w*img.clientWidth+'px',height:h*img.clientHeight+'px'});
+}
+function openZoom(c){
+ zoomCam=c;zoomCrop=c.crop;$('zoomBox').hidden=false;$('zoomSave').disabled=true;
+ $('zoomNote').textContent='Getting the whole picture from '+c.name+'\u2026';
+ const img=$('zoomImg');img.onload=()=>{$('zoomNote').textContent='Drag a box over the part of the picture to show. The stream is cropped before it reaches you, so a zoomed picture keeps the camera\u2019s full detail.';$('zoomSave').disabled=false;drawZoom()};
+ img.onerror=()=>{$('zoomNote').textContent='The camera didn\u2019t send a picture. Check it\u2019s on, then try again.'};
+ img.src='/api/camera/whole?id='+encodeURIComponent(c.id)+'&n='+Date.now();
+ $('zoomBox').scrollIntoView({block:'nearest'});
+}
+{
+ let start=null;const area=$('zoomArea'),at=e=>{const r=$('zoomImg').getBoundingClientRect();return[Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))]};
+ area.addEventListener('pointerdown',e=>{if(!$('zoomImg').naturalWidth)return;start=at(e);area.setPointerCapture(e.pointerId);e.preventDefault()});
+ area.addEventListener('pointermove',e=>{if(!start)return;const p=at(e);zoomCrop=[Math.min(start[0],p[0]),Math.min(start[1],p[1]),Math.abs(p[0]-start[0]),Math.abs(p[1]-start[1])];drawZoom()});
+ area.addEventListener('pointerup',()=>{start=null;if(zoomCrop&&(zoomCrop[2]<0.05||zoomCrop[3]<0.05)){zoomCrop=null;drawZoom()}});
+ addEventListener('resize',drawZoom);
+}
+$('zoomSave').addEventListener('click',async()=>{if(await cameraAction({action:'zoom',id:zoomCam.id,crop:zoomCrop}))$('zoomBox').hidden=true});
+$('zoomFull').addEventListener('click',async()=>{if(await cameraAction({action:'zoom',id:zoomCam.id,crop:null}))$('zoomBox').hidden=true});
+$('zoomCancel').addEventListener('click',()=>{$('zoomBox').hidden=true});
 async function cameraAction(body){
  $('cameraErr').textContent='';
  const d=await post('cameras',body).catch(()=>({error:'Lost connection to claude-monitor.'}));
@@ -7989,6 +8066,12 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                     self.send_json(200, {"commands": commands})
             elif parts.path == "/api/folders":
                 self.send_json(200, {"folders": trusted_folders()})
+            elif parts.path == "/api/camera/whole":
+                picture = camera_whole_picture(query.get("id", [""])[0])
+                if picture:
+                    self.respond(200, "image/jpeg", picture)
+                else:
+                    self.respond(404, "text/plain", b"no picture available")
             elif parts.path == "/api/device/screen":
                 frame = monitor.device_frame(query.get("serial", [""])[0])
                 try:

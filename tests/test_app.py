@@ -1439,13 +1439,39 @@ class CameraTests(unittest.TestCase):
         ok, view = app.camera_settings(None, {"action": "add", "url": self.URL, "name": "Enclosure"})
         self.assertTrue(ok)
         [camera] = view["cameras"]
-        self.assertEqual((camera["name"], camera["url"]), ("Enclosure", "rtsp://admin:\u2022\u2022\u2022@192.168.0.82:554/1"))
+        self.assertEqual((camera["name"], camera["url"], camera["crop"]), ("Enclosure", "rtsp://admin:\u2022\u2022\u2022@192.168.0.82:554/1", None))
         self.assertNotIn("secret", json.dumps(view))
         self.assertFalse(app.camera_settings(None, {"action": "add", "url": self.URL})[0])  # Already there.
         self.assertEqual(app.read_cameras()[0]["url"], self.URL)
         if not WINDOWS:
             self.assertEqual(os.stat(app.CAMERAS_FILE).st_mode & 0o777, 0o600)
         self.assertEqual(app.camera_settings(None, {"action": "remove", "id": camera["id"]})[1]["cameras"], [])
+
+    def test_zoom(self):
+        self.assertIsNone(app.camera_crop(None))
+        self.assertIsNone(app.camera_crop([0, 0, 1, 1]))  # The whole picture is no zoom.
+        for bad in ([0.5, 0.5, 0.01, 0.5], [-0.1, 0, 0.5, 0.5], [0.8, 0, 0.5, 0.5], ["x", 0, 1, 1], [0, 0, 1], "abc"):
+            self.assertIsNone(app.camera_crop(bad), bad)
+        self.assertEqual(app.camera_crop([0.21354, 0.1157, 0.5208, 0.6944]), [0.2135, 0.1157, 0.5208, 0.6944])
+        self.assertEqual(app.camera_filter(None), "fps=10")
+        self.assertEqual(app.camera_filter([0.25, 0.1, 0.5, 0.75]),
+                         "crop=trunc(iw*0.5/2)*2:trunc(ih*0.75/2)*2:trunc(iw*0.25):trunc(ih*0.1),fps=10")
+        [camera] = app.camera_settings(None, {"action": "add", "url": self.URL, "name": "Enclosure"})[1]["cameras"]
+        self.assertFalse(app.camera_settings(None, {"action": "zoom", "id": camera["id"], "crop": [0, 0, 0.01, 0.01]})[0])
+        self.assertEqual(app.camera_settings(None, {"action": "zoom", "id": camera["id"], "crop": [0.25, 0.1, 0.5, 0.75]})[1]["cameras"][0]["crop"], [0.25, 0.1, 0.5, 0.75])
+        feed = app.network_camera(camera["id"])
+        self.assertEqual(feed.crop, [0.25, 0.1, 0.5, 0.75])
+        app.camera_settings(None, {"action": "zoom", "id": camera["id"], "crop": None})
+        self.assertIsNot(app.network_camera(camera["id"]), feed)  # A new zoom starts a new stream.
+        self.assertEqual(feed.wanted_at, 0)
+        self.assertIsNone(app.read_cameras()[0]["crop"])
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
+    def test_zoom_filter_runs_in_ffmpeg(self):
+        done = subprocess.run([shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=21",
+                               "-frames:v", "1", "-vf", app.camera_filter([0.2135, 0.1157, 0.5208, 0.6944]), "-c:v", "mjpeg", "-f", "image2pipe", "-"],
+                              capture_output=True, timeout=30)
+        self.assertEqual(done.stdout[:2], b"\xff\xd8", done.stderr)
 
     def test_listed_and_linked_like_a_printer_camera(self):
         app.camera_settings(None, {"action": "add", "url": self.URL, "name": "Enclosure"})
