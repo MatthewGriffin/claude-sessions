@@ -44,6 +44,7 @@ import secrets
 import socket
 import socketserver
 import shutil
+import signal
 import ssl
 import struct
 import subprocess
@@ -928,6 +929,10 @@ class Monitor:
             changed = True
         self.retired_ids = set()
         for session in sessions:
+            if session.get("startedBy"):
+                # Started by another session to be thrown away once it reports back: never offered again.
+                changed = entries.pop(session["id"], None) is not None or changed
+                continue
             transcript = self.transcripts.get(session["id"])
             if not transcript or not transcript.path:
                 continue
@@ -2826,7 +2831,9 @@ def asked_questions(tool_input):
 
 def given_answers(asked, result, text, failed):
     """The user's answer to each question, in order, or a note when none was given."""
-    answers = (result or {}).get("answers") if isinstance((result or {}).get("answers"), dict) else {}
+    # A rejected or failed question's result is plain text (such as "Error: The user doesn't want to proceed").
+    result = result if isinstance(result, dict) else {}
+    answers = result.get("answers") if isinstance(result.get("answers"), dict) else {}
     found = []
     for item in asked:
         answer = answers.get(item["question"])
@@ -5300,6 +5307,24 @@ def end_session(monitor, request):
     return True, "Ended."
 
 
+def end_started(monitor, request):
+    """End a session that another session started, from its starter's page. It isn't the app's own,
+    so it's asked to stop as any program would be (SIGTERM), which Claude Code handles by exiting."""
+    session = monitor.current(str(request.get("id", "")))
+    if not session:
+        return False, "That session is no longer running."
+    if not session.get("startedBy") or WINDOWS:
+        return False, "Only sessions started by another session can be ended here."
+    if session["hosted"]:
+        return end_session(monitor, request)
+    try:
+        os.kill(int(session["pid"]), signal.SIGTERM)
+    except (OSError, ValueError, TypeError) as exc:
+        return False, f"Could not end it: {clean(exc)}"
+    monitor.invalidate()
+    return True, "Ended."
+
+
 def open_terminal(monitor, request):
     session = monitor.current(str(request.get("id", "")))
     if not session:
@@ -5627,6 +5652,7 @@ POST_ROUTES = {
     "/api/sessions/update": update_app,
     "/api/sessions/restart-app": restart_app,
     "/api/sessions/context": recheck_context,
+    "/api/sessions/end-started": end_started,
     "/api/sessions/rename": rename_session,
     "/api/sessions/new": start_session,
     "/api/sessions/send": send_reply,
@@ -6449,6 +6475,9 @@ dialog::backdrop{background:#0009}
 #reqBox[hidden]{display:none}
 #btwBox{flex:1 1 0;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:10px;font-size:13px;align-content:start}
 #btwBox[hidden]{display:none}
+#startedBox{padding:12px 16px 0;display:grid;gap:8px;font-size:13px}#startedBox[hidden]{display:none}#startedBox h3{margin:0;font-size:13px}
+.startedrow{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.startedrow .note{flex-basis:100%;color:var(--dim);font-size:12px;overflow-wrap:anywhere}.startedrow button{font-size:12px;padding:3px 8px}
 #replyDraft{font-size:12px;color:var(--dim);margin:4px 0 0}#replyDraft[hidden]{display:none}#replyDraft button{font-size:12px;padding:2px 8px;margin-left:4px}
 #cmdHist{display:grid;grid-template-columns:minmax(0,1fr);gap:10px}
 #panelLive{border:1px solid var(--line);border-radius:8px;padding:10px;display:grid;gap:8px;background:var(--card)}
@@ -6663,7 +6692,7 @@ textarea{min-height:110px;resize:vertical}
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
 <dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="replyDraft" hidden><span id="replyDraftText"></span> <button id="replyDraftClear" type="button">Empty its input box</button></div><div id="queue" hidden></div>
-<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Slash commands: what they showed, side questions (/btw), and any panel open now" hidden>Commands</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabContext" type="button" role="tab" title="What fills this session's context window">Context</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Commands" hidden><section id="panelLive" aria-label="Panel open on its screen" hidden><h3 id="panelTitle"></h3><div class="reqnote">A command has this panel open on the session’s screen. Use the buttons as you would the keys. Messages wait in the queue until it closes.</div><pre id="panelText"></pre><div id="panelOpts" class="panelbtns"></div><div id="panelKeys" class="panelbtns"></div><form id="panelType"><input id="panelTypeText" aria-label="Type into the panel" placeholder="Type into it, such as to search or filter" maxlength="200" autocomplete="off"><button type="submit">Type</button></form><div id="panelErr" class="err"></div></section><div id="cmdHist"></div></div><div id="ctxBox" aria-label="Context" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
+<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Slash commands: what they showed, side questions (/btw), and any panel open now" hidden>Commands</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabContext" type="button" role="tab" title="What fills this session's context window">Context</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Commands" hidden><section id="panelLive" aria-label="Panel open on its screen" hidden><h3 id="panelTitle"></h3><div class="reqnote">A command has this panel open on the session’s screen. Use the buttons as you would the keys. Messages wait in the queue until it closes.</div><pre id="panelText"></pre><div id="panelOpts" class="panelbtns"></div><div id="panelKeys" class="panelbtns"></div><form id="panelType"><input id="panelTypeText" aria-label="Type into the panel" placeholder="Type into it, such as to search or filter" maxlength="200" autocomplete="off"><button type="submit">Type</button></form><div id="panelErr" class="err"></div></section><div id="cmdHist"></div></div><div id="ctxBox" aria-label="Context" hidden></div><div id="startedBox" aria-label="Sessions it started" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
 <ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p>
@@ -6970,8 +6999,10 @@ function update(c,s){
   const row=el('div','sub started',c.subs);
   el('i','',row).style.background=c.office.color('session-'+t.id);
   el('span','',row,'Session it started: '+t.name);
-  el('small','',row,(t.status==='busy'?(t.now||t.last||'working'):t.status==='waiting'?'needs you':'idle')+' \u00b7 its own card');
-  row.title='A separate Claude Code session started by this one. Open its own card to see or reply to it.';
+  el('small','',row,t.status==='busy'?(t.now||t.last||'working'):t.status==='waiting'?'needs you':'idle');
+  row.title='A separate Claude Code session started by this one. Click to open its chat.';
+  row.style.cursor='pointer';
+  row.addEventListener('click',e=>{e.stopPropagation();const k=cards.get(t.id);if(k)openHistory(k.session)});
  }
  const done=[];
  for(const a of s.subagents){
@@ -7239,6 +7270,7 @@ function layoutPreview(){
  box.hidden=!has||(!roomy&&tab!=='preview');
  $('histChanges').hidden=tab!=='files';
  $('agentList').hidden=tab!=='agents';
+ $('startedBox').hidden=tab!=='agents'||!startedShown;
  $('reqBox').hidden=tab!=='requests';
  $('btwBox').hidden=tab!=='btw';
  $('ctxBox').hidden=tab!=='context';
@@ -7468,6 +7500,8 @@ async function refresh(){
   for(const s of d.sessions){
    if(!cards.has(s.id)){const c=makeCard(s);cards.set(s.id,c);gridEl.appendChild(c.root)}
    update(cards.get(s.id),s);
+   // Started by another session to be thrown away once it reports back: it lives on its starter's page.
+   cards.get(s.id).root.hidden=!!s.startedBy;
   }
   noticeVersion(d);
   noticeRelease(d);
@@ -7611,11 +7645,14 @@ function updateFoot(s){
  $('histCtx').textContent=contextText(s);
  if($('histModel').textContent!==(s.model||''))$('histModel').textContent=s.model||'';
  $('histModel').title=modelTitle(s);
- const working=s.subagents.filter(a=>a.state==='working').length;
- const label='Subagents ('+(working?working+' working':s.subagents.length)+')';
- $('histAgents').hidden=!s.subagents.length;
- if($('histAgents').textContent!==label){$('histAgents').textContent=label;$('tabAgents').textContent=label}
- if(agentCount!==s.subagents.length){agentCount=s.subagents.length;layoutPreview()}
+ const started=s.started||[];
+ const working=s.subagents.filter(a=>a.state==='working').length+started.filter(t=>t.status==='busy').length;
+ const total=s.subagents.length+started.length;
+ const label=(started.length?'Subagents & sessions':'Subagents')+' ('+(working?working+' working':total)+')';
+ $('histAgents').hidden=!total;
+ if($('histAgents').textContent!==label){$('histAgents').textContent=label;$('tabAgents').textContent=singleColumn.matches&&started.length?'Agents ('+(working?working+' working':total)+')':label}
+ renderStarted(started);
+ if(agentCount!==total){agentCount=total;layoutPreview()}
  $('histName').textContent=s.name;
  const a=s.attention||{},permission=s.status==='waiting'&&a.kind==='permission',waiting=s.status==='waiting'&&!s.panel;
  $('histTerm').hidden=!(s.hosted||s.job);
@@ -8154,14 +8191,40 @@ function agentCard(a,open){
  });
  return card;
 }
+// Sessions this one started (such as Claude's tests in their own terminal). They're kept off the main
+// page while it runs, as they're meant to be ended once they report back.
+let startedShown=0,startedSig='';
+function renderStarted(list){
+ const sig=JSON.stringify(list.map(t=>[t.id,t.name,t.status,t.now,t.last]));
+ if(sig===startedSig)return;
+ startedSig=sig;startedShown=list.length;
+ const box=$('startedBox'),rows=[];
+ if(list.length){
+  rows.push(el('h3','',null,list.length+' session'+(list.length===1?'':'s')+' it started'));
+  rows.push(el('div','note',null,'Separate Claude Code sessions this one started, such as tests in their own terminal. They\u2019re meant to be ended once they report back, so they stay here rather than on the main page or in the sessions to resume.'));
+ }
+ for(const t of list){
+  const row=el('div','startedrow');
+  el('b','',row,t.name);
+  el('span','pill '+t.status,row,t.status==='waiting'?'needs you':t.status);
+  el('div','note',row,t.status==='busy'?(t.now||t.last||'working'):t.last?'last: '+t.last:'no activity yet');
+  const open=el('button','',row,'Open its chat');open.type='button';
+  open.addEventListener('click',()=>{const k=cards.get(t.id);if(k)openHistory(k.session)});
+  const end=el('button','deny',row,'End');end.type='button';
+  end.addEventListener('click',async()=>{if(confirm('End '+t.name+'? Anything it is doing stops.')){try{const d=await post('end-started',{id:t.id});if(d.error)alert(d.error)}catch(e){}refresh()}});
+  rows.push(row);
+ }
+ box.replaceChildren(...rows);
+ layoutPreview();
+}
 function renderAgents(agents){
  const box=$('agentList'),keep=box.scrollTop,opened=new Map();
  for(const card of box.querySelectorAll('.agent'))opened.set(card.dataset.id,new Set([...card.querySelectorAll('details[open]')].map(d=>d.dataset.seq)));
  const working=agents.filter(a=>a.state==='working');
- const rows=[el('h3','',null,agents.length+' subagent'+(agents.length===1?'':'s')+(working.length?' · '+working.length+' working':''))];
+ const rows=agents.length||!startedShown?[el('h3','',null,agents.length+' subagent'+(agents.length===1?'':'s')+(working.length?' · '+working.length+' working':''))]:[];
  // Newest first, since that's the one most likely to be of interest.
  for(const a of [...agents].reverse())rows.push(agentCard(a,opened.get(a.id)||new Set()));
- if(!agents.length)rows.push(el('div','note',null,'None running or kept for this chat.'));
+ if(!agents.length&&!startedShown)rows.push(el('div','note',null,'None running or kept for this chat.'));
  box.replaceChildren(...rows);
  box.scrollTop=keep;
 }
@@ -8232,7 +8295,7 @@ function openHistory(s,fromUrl){
  setRenaming(false);
  $('histBody').replaceChildren();shownMessages=[];$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
- $('replyErr').textContent='';$('replyText').value='';pendingImages=[];$('replySlow').textContent='';pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;$('cmdHist').replaceChildren();$('btwBox').hidden=true;btwCount=0;panelShown='';$('panelLive').hidden=true;$('panelLive').dataset.shown='';$('ctxBox').replaceChildren();lastContext=null;
+ $('replyErr').textContent='';$('replyText').value='';pendingImages=[];$('replySlow').textContent='';pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('startedBox').replaceChildren();startedShown=0;startedSig='';$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;$('cmdHist').replaceChildren();$('btwBox').hidden=true;btwCount=0;panelShown='';$('panelLive').hidden=true;$('panelLive').dataset.shown='';$('ctxBox').replaceChildren();lastContext=null;
  updateFoot(s);
  let saved=null;try{saved=localStorage.getItem('filesOpen')}catch(e){}
  setFilesOpen(!singleColumn.matches&&(saved?saved==='1':innerWidth>=1100),false);  // On a phone, the chat comes first.

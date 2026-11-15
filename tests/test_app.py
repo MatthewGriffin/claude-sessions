@@ -1518,6 +1518,8 @@ class QuestionTests(unittest.TestCase):
         text = 'User has answered your questions: "Which colour?"="Green, please", "Which size?"="L".'
         self.assertEqual(app.given_answers(asked, None, text, False), {"list": ["Green, please", "L"]})
         self.assertEqual(app.given_answers(asked, None, "The user declined to answer.", True)["note"], "Not answered: The user declined to answer.")
+        # A rejected question's result is plain text, not a dict.
+        self.assertIn("note", app.given_answers(asked, "Error: The user doesn't want to proceed", "rejected", True))
 
 
 class TickBoxAnswerTests(unittest.TestCase):
@@ -1717,6 +1719,18 @@ class StartedSessionTests(unittest.TestCase):
         self.assertEqual(sessions[1]["startedBy"], {"id": "lead", "name": "Lead"})
         self.assertEqual([(t["id"], t["status"], t["last"]) for t in sessions[0]["started"]], [("test", "idle", "Read a file")])
         self.assertIsNone(sessions[2]["startedBy"])
+
+    def test_never_remembered(self):
+        monitor = app.Monitor()
+        saved = {}
+        known = {"remember": True, "sessions": {"test": {"id": "test", "seen": time.time()}}}
+        monitor.transcripts = {"lead": types.SimpleNamespace(path="/x/lead.jsonl", permission_mode="", resume_model=None),
+                               "test": types.SimpleNamespace(path="/x/test.jsonl", permission_mode="", resume_model=None)}
+        sessions = [{"id": "lead", "name": "Lead", "cwd": "/x", "title": "", "startedBy": None},
+                    {"id": "test", "name": "Test", "cwd": "/x", "title": "", "startedBy": {"id": "lead", "name": "Lead"}}]
+        with mock.patch.object(app, "read_known", lambda: known), mock.patch.object(app, "write_known", saved.update):
+            monitor._update_known(sessions)
+        self.assertEqual(set(saved["sessions"]), {"lead"})
 
     @unittest.skipIf(sys.platform == "win32", "reads /proc")
     def test_reads_this_process(self):
