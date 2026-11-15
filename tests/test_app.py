@@ -1912,16 +1912,79 @@ class EmulatorGuardTests(unittest.TestCase):
 
     def test_setup_installs_it_once(self):
         with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "settings.json"), "w", encoding="utf-8") as handle:
+                handle.write('{"note": "a \u2014 b"}\n')
             with mock.patch.object(app, "SETTINGS_FILE", os.path.join(folder, "settings.json")), \
                     mock.patch.object(app, "CONFIG_DIR", folder), mock.patch.object(app, "WINDOWS", False), \
                     mock.patch.object(app.os.path, "exists", lambda path: True if "applications" in str(path) else os.path.lexists(path)):
                 for _ in range(2):
                     app.run_setup(verbose=False)
-                with open(os.path.join(folder, "settings.json")) as handle:
-                    groups = json.load(handle)["hooks"]["PreToolUse"]
+                with open(os.path.join(folder, "settings.json"), encoding="utf-8") as handle:
+                    text = handle.read()
+                groups = json.loads(text)["hooks"]["PreToolUse"]
+        self.assertIn("a \u2014 b", text)  # Kept as written, not turned into an escape.
         guards = [h for g in groups for h in g["hooks"] if "--emulator-guard" in h["command"]]
         self.assertEqual(len(guards), 1)
         self.assertEqual((guards[0]["if"], groups[0]["matcher"]), ("Bash(*emulator*)", "Bash"))
+
+
+class SkillTrimmingTests(unittest.TestCase):
+    """Skills a CLI session can't use are switched off, and back on when that changes, without touching the user's own."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        synced = os.path.join(self.folder, "skills", "synced", "org_user")
+        for name, description in {"desk": "Use in the desktop app, whose tools are named mcp__Desk__* there.",
+                                  "chrome-browser": "Uses tools named mcp__claude-in-chrome__*.",
+                                  "plain": "Reads PDFs.", "google-workspace": "Google files."}.items():
+            os.makedirs(os.path.join(synced, name))
+            with open(os.path.join(synced, name, "SKILL.md"), "w") as handle:
+                handle.write(f"---\nname: {name}\ndescription: \"{description}\"\n---\nBody")
+        self.patches = [mock.patch.object(app, "CONFIG_DIR", self.folder), mock.patch.object(app, "SETTINGS_FILE", os.path.join(self.folder, "settings.json")),
+                        mock.patch.object(app, "SKILLS_FILE", os.path.join(self.folder, "skills_off.json")),
+                        mock.patch.object(app, "connected_connectors", lambda: ["claude.ai Claude Docs"])]
+        for patch in self.patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def report(self, tools=()):
+        names = ["anthropic-skills:" + n for n in ("desk", "chrome-browser", "plain", "google-workspace")]
+        return {"skills": names, "tools": ["Bash", "Read"] + list(tools), "mcp_servers": []}
+
+    def test_which_are_unusable(self):
+        off = app.unusable_skills(self.report())
+        self.assertEqual(sorted(off), ["anthropic-skills:desk", "anthropic-skills:google-workspace"])  # Not plain, nor chrome-browser (--chrome).
+        self.assertEqual(app.unusable_skills(self.report(["mcp__Desk__open"])).keys(), {"anthropic-skills:google-workspace"})
+        with mock.patch.object(app, "connected_connectors", lambda: ["claude.ai Google Drive"]):
+            self.assertEqual(app.unusable_skills(self.report(["mcp__Desk__open"])), {})
+
+    def test_settings_change_only_what_is_the_apps(self):
+        path = os.path.join(self.folder, "settings.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"theme": "dark \u2014 x", "skillOverrides": {"mine": "name-only"}}, handle)
+        read = lambda: json.load(open(path, encoding="utf-8"))
+        self.assertEqual(app.apply_skill_overrides({"a": "why", "mine": "why"}), (["a"], []))
+        self.assertEqual(read()["skillOverrides"], {"mine": "name-only", "a": "off"})  # The user's own is left as it was.
+        self.assertEqual(app.apply_skill_overrides({"a": "why"}), ([], []))  # Nothing new.
+        self.assertEqual(app.apply_skill_overrides({}), ([], ["a"]))  # Usable again: back on, and only that one.
+        self.assertEqual(read()["skillOverrides"], {"mine": "name-only"})
+        self.assertIn("\u2014", open(path, encoding="utf-8").read())
+        # Changed by hand since: no longer the app's to undo.
+        app.apply_skill_overrides({"b": "why"})
+        settings = read()
+        settings["skillOverrides"]["b"] = "name-only"
+        json.dump(settings, open(path, "w", encoding="utf-8"))
+        self.assertEqual(app.apply_skill_overrides({}), ([], []))
+        self.assertEqual(read()["skillOverrides"]["b"], "name-only")
+
+    def test_nothing_left_removes_the_setting(self):
+        path = os.path.join(self.folder, "settings.json")
+        with open(path, "w") as handle:
+            json.dump({"theme": "dark"}, handle)
+        app.apply_skill_overrides({"a": "why"})
+        app.apply_skill_overrides({})
+        self.assertEqual(json.load(open(path)), {"theme": "dark"})
 
 
 class PreviewTests(unittest.TestCase):

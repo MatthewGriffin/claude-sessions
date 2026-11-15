@@ -6000,6 +6000,164 @@ def run_context_hook():
     return 0
 
 
+# Skills that can't work in a Claude Code session still cost tokens: each is listed, name and description,
+# in every session. Claude Code can switch one off for all sessions (settings.json "skillOverrides", "off"
+# hides it from the model and from /name). This app does that for the skills a CLI session has no way to use,
+# found from what a CLI session really has (its start-up report lists its tools and connected connectors),
+# and switches them back on when that changes, such as when a connector is added. Only the ones it switched
+# off itself are ever switched back on, and a skill the user has an override for is left alone.
+SKILL_TOOL_PREFIX = re.compile(r"(mcp__[A-Za-z0-9_.-]*?)\*")
+# Skills that need a connector, by a pattern for its name (the claude.ai connectors are named like
+# "claude.ai Google Drive"). Their text doesn't name tools, so these are known by hand.
+SKILL_CONNECTORS = {"google-workspace": r"google", "morning": r"calendar|gmail|outlook|slack|teams", "import-memory": r"memory"}
+# Needs tools the CLI only has with `claude --chrome`, which it supports, so it stays listed.
+SKILL_KEEP = {"chrome-browser"}
+SKILLS_CHECK_SECONDS = 3600
+SKILLS_FILE = os.path.join(MONITOR_DIR, "skills_off.json")  # The skills this app switched off.
+
+
+def skill_text(name):
+    """The description of a user or synced skill, from its SKILL.md, or ""."""
+    bare = name.split(":")[-1]
+    paths = glob.glob(os.path.join(glob.escape(CONFIG_DIR), "skills", "synced", "*", glob.escape(bare), "SKILL.md"))
+    paths.append(os.path.join(CONFIG_DIR, "skills", bare, "SKILL.md"))
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                head = handle.read(6000)
+        except OSError:
+            continue
+        match = re.search(r"^description:\s*(.*?)(?=^[A-Za-z_-]+:|^---)", head, re.S | re.M)
+        return match.group(1) if match else ""
+    return ""
+
+
+def connected_connectors():
+    """The claude.ai connectors this account has connected in Claude Code, by name ("claude.ai Claude Docs")."""
+    folder = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~")
+    try:
+        with open(os.path.join(folder, ".claude.json"), encoding="utf-8") as handle:
+            names = json.load(handle).get("claudeAiMcpEverConnected", [])
+        return [n for n in names if isinstance(n, str)]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def unusable_skills(report):
+    """{skill name: why} for each skill a CLI session with this start-up report can't use. The report is
+    Claude Code's own: its skills, its tool names and its connectors."""
+    tools = [t for t in report.get("tools", []) if isinstance(t, str)]
+    servers = [x for x in report.get("mcp_servers", []) if isinstance(x, dict)]
+    # A quick headless run reports connectors as "pending" before they connect, so the connectors the account
+    # has are also read from the list Claude Code keeps of those it has connected.
+    have = " ".join([t for t in tools if t.startswith("mcp__")] + [str(x.get("name", "")) for x in servers] + connected_connectors())
+    found = {}
+    for name in report.get("skills", []):
+        if not isinstance(name, str) or name.split(":")[-1] in SKILL_KEEP:
+            continue
+        bare = name.split(":")[-1]
+        prefixes = SKILL_TOOL_PREFIX.findall(skill_text(name))
+        if prefixes and not any(t.startswith(p) for p in prefixes for t in tools):
+            found[name] = "its tools (" + ", ".join(p + "*" for p in prefixes[:3]) + ") aren't in a CLI session"
+        elif bare in SKILL_CONNECTORS and not re.search(SKILL_CONNECTORS[bare], have, re.I):
+            found[name] = "it needs a connector that isn't connected"
+    return found
+
+
+def skills_report(cwd=None):
+    """Claude Code's start-up report (skills, tools, connectors) from a headless run that makes no request
+    to the model, or None."""
+    command = ["claude", "-p", "/context", "--output-format", "stream-json", "--verbose", "--no-session-persistence"]
+    try:
+        process = subprocess.Popen(command, cwd=cwd or MONITOR_DIR, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    helper_pids.add(process.pid)
+    try:
+        out, _ = process.communicate(timeout=CONTEXT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        return None
+    finally:
+        helper_pids.discard(process.pid)
+    for line in out.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("type") == "system" and entry.get("subtype") == "init":
+            # Without Claude Code's own tools there is nothing to judge from.
+            return entry if len(entry.get("tools", [])) > 5 and entry.get("skills") else None
+    return None
+
+
+def apply_skill_overrides(off):
+    """Switch the skills in off ({name: why}) off in settings.json, and switch back on those this app
+    switched off before that are usable now. Returns what changed: (switched off, switched on)."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as handle:
+            settings = json.load(handle)
+    except (OSError, ValueError):
+        return [], []  # No settings to change, or not readable (maybe being written).
+    try:
+        with open(SKILLS_FILE, encoding="utf-8") as handle:
+            mine = set(json.load(handle))
+    except (OSError, ValueError, TypeError):
+        mine = set()
+    if not isinstance(settings, dict) or not isinstance(settings.get("skillOverrides", {}), dict):
+        return [], []
+    overrides = settings.setdefault("skillOverrides", {})
+    turned_off, turned_on = [], []
+    for name in sorted(off):
+        if name not in overrides:  # One the user has set is theirs.
+            overrides[name] = "off"
+            mine.add(name)
+            turned_off.append(name)
+    for name in sorted(mine - set(off)):
+        if overrides.get(name) == "off":
+            del overrides[name]
+            turned_on.append(name)
+        mine.discard(name)
+    mine &= {n for n, v in overrides.items() if v == "off"}  # Changed by hand since: no longer this app's to undo.
+    if not overrides:
+        del settings["skillOverrides"]
+    if turned_off or turned_on:
+        temporary = f"{SETTINGS_FILE}.{os.getpid()}"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(temporary, SETTINGS_FILE)
+    write_json_file(SKILLS_FILE, sorted(mine))
+    return turned_off, turned_on
+
+
+def trim_skills(verbose=False):
+    """Work out which skills a CLI session can't use and switch them off (or back on). Returns the
+    (switched off, switched on) lists, or None if Claude Code's report couldn't be read."""
+    report = skills_report()
+    if not report:
+        return None
+    off = unusable_skills(report)
+    changed = apply_skill_overrides(off)
+    if verbose:
+        for name, why in sorted(off.items()):
+            print(f"{name}: off, because {why}")
+        print(f"Switched off: {', '.join(changed[0]) or 'nothing new'}. Switched back on: {', '.join(changed[1]) or 'nothing'}.")
+    return changed
+
+
+def run_skill_trimming():
+    """Keep skills a CLI session can't use switched off, checking again now and then."""
+    while True:
+        try:
+            trim_skills()
+        except Exception as exc:  # This thread has to outlive any one failure.
+            print(f"claude-monitor: skill check failed: {clean(exc)}", file=sys.stderr, flush=True)
+        time.sleep(SKILLS_CHECK_SECONDS)
+
+
 def hook_session_is_started():
     """Whether the Claude Code process running this hook was started by another session, such as a test
     Claude starts in its own terminal. Those are meant to be thrown away once they report back, and their
@@ -9371,6 +9529,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
     threading.Thread(target=releases.watch, daemon=True).start()
     threading.Thread(target=run_queue_delivery, args=(monitor,), daemon=True).start()
     threading.Thread(target=installed_commands, daemon=True).start()  # Reading Claude Code takes a few seconds.
+    threading.Thread(target=run_skill_trimming, daemon=True).start()
     phone["handler"] = type("PhoneHandler", (Handler,), {"on_phone": True})
     if phone_settings()["enabled"]:
         threading.Thread(target=start_phone_on_launch, daemon=True).start()
@@ -9563,7 +9722,7 @@ def run_setup(verbose=True):
                 handle.write(original)
         temporary = f"{SETTINGS_FILE}.{os.getpid()}"
         with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(settings, handle, indent=2)
+            json.dump(settings, handle, indent=2, ensure_ascii=False)  # As Claude Code writes it, not as \u2014 escapes.
             handle.write("\n")
         os.replace(temporary, SETTINGS_FILE)
         say(f"Updated {SETTINGS_FILE}: {', '.join(added)}. Sessions started from now on use them.")
@@ -9791,6 +9950,7 @@ def main():
     parser.add_argument("--hook", action="store_true", help="handle a Claude Code hook event from stdin")
     parser.add_argument("--context", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--emulator-guard", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--trim-skills", action="store_true", help="switch off the skills a Claude Code session can't use, and show which")
     parser.add_argument("--preview", action="store_true", help="for a session: save a picture of each preview beside its chat")
     parser.add_argument("--statusline", action="store_true", help="status line for Claude Code that also feeds this app")
     parser.add_argument("--setup", action="store_true", help="add this app's hooks (and a status line, if none) to Claude Code")
@@ -9803,6 +9963,8 @@ def main():
         return run_context_hook()
     if args.emulator_guard:
         return run_emulator_guard()
+    if args.trim_skills:
+        return 0 if trim_skills(verbose=True) is not None else 1
     if args.preview:
         return run_preview()
     if args.statusline:
