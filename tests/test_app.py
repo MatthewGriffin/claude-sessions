@@ -1780,6 +1780,28 @@ class InputBoxTests(unittest.TestCase):
         self.assertEqual(typed, [("new", ""), ("new", None)])  # Changed since: added after it, as typing there would.
 
 
+class CommandOptionTests(unittest.TestCase):
+    """Values offered after a command's name, from Claude Code's own hints or known lists."""
+
+    def test_hints(self):
+        cases = {"[on|off]": ["on", "off"], "[auto|<tokens>]": ["auto"], "[all]": ["all"], "<model>": [], "[name]": [],
+                 "[reconnect|enable|disable [<server>|all]]": ["reconnect", "enable", "disable"],
+                 "[<condition> | clear]": ["clear"], "[codex|gemini|cursor] [--dry-run]": ["codex", "gemini", "cursor"]}
+        for hint, words in cases.items():
+            self.assertEqual(app.hint_alternatives(hint), words, hint)
+
+    def test_known_lists(self):
+        with tempfile.TemporaryDirectory() as folder:
+            styles = os.path.join(folder, ".claude", "output-styles")
+            os.makedirs(styles)
+            with open(os.path.join(styles, "terse.md"), "w") as handle:
+                handle.write("---\nname: Terse\ndescription: Short answers\n---\nBe brief.")
+            self.assertIn({"value": "Terse", "description": "Short answers"}, app.command_options("output-style", "[style]", folder))
+        self.assertEqual([o["value"] for o in app.command_options("model", "<model>", "/")][:3], ["default", "opus", "sonnet"])
+        self.assertEqual([o["value"] for o in app.command_options("effort", app.BUILTIN_HINTS["effort"], "/")],
+                         ["low", "medium", "high", "xhigh", "max", "auto"])
+
+
 class PreviewTests(unittest.TestCase):
     """A session can see the previews beside its chat, and is told about them once."""
 

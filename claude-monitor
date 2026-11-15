@@ -169,7 +169,7 @@ BUILTIN_COMMANDS = [
     ("context", "", "Show what is using the context window"),
     ("diff", "", "View uncommitted changes and what each turn changed"),
     ("doctor", "", "Check the Claude Code installation"),
-    ("effort", "", "Set the effort level"),
+    ("effort", "[low|medium|high|xhigh|max|auto]", "Set the effort level"),
     ("exit", "", "End this session"),
     ("export", "[filename]", "Export the conversation to a file"),
     ("fast", "", "Turn fast mode on or off"),
@@ -767,6 +767,77 @@ def link_started_sessions(sessions):
                                   "quiet": session.get("quiet")})
 
 
+# The values a command's argument can take, for the reply box to offer once its name is typed. Most come
+# from Claude Code's own hint ("[on|off]"). /model's hint is just "<model>", so its values are the
+# aliases Claude Code takes, with the words its own /model menu uses.
+BUILTIN_HINTS = {"effort": "[low|medium|high|xhigh|max|auto]"}
+KNOWN_OPTIONS = {
+    "model": [("default", "Default (recommended) model"), ("opus", "Opus: for complex work and everyday tasks"),
+              ("sonnet", "Sonnet: most efficient for simpler tasks"), ("haiku", "Haiku: fastest for quick answers"),
+              ("fable", "Fable: for your toughest challenges"), ("opusplan", "Opus to plan, Sonnet to do the work")],
+    "output-style": [("default", "Claude Code's usual style"), ("explanatory", "Explains its choices as it works"),
+                     ("learning", "Leaves parts for you to write, to learn by doing")],
+}
+OPTION_WORD = re.compile(r"^[A-Za-z][\w.-]*$")
+
+
+def hint_alternatives(hint):
+    """The plain words of the first [a|b|c] or <a|b> group of a hint: "[auto|<tokens>]" gives ["auto"]."""
+    match = re.search(r"[\[<]", hint or "")
+    if not match:
+        return []
+    depth, part, parts = 0, "", []
+    for char in hint[match.start():]:
+        if char in "[<":
+            depth += 1
+            if depth == 1:
+                continue
+        elif char in "]>":
+            depth -= 1
+            if depth == 0:
+                break
+        if char == "|" and depth == 1:
+            parts.append(part)
+            part = ""
+        else:
+            part += char
+    parts.append(part)
+    words = [p.strip().split()[0] for p in parts if p.strip()]
+    return [w for w in words if OPTION_WORD.match(w)] if len(parts) > 1 or words and OPTION_WORD.match(words[0]) and words[0] in ("all", "open", "clear") else []
+
+
+def output_styles(cwd):
+    """Custom output styles: Markdown files in ~/.claude/output-styles and the project's, by their name."""
+    found = []
+    for folder in (os.path.join(CONFIG_DIR, "output-styles"), os.path.join(cwd, ".claude", "output-styles")):
+        for path in sorted(glob.glob(os.path.join(glob.escape(folder), "*.md")))[:50]:
+            try:
+                with open(path, encoding="utf-8", errors="replace") as handle:
+                    head = handle.read(2000)
+            except OSError:
+                continue
+            name = re.search(r"^name:\s*(.+?)\s*$", head, re.M)
+            about = re.search(r"^description:\s*(.+?)\s*$", head, re.M)
+            found.append((clean(name.group(1) if name else os.path.basename(path)[:-3])[:60],
+                          clean(about.group(1) if about else "Your own output style")[:120]))
+    return found
+
+
+def command_options(name, hint, cwd):
+    """[{value, description}] for a built-in command's argument, or [] when it's free text."""
+    pairs = list(KNOWN_OPTIONS.get(name, []))
+    if name == "output-style":
+        pairs += output_styles(cwd)
+    if not pairs:
+        pairs = [(word, "") for word in hint_alternatives(hint)]
+    seen, options = set(), []
+    for value, about in pairs:
+        if value.lower() not in seen:
+            seen.add(value.lower())
+            options.append({"value": value, "description": about})
+    return options
+
+
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
 AGENTS_RECHECK_SECONDS = 30
 # Statuses in Claude Code's session files, as `claude agents` reports them.
@@ -1158,6 +1229,13 @@ class Monitor:
             found[name] = {"name": name, "hint": "", "description": clean(text)[:200], "source": "skill"}
         for command in custom_commands(session.get("cwd") or ""):
             found[command["name"]] = command
+        for command in found.values():
+            if command["source"] == "built-in":
+                if not command["hint"] and BUILTIN_HINTS.get(command["name"]):
+                    command["hint"] = BUILTIN_HINTS[command["name"]]  # Worked out at run time, so the scan misses it.
+                options = command_options(command["name"], command["hint"], session.get("cwd") or "")
+                if options:
+                    command["options"] = options
         return sorted(found.values(), key=lambda c: c["name"])
 
     def history(self, session_id, limit=HISTORY_LIMIT, since=None):
@@ -8649,7 +8727,24 @@ async function loadCommands(){
  }catch(e){}
 }
 function closeCommands(){commandMatches=[];$('cmdList').hidden=true;$('replyText').removeAttribute('aria-activedescendant')}
+// After a command and a space, the values its argument can take, such as /model's models.
+function argumentMatches(){
+ const m=/^\/([\w.:-]+) (\S*)$/.exec($('replyText').value);
+ if(!m||commandsFor!==histSession)return null;
+ const c=commandList.find(c=>c.name.toLowerCase()===m[1].toLowerCase());
+ if(!c||!c.options||!c.options.length)return null;
+ const q=m[2].toLowerCase(),rank=o=>{const v=o.value.toLowerCase();return v.startsWith(q)?0:v.includes(q)||o.description.toLowerCase().includes(q)?1:2};
+ const found=c.options.filter(o=>rank(o)<2).sort((a,b)=>rank(a)-rank(b));
+ if(!found.length||(found.length===1&&found[0].value.toLowerCase()===q))return [];
+ return found.map(o=>({arg:true,command:c.name,name:o.value,hint:'',description:o.description,source:'built-in'}));
+}
 function showCommands(){
+ const args=argumentMatches();
+ if(args){
+  if(!args.length){closeCommands();return}
+  commandMatches=args;
+  return drawCommands();
+ }
  const m=/^\/([\w.:-]*)$/.exec($('replyText').value);
  if(!m||commandsFor!==histSession){closeCommands();return}
  const q=m[1].toLowerCase();
@@ -8657,10 +8752,13 @@ function showCommands(){
  const rank=c=>{const n=c.name.toLowerCase();return n.startsWith(q)?0:n.includes(q)?1:c.description.toLowerCase().includes(q)?2:3};
  commandMatches=commandList.filter(c=>rank(c)<3).sort((a,b)=>rank(a)-rank(b)||a.name.localeCompare(b.name));
  if(!commandMatches.length||(commandMatches.length===1&&commandMatches[0].name.toLowerCase()===q)){closeCommands();return}
+ drawCommands();
+}
+function drawCommands(){
  commandPick=Math.min(commandPick,commandMatches.length-1);
  $('cmdList').replaceChildren(...commandMatches.map((c,i)=>{
   const b=el('button','cmd');b.type='button';b.id='cmd-'+i;b.setAttribute('role','option');b.setAttribute('aria-selected',String(i===commandPick));
-  el('b','',b,'/'+c.name);el('span','cmdhint',b,c.hint);el('span','cmddesc',b,c.description);
+  el('b','',b,c.arg?c.name:'/'+c.name);el('span','cmdhint',b,c.arg?'/'+c.command:c.hint);el('span','cmddesc',b,c.description);
   if(c.source!=='built-in')el('span','cmdsrc',b,c.source);
   b.title=c.description;
   // Keep focus in the reply box, so typing carries on.
@@ -8674,8 +8772,9 @@ function showCommands(){
 }
 function pickCommand(i){
  const c=commandMatches[i];if(!c)return;
- const t=$('replyText');t.value='/'+c.name+' ';t.focus();t.setSelectionRange(t.value.length,t.value.length);
+ const t=$('replyText');t.value=c.arg?'/'+c.command+' '+c.name:'/'+c.name+' ';t.focus();t.setSelectionRange(t.value.length,t.value.length);
  closeCommands();
+ if(!c.arg)showCommands();  // A command whose argument has set values offers them straight away.
 }
 $('replyText').addEventListener('input',()=>{commandPick=0;showCommands()});
 $('replyText').addEventListener('focus',()=>{if(commandsFor!==histSession)loadCommands();else showCommands()});
@@ -8686,7 +8785,9 @@ $('replyText').addEventListener('keydown',e=>{
    e.preventDefault();commandPick=(commandPick+(e.key==='ArrowDown'?1:-1)+commandMatches.length)%commandMatches.length;showCommands();return;
   }
   // Enter on a complete command name sends it, as in the terminal. Otherwise it completes the pick.
-  const typed=$('replyText').value.slice(1).toLowerCase(),whole=commandList.some(c=>c.name.toLowerCase()===typed);
+  // Likewise a complete value after a command, such as "/model opus".
+  const typed=$('replyText').value.slice(1).toLowerCase(),arg=/^([\w.:-]+) (\S+)$/.exec(typed);
+  const whole=arg?commandMatches.some(c=>c.arg&&c.name.toLowerCase()===arg[2]):commandList.some(c=>c.name.toLowerCase()===typed);
   if(e.key==='Tab'||(e.key==='Enter'&&!e.shiftKey&&!whole)){e.preventDefault();pickCommand(commandPick);return}
   if(e.key==='Escape'){e.preventDefault();e.stopPropagation();closeCommands();return}
  }
