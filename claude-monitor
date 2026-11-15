@@ -839,6 +839,11 @@ class Monitor:
                 listed = sorted(json.loads(result.stdout), key=lambda s: s.get("startedAt", 0))
                 self.raw_sessions = [dict(s) for s in listed]
                 self.agents_at, self.agents_files = time.monotonic(), files
+            # Claude Code's "shell" (its turn is over, background shells still run) is "busy" to
+            # `claude agents`, so the files' own word is kept beside it.
+            for session in listed:
+                entry = (files or {}).get(session.get("pid")) or {}
+                session["fileStatus"] = entry.get("status") if entry.get("sessionId") == session.get("sessionId") else None
             self.sessions = listed
             names = read_names()
             for session in self.sessions:
@@ -990,7 +995,8 @@ class Monitor:
     def session_state(self, session):
         transcript = self.transcript(session)
         quiet = quiet_seconds(transcript)
-        if session.get("status") == "busy" and not transcript.pending and turn_ended(session, self.panes.get(session.get("pid"))):
+        if session.get("status") == "busy" and (session.get("fileStatus") == "shell" or (
+                not transcript.pending and turn_ended(session, self.panes.get(session.get("pid"))))):
             # Claude Code stays "busy" while a background task runs, though Claude is free. Treated
             # as busy, the session would hold every message and command until the task ended.
             session = {**session, "status": "idle", "heldBusy": True}

@@ -1110,6 +1110,22 @@ class SendNowTests(unittest.TestCase):
             json.dump({"kind": "permission", "at": 1001}, handle)
         self.assertFalse(app.turn_ended(session, "s1"))
 
+    def test_shell_status_counts_as_free(self):
+        # Claude Code says "shell" once its turn is over (or interrupted) while background shells run.
+        # An interrupt fires no Stop hook, so the file's word is all there is.
+        monitor = app.Monitor()
+        files = {7: {"sessionId": "s9", "status": "shell", "name": "x"}}
+        listed = [{"pid": 7, "sessionId": "s9", "status": "busy", "name": "x", "cwd": self.folder}]
+        with mock.patch.object(app, "read_session_files", lambda: files), \
+                mock.patch.object(monitor, "_from_session_files", lambda found: [dict(s) for s in listed]), \
+                mock.patch.object(app, "hosted_panes", lambda: {}):
+            monitor.refresh()
+            state = monitor.session_state(monitor.sessions[0])
+            self.assertEqual((state["status"], state["heldBusy"]), ("idle", True))
+            files[7]["status"] = "busy"
+            monitor.refresh()
+            self.assertEqual(monitor.session_state(monitor.sessions[0])["status"], "busy")
+
     def test_no_enter_if_a_menu_appears_while_typing(self):
         self.screens = [BOX.format(text=""), MENU]
         ok, _ = app.send_queued_now(self.monitor, {"id": "s1", "item": "a"})
