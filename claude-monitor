@@ -717,6 +717,55 @@ class Transcript:
         return states
 
 
+# A Claude Code session can start others, as Claude does for tests in their own terminal. Each is a
+# full session with its own card, but it also shows as a person in its starter's office. Claude Code
+# records no parent, but a session started from another's shell inherits that one's CLAUDE_PID and
+# CLAUDE_CODE_SESSION_ID, with CLAUDE_CODE_CHILD_SESSION=1. Linux only: Windows has no /proc.
+started_by_cache = {}  # (pid, start time) -> (parent pid, parent session id), or None.
+
+
+def started_by(pid):
+    """(parent pid, parent session id) of the session that started this process, or None."""
+    if WINDOWS or not isinstance(pid, int):
+        return None
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            key = (pid, handle.read().rsplit(b")", 1)[-1].split()[19])  # Start time, so a reused pid isn't mistaken.
+        if key not in started_by_cache:
+            with open(f"/proc/{pid}/environ", "rb") as handle:
+                env = dict(item.split(b"=", 1) for item in handle.read().split(b"\0") if b"=" in item)
+            parent_pid = env.get(b"CLAUDE_PID", b"").decode(errors="replace")
+            parent_id = env.get(b"CLAUDE_CODE_SESSION_ID", b"").decode(errors="replace")
+            started_by_cache[key] = ((int(parent_pid) if parent_pid.isdigit() else None, parent_id)
+                                     if env.get(b"CLAUDE_CODE_CHILD_SESSION") == b"1" and (parent_pid or parent_id) else None)
+            if len(started_by_cache) > 500:
+                started_by_cache.clear()
+        return started_by_cache[key]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def link_started_sessions(sessions):
+    """Give each session "startedBy" ({id, name}) and "started" (the sessions it started, briefly)."""
+    by_pid = {s.get("pid"): s for s in sessions}
+    by_id = {s["id"]: s for s in sessions}
+    for session in sessions:
+        session.setdefault("started", [])
+        session["startedBy"] = None
+    for session in sessions:
+        # Sessions this app starts are the user's, whatever the app's own environment says.
+        link = None if session.get("hosted") else started_by(session.get("pid"))
+        if not link:
+            continue
+        parent = by_pid.get(link[0]) or by_id.get(link[1])
+        if not parent or parent is session:
+            continue
+        session["startedBy"] = {"id": parent["id"], "name": parent["name"]}
+        parent["started"].append({"id": session["id"], "name": session["name"], "status": session["status"],
+                                  "now": session.get("now", ""), "last": (session.get("actions") or [""])[0],
+                                  "quiet": session.get("quiet")})
+
+
 SESSIONS_DIR = os.path.join(CONFIG_DIR, "sessions")
 AGENTS_RECHECK_SECONDS = 30
 # Statuses in Claude Code's session files, as `claude agents` reports them.
@@ -923,6 +972,7 @@ class Monitor:
                         session["model"] = shown
                     chosen = transcript.resume_model if transcript and transcript.resume_model is not None else self.chosen_models.get(session["id"], "")
                     session["modelNow"], session["model"] = session["model"], model_label(session["model"], chosen)
+                link_started_sessions(sessions)
                 self.devices, self.adb = find_devices()
                 with self.frames_lock:
                     live = {device["serial"] for device in self.devices}
@@ -6610,7 +6660,8 @@ class Office{
   const blocked=s.attention&&s.attention.kind!=='done';
   main.mood=blocked?'alert':waiting?'work':s.status==='idle'?'idle':(!busy||stale)?'ask':'work';
   main.icon=main.mood==='work'?iconFor(s.now||s.actions[0]):null;
-  const working=s.subagents.filter(a=>a.state==='working'),seen=new Set(working.map(a=>a.id));
+  const working=s.subagents.filter(a=>a.state==='working'),started=s.started||[];
+  const seen=new Set([...working.map(a=>a.id),...started.map(t=>'session-'+t.id)]);
   for(const a of s.subagents)this.color(a.id);
   // Free the desks of departing agents first so new arrivals can take them.
   for(const c of this.chars.values())if(!c.main&&!seen.has(c.id)&&c.mode!=='leaving'){c.mode='leaving';c.mood='work'}
@@ -6618,6 +6669,12 @@ class Office{
    const c=this.chars.get(a.id)||this.add(a.id,false,!this.first);
    c.mood=a.quiet>STALE?'ask':'work';
    c.icon=iconFor(a.now||a.last);
+  }
+  // Sessions this one started stay at their desks for as long as they run, asleep when idle.
+  for(const t of started){
+   const c=this.chars.get('session-'+t.id)||this.add('session-'+t.id,false,!this.first);
+   c.mood=t.status==='waiting'?'alert':t.status==='busy'?'work':'idle';
+   c.icon=c.mood==='work'?iconFor(t.now||t.last):null;
   }
   this.first=false;
  }
@@ -6804,7 +6861,7 @@ function update(c,s){
  c.pill.title=waiting?'Claude has finished its turn and is waiting for background tasks':'';
  const stale=s.status==='busy'&&!waiting&&s.quiet!==null&&s.quiet>STALE;
  c.meta.replaceChildren();
- c.meta.append([s.project,s.branch,s.model,contextText(s),'up '+s.up].filter(Boolean).join(' · ')+' · ');
+ c.meta.append([s.startedBy?'started by '+s.startedBy.name:'',s.project,s.branch,s.model,contextText(s),'up '+s.up].filter(Boolean).join(' · ')+' · ');
  if(s.queue&&s.queue.length)el('span','quiet',c.meta,s.queue.length+' queued · ');
  el('span',stale?'quiet':'',c.meta,stale?'quiet '+age(s.quiet):'active '+age(s.quiet)+' ago');
  c.title.textContent=s.title;c.title.hidden=!s.title;
@@ -6813,13 +6870,20 @@ function update(c,s){
  else if(waiting){el('b','',c.now,'waiting for ');c.now.append(bg.length===1?bg[0].description:bg.length+' background tasks')}
  else el('span','idle-now',c.now,s.actions[0]?'last: '+s.actions[0]:'no activity yet');
  c.office.sync(s);
- c.canvas.setAttribute('aria-label',s.name+' office: lead agent '+s.status+', '+s.subagents.filter(a=>a.state==='working').length+' subagents working');
+ c.canvas.setAttribute('aria-label',s.name+' office: lead agent '+s.status+', '+s.subagents.filter(a=>a.state==='working').length+' subagents working'+((s.started||[]).length?', '+s.started.length+' sessions it started':''));
  c.subs.replaceChildren();
  for(const t of bg){
   const row=el('div','sub bgtask',c.subs);
   el('i','',row);
   el('span','',row,'Background: '+t.description);
   el('small','',row,t.running!==null?'running for '+age(t.running):'running');
+ }
+ for(const t of s.started||[]){
+  const row=el('div','sub started',c.subs);
+  el('i','',row).style.background=c.office.color('session-'+t.id);
+  el('span','',row,'Session it started: '+t.name);
+  el('small','',row,(t.status==='busy'?(t.now||t.last||'working'):t.status==='waiting'?'needs you':'idle')+' \u00b7 its own card');
+  row.title='A separate Claude Code session started by this one. Open its own card to see or reply to it.';
  }
  const done=[];
  for(const a of s.subagents){

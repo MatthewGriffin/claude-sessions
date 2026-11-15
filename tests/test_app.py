@@ -1688,6 +1688,27 @@ class CommandPanelTests(unittest.TestCase):
                 self.assertEqual(set(app.read_session_files()), {11})
 
 
+class StartedSessionTests(unittest.TestCase):
+    """A session started from another session's shell shows in that session's office."""
+
+    def test_links(self):
+        sessions = [{"id": "lead", "name": "Lead", "pid": 10, "status": "busy", "hosted": True},
+                    {"id": "test", "name": "Test", "pid": 20, "status": "idle", "hosted": False, "actions": ["Read a file"]},
+                    {"id": "mine", "name": "Mine", "pid": 30, "status": "idle", "hosted": True}]
+        links = {20: (10, "old-id"), 30: (10, "lead")}  # 30 is the app's own: never counted.
+        with mock.patch.object(app, "started_by", lambda pid: links.get(pid)):
+            app.link_started_sessions(sessions)
+        self.assertEqual(sessions[1]["startedBy"], {"id": "lead", "name": "Lead"})
+        self.assertEqual([(t["id"], t["status"], t["last"]) for t in sessions[0]["started"]], [("test", "idle", "Read a file")])
+        self.assertIsNone(sessions[2]["startedBy"])
+
+    @unittest.skipIf(sys.platform == "win32", "reads /proc")
+    def test_reads_this_process(self):
+        # This test isn't a Claude Code child unless run from one, but it must never fail to read itself.
+        link = app.started_by(os.getpid())
+        self.assertTrue(link is None or isinstance(link, tuple))
+
+
 class PreviewTests(unittest.TestCase):
     """A session can see the previews beside its chat, and is told about them once."""
 
