@@ -5999,6 +5999,21 @@ def run_context_hook():
     return 0
 
 
+def hook_session_is_started():
+    """Whether the Claude Code process running this hook was started by another session, such as a test
+    Claude starts in its own terminal. Those are meant to be thrown away once they report back, and their
+    starter deals with them, so they never ping the desktop. Linux only, as started_by is.
+
+    The hook's own CLAUDE_PID is its Claude Code process (the variable it was started with is replaced for
+    its children), and that process's environment says who started it. A session this app hosts doesn't
+    count, whatever its environment says."""
+    if WINDOWS:
+        return False
+    pid = os.environ.get("CLAUDE_PID", "")
+    pid = int(pid) if pid.isdigit() and os.path.isdir(f"/proc/{pid}") else os.getppid()
+    return started_by(pid) is not None and pid not in hosted_panes()
+
+
 def run_hook():
     """Handle one Claude Code hook event from stdin. Never fails the session it runs for."""
     try:
@@ -6022,7 +6037,9 @@ def run_hook():
         if event == "PermissionRequest":
             tool = payload.get("tool_name", "a tool")
             is_question = tool == "AskUserQuestion"
-            kind, title = ("question", "has a question") if is_question else ("permission", "needs permission")
+            # A subagent's request has agent_id and agent_type. Its prompt shows on this session's own screen.
+            who = f"subagent ({clean(payload.get('agent_type') or 'agent')[:40]}) " if payload.get("agent_id") else ""
+            kind, title = ("question", who + "has a question") if is_question else ("permission", who + "needs permission")
             message = "Waiting for your answer" if is_question else describe_tool(tool, payload.get("tool_input"))
             ping = not previous or time.time() - previous.get("at", 0) > REPEAT_PING_SECONDS
             urgent = True
@@ -6039,7 +6056,8 @@ def run_hook():
         else:
             return 0
         notification = previous.get("notification") if previous else None
-        if ping:
+        # Still recorded below, so the app shows it needs you, just without a ping.
+        if ping and not hook_session_is_started():
             notification = desktop_notify(f"{name} {title}", message, urgent, notification) or notification
         write_attention(session_id, kind, message, notification)
     except (OSError, ValueError, TypeError, AttributeError):

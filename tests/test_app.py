@@ -1828,6 +1828,47 @@ class ChatOutputTests(unittest.TestCase):
                                  ("system", None, "/remote-control is active")])
 
 
+class HookPingTests(unittest.TestCase):
+    """Desktop pings from the hook: none for sessions another session started, labelled for subagents."""
+
+    SID = "c6813322-ec0b-465a-b695-0e83efdbde7b"
+
+    def run_hook(self, payload, started, hosted=()):
+        pings = []
+        folder = tempfile.mkdtemp()
+        env = {"CLAUDE_PID": str(os.getpid())}  # Any process that has a /proc entry.
+        with mock.patch.object(app, "ATTENTION_DIR", folder), mock.patch.object(app, "WINDOWS", False), \
+                mock.patch.object(app.sys, "stdin", io.StringIO(json.dumps({"session_id": self.SID, "cwd": "/x", **payload}))), \
+                mock.patch.object(app, "started_by", lambda pid: (1, "parent") if started else None), \
+                mock.patch.object(app, "hosted_panes", lambda: {os.getpid(): "x"} if hosted else {}), \
+                mock.patch.object(app, "session_name", lambda sid, cwd: "Test"), \
+                mock.patch.dict(os.environ, env), \
+                mock.patch.object(app, "desktop_notify", lambda title, body, urgent, replaces=None: pings.append(title) or 7):
+            app.run_hook()
+        with open(os.path.join(folder, self.SID + ".json")) as handle:
+            record = json.load(handle)
+        shutil.rmtree(folder)
+        return pings, record
+
+    def test_started_sessions_are_silent_but_still_recorded(self):
+        request = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "touch x"}}
+        pings, record = self.run_hook(request, started=True)
+        self.assertEqual(pings, [])
+        self.assertEqual(record["kind"], "permission")  # The app still shows that it needs you.
+        pings, _ = self.run_hook({"hook_event_name": "Stop", "last_assistant_message": "Done"}, started=True)
+        self.assertEqual(pings, [])
+
+    def test_other_sessions_still_ping(self):
+        request = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "touch x"}}
+        self.assertEqual(self.run_hook(request, started=False)[0], ["Test needs permission"])
+        self.assertEqual(self.run_hook(request, started=True, hosted=True)[0], ["Test needs permission"])  # The app's own.
+
+    def test_a_subagent_ping_says_so(self):
+        request = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "touch x"},
+                   "agent_id": "a23870a219a70e3ee", "agent_type": "general-purpose"}
+        self.assertEqual(self.run_hook(request, started=False)[0], ["Test subagent (general-purpose) needs permission"])
+
+
 class PreviewTests(unittest.TestCase):
     """A session can see the previews beside its chat, and is told about them once."""
 
