@@ -7811,9 +7811,9 @@ function updateFoot(s){
  const started=s.started||[];
  const working=s.subagents.filter(a=>a.state==='working').length+started.filter(t=>t.status==='busy').length;
  const total=s.subagents.length+started.length;
- const label=(started.length?'Subagents & sessions':'Subagents')+' ('+(working?working+' working':total)+')';
+ const label='Subagents ('+(working?working+' working':total)+')';
  $('histAgents').hidden=!total;
- if($('histAgents').textContent!==label){$('histAgents').textContent=label;$('tabAgents').textContent=singleColumn.matches&&started.length?'Agents ('+(working?working+' working':total)+')':label}
+ if($('histAgents').textContent!==label){$('histAgents').textContent=label;$('tabAgents').textContent=label}
  renderStarted(started);
  if(agentCount!==total){agentCount=total;layoutPreview()}
  $('histName').textContent=s.name;
