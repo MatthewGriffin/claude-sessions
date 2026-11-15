@@ -1725,6 +1725,47 @@ class StartedSessionTests(unittest.TestCase):
         self.assertTrue(link is None or isinstance(link, tuple))
 
 
+class InputBoxTests(unittest.TestCase):
+    """Text in a session's own input box: read as Claude Code shows it, and replaced on send."""
+
+    RULE = "─" * 60
+    BOX = "\n".join(["● Done", RULE, "❯ line one", "  line two", "  line three", RULE, "  Haiku 5.5 | Ctx 4%", "  ⏸ manual mode on"])
+
+    def test_several_lines_are_no_menu(self):
+        self.assertEqual(app.menu_options(self.BOX), [])
+        self.assertEqual(app.input_box(self.BOX), "line one\nline two\nline three")
+        trust = "\n".join(["Is this a project you trust?", "", " ❯ No, exit", "   Yes, I trust this folder", "", " Enter to confirm"])
+        self.assertEqual([o["label"] for o in app.menu_options(trust)], ["No, exit", "Yes, I trust this folder"])
+
+    def test_clearing_line_by_line(self):
+        lines = ["line one", "line two", "line three"]
+        screen = lambda target: "\n".join(["● Done", self.RULE, "❯ " + "\n  ".join(lines) if lines else "❯ ", self.RULE, "  Haiku"])
+
+        def keys(target, *pressed):
+            for key in pressed:
+                if key == "C-u" and lines:
+                    lines[-1] = ""
+                elif key == "BSpace" and lines and not lines[-1]:
+                    lines.pop()
+            return True
+        with mock.patch.object(app, "session_screen", screen), mock.patch.object(app, "send_keys", keys), \
+                mock.patch.object(app.time, "sleep"):
+            self.assertTrue(app.clear_input_box("t"))
+        self.assertIn(lines, ([], [""]))
+
+    def test_send_replaces_only_the_text_seen(self):
+        cleared, typed = [], []
+        session = {"id": "s1", "tmux": "t"}
+        with mock.patch.object(app, "session_screen", lambda target: "\n".join([self.RULE, "❯ old message", self.RULE])), \
+                mock.patch.object(app, "clear_input_box", lambda target: cleared.append(target) or True), \
+                mock.patch.object(app, "type_into", lambda session, text, images, pasted, in_box=None: typed.append((text, in_box)) or True), \
+                mock.patch.object(app, "send_keys", lambda *a: True):
+            app.type_message(session, "new", replaces="old message")
+            app.type_message(session, "new", replaces="something else")
+        self.assertEqual(cleared, ["t"])
+        self.assertEqual(typed, [("new", ""), ("new", None)])  # Changed since: added after it, as typing there would.
+
+
 class PreviewTests(unittest.TestCase):
     """A session can see the previews beside its chat, and is told about them once."""
 

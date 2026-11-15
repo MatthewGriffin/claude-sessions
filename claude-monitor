@@ -810,6 +810,7 @@ class Monitor:
         self.git_states = {}  # Folder -> when git was last asked about it, and its answer.
         self.contexts = {}  # Session id -> its latest context check.
         self.panels = {}  # Session id -> the command panel open on its screen, if any.
+        self.drafts = {}  # Session id -> text waiting in its input box in the terminal.
         self.panes = {}
         self.pid_ids = {}
         self.id_changes = []
@@ -1029,6 +1030,7 @@ class Monitor:
             "heldBusy": bool(session.get("heldBusy")),
             "panel": bool(self.panels.get(session["sessionId"])),
             "waitingFor": str(session.get("waitingFor") or "")[:60],
+            "draft": self.drafts.get(session["sessionId"], "")[:MAX_REPLY_BYTES],
         }
 
     def background_state(self, session, transcript):
@@ -3954,6 +3956,10 @@ def menu_options(screen):
         numbered = MENU_NUMBERED.match(lines[anchor])
     if not numbered:
         # No numbers: the answers are the lines around the highlighted one that start in the same column.
+        # The input box is no menu, though a message of several lines in it lines up like one: its
+        # "❯" is at the very left, right under a divider (menus indent theirs).
+        if not lines[here].startswith(" ") and here > 0 and LIVE_RULE.match(lines[here - 1]):
+            return []
         column = MENU_HIGHLIGHT.match(lines[here]).start(2)
         same = lambda line: len(line) - len(line.lstrip()) == column and not line.lstrip().startswith("❯")
         start, end = here, here
@@ -4400,6 +4406,50 @@ def type_text(target, text, pasted=()):
     return True
 
 
+INPUT_CLEAR_STEPS = 40
+
+
+typed_at = {}  # Session id -> when this app last typed into it, so its own typing isn't taken for the user's.
+SUGGESTION_STYLE = re.compile(r"\x1b\[(?:[0-9;]*;)?(?:2|90|38;5;(?:2[3-5][0-9]|8))(?:;[0-9;]*)?m")
+
+
+def note_typing(session):
+    typed_at[session.get("id") or session.get("tmux")] = time.time()
+
+
+def input_draft(session, screen):
+    """Text waiting in a session's input box in the terminal, as the user would see it there: a message
+    Claude Code put back after an interrupt, or something typed in the terminal. Not Claude Code's
+    grey suggestions, and not this app's own typing in progress."""
+    box = input_box(screen)
+    if not box or time.time() - typed_at.get(session["id"], 0) < DRAFT_QUIET_SECONDS:
+        return ""
+    styled = tmux("capture-pane", "-t", tmux_target(session["tmux"]), "-p", "-e").stdout if not WINDOWS else ""
+    line = next((l for l in reversed(styled.split("\n")) if re.match(r"^(?:\x1b\[[0-9;]*m)*❯", l)), "")
+    lead = re.match(r"^((?:\x1b\[[0-9;]*m)*❯(?:\x1b\[[0-9;]*m|\s|\xa0)*)", line)
+    if lead and SUGGESTION_STYLE.search(lead.group(1)[lead.group(1).index("❯"):]):
+        return ""  # Grey: a suggestion, which Claude Code drops as soon as anything is typed.
+    return box
+
+
+def clear_input_box(target):
+    """Empty Claude Code's input box, line by line: Ctrl+U clears up to the cursor (at the end), and
+    Backspace joins the line above. Ctrl+C or a double Esc would also clear it, but on an empty box
+    those start quitting or open rewind. True once the box shows empty."""
+    for _ in range(INPUT_CLEAR_STEPS):
+        box = input_box(session_screen(target))
+        if box is None:
+            return False  # A menu or panel took the screen: stop pressing keys.
+        if box == "":
+            return True
+        send_keys(target, "C-u")
+        time.sleep(0.15)
+        if input_box(session_screen(target)):
+            send_keys(target, "BSpace")
+            time.sleep(0.15)
+    return input_box(session_screen(target)) == ""
+
+
 def type_into(session, text, images=(), pasted=(), in_box=None):
     """Type a message into the input box without sending it. Each picture's path is pasted on
     its own, which is what makes Claude Code attach it as an image rather than leave it as text.
@@ -4419,10 +4469,23 @@ def type_into(session, text, images=(), pasted=(), in_box=None):
     return True
 
 
-def type_message(session, text, images=(), pasted=()):
-    """Type a message into a session and submit it. Returns (succeeded, message)."""
+def type_message(session, text, images=(), pasted=(), replaces=""):
+    """Type a message into a session and submit it. Returns (succeeded, message).
+
+    replaces is the text the user saw in the session's input box, shown in the app's reply box, such
+    as a message Claude Code put back after an interrupt. If the box still holds just that, it's
+    emptied first, so what's sent is exactly what the reply box held."""
+    in_box = None
+    if replaces and replaces.strip():
+        box = input_box(session_screen(session["tmux"]))
+        if box and box.strip() == replaces.strip():
+            with timed("clearing its input box"):
+                if not clear_input_box(session["tmux"]):
+                    return False, "Couldn't empty its input box first, so nothing was sent. Check the terminal."
+            in_box = ""
+    note_typing(session)
     with timed("typing"):
-        typed = type_into(session, text, images, pasted)
+        typed = type_into(session, text, images, pasted, in_box=in_box)
     if not typed:
         return False, "Could not type into the session."
     with timed("pressing Enter"):
@@ -4541,7 +4604,8 @@ def send_queued_now(monitor, request):
             state["sent"][session["id"]] = time.time()
             state["checks"][session["id"]] = {"text": item["text"], "images": item.get("images", []), "pasted": item.get("pasted", []), "count": monitor.human_messages(session["id"]), "at": time.time()}
         else:
-            succeeded, message = send_tracked(monitor, session, item["text"], state, item.get("images", []), item.get("pasted", []))
+            succeeded, message = send_tracked(monitor, session, item["text"], state, item.get("images", []), item.get("pasted", []),
+                                              item.get("replaces", ""))
             if not succeeded:
                 return False, message
         items.remove(item)
@@ -4558,10 +4622,10 @@ def may_type_now(session, state):
     return session["status"] == "idle" and time.time() - state["sent"].get(session["id"], 0) >= QUEUE_GAP_SECONDS
 
 
-def send_tracked(monitor, session, text, state, images=(), pasted=()):
+def send_tracked(monitor, session, text, state, images=(), pasted=(), replaces=""):
     """Type a message and note what's needed to tell later whether it arrived."""
     before = monitor.human_messages(session["id"])
-    succeeded, message = type_message(session, text, images, pasted)
+    succeeded, message = type_message(session, text, images, pasted, replaces)
     if succeeded:
         state["sent"][session["id"]] = time.time()
         note_btw(session, text)
@@ -4736,6 +4800,7 @@ PANEL_BASE_KEYS = [("↑", "Up"), ("↓", "Down"), ("←", "Left"), ("→", "Rig
                    ("⌫", "BSpace"), ("Enter", "Enter"), ("Esc", "Escape")]
 PANEL_SEND = {key for _, key in PANEL_BASE_KEYS} | set(PANEL_KEYS.values())
 PANEL_WAITING = "dialog open"
+DRAFT_QUIET_SECONDS = 5
 CONTEXT_CHECK_SECONDS = 30
 CONTEXT_TIMEOUT = 60
 
@@ -4819,7 +4884,7 @@ def watch_panels(monitor):
     snapshot = monitor.snapshot()
     if snapshot["error"]:
         return
-    seen = {}
+    seen, drafts = {}, {}
     for session in snapshot["sessions"]:
         if not session["hosted"] or not panel_allowed(session):
             continue
@@ -4827,8 +4892,11 @@ def watch_panels(monitor):
         panel = command_panel(screen)
         if panel and not btw_panel(screen):  # Side questions have their own entries.
             seen[session["id"]] = panel
+        elif session["status"] == "idle":
+            drafts[session["id"]] = input_draft(session, screen)
     with monitor.lock:
         before, monitor.panels = monitor.panels, seen
+        monitor.drafts = drafts
     for session_id, panel in before.items():
         if session_id in seen:
             continue  # Still open, though perhaps on another step, such as /model asking to confirm.
@@ -4922,12 +4990,14 @@ def send_reply(monitor, request):
         if not session:
             return False, NOT_HOSTED
         items = state["messages"].setdefault(session["id"], [])
-        item = {"id": secrets.token_hex(8), "text": text, **({"images": images} if images else {}), **({"pasted": pasted} if pasted else {})}
+        replaces = str(request.get("replaces") or "")[:MAX_REPLY_BYTES]
+        item = {"id": secrets.token_hex(8), "text": text, **({"images": images} if images else {}), **({"pasted": pasted} if pasted else {}),
+                **({"replaces": replaces} if replaces.strip() else {})}
         if BTW_COMMAND.match(text) and session["status"] == "busy":
             # A side question is answered while Claude works, so it neither waits nor interrupts.
             return send_btw_now(session, text)
         if not items and may_type_now(session, state) and not panel_open(session):
-            succeeded, message = send_tracked(monitor, session, text, state, images, pasted)
+            succeeded, message = send_tracked(monitor, session, text, state, images, pasted, replaces)
             if succeeded:
                 return True, message
             # Keep it, where it can be retried, instead of leaving it to be lost from the box.
@@ -5101,7 +5171,8 @@ def deliver_queued(monitor):
             if guard and guard not in monitor.last_said(session_id):
                 items[0]["error"] = "It didn't confirm that its progress was saved, so the chat wasn't cleared."
                 continue
-            succeeded, message = send_tracked(monitor, session, items[0]["text"], state, items[0].get("images", []), items[0].get("pasted", []))
+            succeeded, message = send_tracked(monitor, session, items[0]["text"], state, items[0].get("images", []),
+                                              items[0].get("pasted", []), items[0].get("replaces", ""))
             if succeeded:
                 items.pop(0)
             else:
@@ -5192,6 +5263,12 @@ def press_key(monitor, request):
         return True, "Sent."
     if action in ("panelkey", "paneltext", "panelchoose"):
         return panel_action(session, action, request)
+    if action == "clearbox":
+        if status != "idle":
+            return False, "It's busy, so its input box was left alone."
+        if not input_box(session_screen(session["tmux"])):
+            return True, "Its input box is already empty."
+        return (True, "Emptied.") if clear_input_box(session["tmux"]) else (False, "Couldn't empty its input box. Check the terminal.")
     if action in ("approve", "deny"):
         # Tied to the prompt that was on screen, so it can't land on a newer one.
         if not is_permission or attention.get("at") != request.get("prompt"):
@@ -6372,6 +6449,7 @@ dialog::backdrop{background:#0009}
 #reqBox[hidden]{display:none}
 #btwBox{flex:1 1 0;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:10px;font-size:13px;align-content:start}
 #btwBox[hidden]{display:none}
+#replyDraft{font-size:12px;color:var(--dim);margin:4px 0 0}#replyDraft[hidden]{display:none}#replyDraft button{font-size:12px;padding:2px 8px;margin-left:4px}
 #cmdHist{display:grid;grid-template-columns:minmax(0,1fr);gap:10px}
 #panelLive{border:1px solid var(--line);border-radius:8px;padding:10px;display:grid;gap:8px;background:var(--card)}
 #panelLive[hidden]{display:none}#panelLive h3{margin:0;font-size:13px}
@@ -6580,7 +6658,7 @@ textarea{min-height:110px;resize:vertical}
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
 <dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
-<section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="queue" hidden></div>
+<section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="replyDraft" hidden><span id="replyDraftText"></span> <button id="replyDraftClear" type="button">Empty its input box</button></div><div id="queue" hidden></div>
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Slash commands: what they showed, side questions (/btw), and any panel open now" hidden>Commands</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabContext" type="button" role="tab" title="What fills this session's context window">Context</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Commands" hidden><section id="panelLive" aria-label="Panel open on its screen" hidden><h3 id="panelTitle"></h3><div class="reqnote">A command has this panel open on the session’s screen. Use the buttons as you would the keys. Messages wait in the queue until it closes.</div><pre id="panelText"></pre><div id="panelOpts" class="panelbtns"></div><div id="panelKeys" class="panelbtns"></div><form id="panelType"><input id="panelTypeText" aria-label="Type into the panel" placeholder="Type into it, such as to search or filter" maxlength="200" autocomplete="off"><button type="submit">Type</button></form><div id="panelErr" class="err"></div></section><div id="cmdHist"></div></div><div id="ctxBox" aria-label="Context" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
@@ -7432,6 +7510,25 @@ async function act(path,body){
 }
 // "Type something": a box to write the answer in, sent in place of picking one of the others.
 let answerFor=null;  // The question the reply box answers right now, if any.
+// Text in the session's own input box in the terminal (such as a message Claude Code put back after an
+// interrupt) shows in the reply box, as it would in Claude Code, and what's sent replaces it there.
+let draftSeen=null,replyDraft=null;
+function syncDraft(s){
+ const d=s.hosted&&s.status==='idle'&&!s.panel?(s.draft||''):'',box=$('replyText');
+ if(d!==draftSeen){
+  if(d&&(!box.value.trim()||box.value===replyDraft)){box.value=d;replyDraft=d}
+  else if(!d&&replyDraft!==null&&box.value===replyDraft){box.value='';replyDraft=null}
+  else if(!d)replyDraft=null;
+  draftSeen=d;
+ }
+ const note=$('replyDraft');note.hidden=!d;
+ if(d)$('replyDraftText').textContent=replyDraft===d||box.value===replyDraft&&replyDraft!==null
+  ?'This is in its input box in the terminal, as Claude Code left it (a message put back after an interrupt, for one). Edit it here and send, and it replaces that.'
+  :'Its input box in the terminal also holds \u201c'+(d.length>80?d.slice(0,80)+'\u2026':d)+'\u201d. What you send goes after it, as typing there would.';
+}
+$('replyDraftClear').addEventListener('click',async()=>{
+ if(await act('key',{id:histSession,action:'clearbox'})&&$('replyText').value===replyDraft){$('replyText').value='';replyDraft=null}
+});
 function keyButton(label,cls,body){
  const b=el('button',cls,$('keys'),label);b.type='button';
  b.addEventListener('click',()=>act('key',{id:histSession,...body}));
@@ -7533,6 +7630,7 @@ function updateFoot(s){
  $('replySend').textContent=answerFor?'Answer':sendsNow?'Send':'Queue';
  $('replyText').placeholder=s.panel&&!waiting&&!answerFor?'A command’s panel is open on its screen (see Commands). Messages wait until it closes.':answerFor?'Type your own answer, or pick one above (Enter to answer, Shift+Enter for a new line)':
   (sendsNow?'Reply…':waiting?'Queue a message for after you answer the prompt…':'Queue a message for when it finishes…')+' (Enter to '+(sendsNow?'send':'queue')+', Shift+Enter for a new line)';
+ syncDraft(s);
  $('replyNote').textContent=s.hosted?'':s.job?'Started outside this app. To reply, use Open in terminal.':'Started in its own terminal. Reply there.';
  const want=!s.hosted?'':waiting&&options.length?'menu:'+a.at+':'+JSON.stringify(options):permission?'perm:'+a.at:waiting?'wait':s.status==='busy'?'busy':'';
  if(want===keysFor)return;
@@ -8109,7 +8207,7 @@ const pageHash=id=>'#session='+encodeURIComponent(id);
 let pagePushed=false;
 function openHistory(s,fromUrl){
  if(!fromUrl){history.pushState(null,'',pageHash(s.id));pagePushed=true}
- histSession=s.id;histPid=s.pid;histRev=null;histFollow=true;histLimit=400;histScrollTo=null;histCwd=s.cwd;toolFull=new Map();toolPictures=new Map();
+ histSession=s.id;histPid=s.pid;histRev=null;draftSeen=null;replyDraft=null;histFollow=true;histLimit=400;histScrollTo=null;histCwd=s.cwd;toolFull=new Map();toolPictures=new Map();
  setRenaming(false);
  $('histBody').replaceChildren();shownMessages=[];$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
@@ -8204,7 +8302,8 @@ $('replyForm').addEventListener('submit',async e=>{
  const echo=text.trim().startsWith('/')?null:{id:sid,text:text.trim(),images:images.length,seen,rev:histRev,at:Date.now(),posting:true};
  if(echo){sentEcho=echo;showEcho()}
  $('replySlow').textContent='';
- const ok=await act('send',{id:sid,text,images,pasted});
+ const ok=await act('send',{id:sid,text,images,pasted,...(replyDraft!==null&&draftSeen===replyDraft?{replaces:replyDraft}:{})});
+ if(ok)replyDraft=null;
  if(echo&&sentEcho===echo){
   if(ok&&lastActMessage==='Sent.'){echo.posting=false;echo.timing=lastActTiming;showEcho();quickPoll()}
   else{sentEcho=null;showEcho()}  // Queued messages show in the queue; failures say why below the box.
