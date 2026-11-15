@@ -6538,6 +6538,8 @@ button.update svg{flex:none}
 #failText{flex:1 1 240px;min-width:0}
 dialog{background:var(--card);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:0}
 dialog::backdrop{background:#0009}
+#askDlg{max-width:min(460px,calc(100vw - 32px))}#askForm{padding:16px;display:grid;gap:14px}#askText{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.45}
+.askbtns{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
 #hist{width:100vw;height:100vh;height:100dvh;max-width:none;max-height:none;margin:0;border:0;border-radius:0;overflow:hidden}
 #hist>.dhead{flex-wrap:wrap}#histName{min-width:min(120px,100%)}
 #histMore{display:none}
@@ -6789,7 +6791,7 @@ textarea{min-height:110px;resize:vertical}
 <header><h1>Claude Sessions</h1><span id="summary">connecting…</span><span id="error"></span><button id="updateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="restartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><span id="usage" class="usage"></span><button id="devices">Devices</button><button id="phoneBtn" title="Use this app from your phone, on the same Wi-Fi" aria-label="Phone access"><svg viewBox="0 0 16 16" width="14" height="16" aria-hidden="true"><rect x="4" y="1.5" width="8" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 12h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="new" class="primary">New session</button></header>
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
-<dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
+<dialog id="askDlg" aria-labelledby="askText"><form method="dialog" id="askForm"><p id="askText"></p><div class="askbtns"><button value="no" id="askNo">Cancel</button><button value="yes" id="askYes" class="primary">OK</button></div></form></dialog><dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="replyDraft" hidden><span id="replyDraftText"></span> <button id="replyDraftClear" type="button">Empty its input box</button></div><div id="queue" hidden></div>
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Slash commands: what they showed, side questions (/btw), and any panel open now" hidden>Commands</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabContext" type="button" role="tab" title="What fills this session's context window">Context</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Commands" hidden><section id="panelLive" aria-label="Panel open on its screen" hidden><h3 id="panelTitle"></h3><div class="reqnote">A command has this panel open on the session’s screen. Use the buttons as you would the keys. Messages wait in the queue until it closes.</div><pre id="panelText"></pre><div id="panelOpts" class="panelbtns"></div><div id="panelKeys" class="panelbtns"></div><form id="panelType"><input id="panelTypeText" aria-label="Type into the panel" placeholder="Type into it, such as to search or filter" maxlength="200" autocomplete="off"><button type="submit">Type</button></form><div id="panelErr" class="err"></div></section><div id="cmdHist"></div></div><div id="ctxBox" aria-label="Context" hidden></div><div id="startedBox" aria-label="Sessions it started" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
@@ -6944,6 +6946,17 @@ class Office{
  }
 }
 
+// The app's own confirm and alert, in place of the browser's pop-ups. Resolves true for the action button.
+function ask(message,{yes='OK',no='Cancel',danger=false}={}){
+ return new Promise(resolve=>{
+  const d=$('askDlg');
+  $('askText').textContent=message;$('askYes').textContent=yes;$('askYes').className=danger?'deny':'primary';
+  $('askNo').hidden=no===null;if(no!==null)$('askNo').textContent=no;
+  d.returnValue='';d.onclose=()=>resolve(d.returnValue==='yes');
+  d.showModal();(danger?$('askNo'):$('askYes')).focus();
+ });
+}
+const tell=message=>ask(message,{no:null});
 function el(tag,cls,parent,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;if(parent)parent.appendChild(e);return e}
 function age(sec){if(sec===null||sec===undefined)return'-';if(sec<60)return sec+'s';if(sec<3600)return Math.floor(sec/60)+'m';return Math.floor(sec/3600)+'h'+String(Math.floor(sec%3600/60)).padStart(2,'0')+'m'}
 
@@ -6987,7 +7000,7 @@ function ageText(at){return age(Math.max(0,Math.round(Date.now()/1000-at)))+' ag
 async function resumeSession(id,trust){
  const r=await fetch('/api/sessions/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,trust})});
  const d=await r.json().catch(()=>({error:'Unexpected response (HTTP '+r.status+').'}));
- if(d.needsTrust&&!trust&&confirm('Trust this folder? Claude Code will be able to read, edit and run files in '+d.cwd))return resumeSession(id,d.cwd);
+ if(d.needsTrust&&!trust&&await ask('Trust this folder? Claude Code will be able to read, edit and run files in '+d.cwd,{yes:'Trust it'}))return resumeSession(id,d.cwd);
  return r.ok?'':d.error||'Could not resume that session.';
 }
 async function runPrevious(work){
@@ -7017,17 +7030,17 @@ function renderPrevious(list,remember){
   return row;
  });
  $('prevList').replaceChildren(...rows);
- $('prevAll').onclick=()=>{
-  if(confirm('Resume all '+list.length+' sessions? They stay idle until you message them.'))runPrevious(async()=>{
+ $('prevAll').onclick=async()=>{
+  if(await ask('Resume all '+list.length+' sessions? They stay idle until you message them.',{yes:'Resume all'}))runPrevious(async()=>{
    const problems=[];
    for(const p of list){const e=await resumeSession(p.id);if(e)problems.push((p.name||p.id.slice(0,8))+': '+e)}
    return problems.join(' ');
   });
  };
 }
-$('prevRemember').addEventListener('change',e=>{
+$('prevRemember').addEventListener('change',async e=>{
  const on=e.target.checked;
- if(!on&&!confirm('Stop remembering sessions and clear this list?')){e.target.checked=true;return}
+ if(!on&&!await ask('Stop remembering sessions and clear this list?',{yes:'Stop and clear',danger:true})){e.target.checked=true;return}
  runPrevious(async()=>(await post('remember',{on})).error);
 });
 function renderUsage(u){
@@ -7217,7 +7230,7 @@ function showPrinters(list,shares){
    const b=el('button','',li,'Stop sharing');b.type='button';b.addEventListener('click',()=>printerAction('unshare',host));
   }else{
    const b=el('button','',li,'Share\u2026');b.type='button';b.title='Make a public link to watch this camera';
-   b.addEventListener('click',()=>{if(confirm('Make a public link to this printer\u2019s camera? Anyone with the link can watch it, and see the print\u2019s progress, until you stop sharing or close this app. It goes through Cloudflare\u2019s free tunnel.'))printerAction('share',host)});
+   b.addEventListener('click',async()=>{if(await ask('Make a public link to this printer\u2019s camera? Anyone with the link can watch it, and see the print\u2019s progress, until you stop sharing or close this app. It goes through Cloudflare\u2019s free tunnel.',{yes:'Make a link'}))printerAction('share',host)});
   }
   const r=el('button','',li,'Remove');r.type='button';r.addEventListener('click',()=>printerAction('remove',host));
   if(!share)continue;
@@ -7522,7 +7535,7 @@ function updatePrinterPanel(p){
 }
 function say(p,text,bad){p.msg.textContent=text;p.msg.classList.toggle('bad',!!bad)}
 async function sendPrinter(p,control,value,question){
- if(question&&!confirm(question))return false;
+ if(question&&!await ask(question,{yes:'Yes',no:'No'}))return false;
  p.busy=true;updatePrinterPanel(p);say(p,'Sending\u2026');
  try{
   const d=await post('printer-control',{host:p.host,control,value});
@@ -8320,7 +8333,7 @@ function renderStarted(list){
   const open=el('button','',row,'Open its chat');open.type='button';
   open.addEventListener('click',()=>{const k=cards.get(t.id);if(k)openHistory(k.session)});
   const end=el('button','deny',row,'End');end.type='button';
-  end.addEventListener('click',async()=>{if(confirm('End '+t.name+'? Anything it is doing stops.')){try{const d=await post('end-started',{id:t.id});if(d.error)alert(d.error)}catch(e){}refresh()}});
+  end.addEventListener('click',async()=>{if(await ask('End '+t.name+'? Anything it is doing stops.',{yes:'End it',danger:true})){try{const d=await post('end-started',{id:t.id});if(d.error)await tell(d.error)}catch(e){}refresh()}});
   rows.push(row);
  }
  box.replaceChildren(...rows);
@@ -8471,14 +8484,14 @@ $('renameForm').addEventListener('submit',async e=>{
 for(const [button,action] of [['failNow','now'],['failReset','reset'],['failCancel','cancel'],['failDismiss','dismiss']]){
  $(button).addEventListener('click',()=>act('retry',{id:histSession,action}));
 }
-$('histRefresh').addEventListener('click',()=>{
+$('histRefresh').addEventListener('click',async()=>{
  const s=cards.get(histSession)&&cards.get(histSession).session;
- if(s&&s.status!=='idle'&&!confirm('It\u2019s still working. Make a fresh start once it finishes? (Writes notes, clears the chat, then reads the notes and carries on.)'))return;
- if(s&&s.status==='idle'&&!confirm('Save progress to the project\u2019s notes, clear this chat, then read the notes and carry on? The old conversation stays on disk but can\u2019t be resumed from this app.'))return;
+ if(s&&s.status!=='idle'&&!await ask('It\u2019s still working. Make a fresh start once it finishes? (Writes notes, clears the chat, then reads the notes and carries on.)',{yes:'Fresh start after'}))return;
+ if(s&&s.status==='idle'&&!await ask('Save progress to the project\u2019s notes, clear this chat, then read the notes and carry on? The old conversation stays on disk but can\u2019t be resumed from this app.',{yes:'Fresh start'}))return;
  act('refresh',{id:histSession});
 });
 $('histEnd').addEventListener('click',async()=>{
- if(confirm('End this session? Anything it is doing stops. The conversation is kept.')&&await act('end',{id:histSession}))$('hist').close();
+ if(await ask('End this session? Anything it is doing stops. The conversation is kept.',{yes:'End session',danger:true})&&await act('end',{id:histSession}))$('hist').close();
 });
 $('replyForm').addEventListener('submit',async e=>{
  e.preventDefault();
@@ -8730,7 +8743,7 @@ async function phoneAction(action){
 $('phoneBtn').addEventListener('click',()=>{$('phoneDlg').showModal();loadPhone()});
 $('phoneClose').addEventListener('click',()=>$('phoneDlg').close());
 $('phoneOn').addEventListener('change',()=>phoneAction($('phoneOn').checked?'on':'off'));
-$('phoneRenew').addEventListener('click',()=>{if(confirm('Make a new link? Phones using the current one will need to scan the new code.'))phoneAction('renew')});
+$('phoneRenew').addEventListener('click',async()=>{if(await ask('Make a new link? Phones using the current one will need to scan the new code.',{yes:'Make a new link'}))phoneAction('renew')});
 $('replyAttach').addEventListener('click',()=>$('replyFile').click());
 $('replyFile').addEventListener('change',()=>{addImages($('replyFile').files);$('replyFile').value=''});
 // On a phone or tablet, a button that opens the camera straight away. Its photos come back as JPEG.
