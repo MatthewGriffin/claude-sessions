@@ -1591,6 +1591,103 @@ class SideQuestionTests(unittest.TestCase):
                 self.assertEqual(len(app.btw_for("s2")), 1)
 
 
+class CommandPanelTests(unittest.TestCase):
+    """Panels opened by slash commands, worked from the app, and the context check."""
+
+    RULE = "▔" * 60
+    MODEL = "\n".join(["● Done", "", RULE, "   Select model", "   Switch between Claude models.", "",
+                        "     1.  Default (recommended)  Sonnet 5.5 · Efficient", "     2.  Opus 5.5               For complex work",
+                        "   ❯ 3.  Haiku 5.5 ✔            Fastest", "     ▸   More models", "",
+                        "   Enter to set as default · s to use this session only · Esc to cancel"])
+    RESUME = "\n".join([RULE, "   Resume session", "   ❯ Fruit selection question", "     2 hours ago · HEAD · 335.2KB",
+                         "     Ctrl+A to show all projects · Ctrl+B to only show current branch · Space to preview · Ctrl+R to rename · Type to",
+                         "     search · Esc to cancel"])
+    IDLE = "\n".join(["● Done", "", "─" * 60, "❯ ", "─" * 60, "  Haiku 5.5 | Ctx 4%"])
+
+    def test_panel_and_its_keys(self):
+        panel = app.command_panel(self.MODEL)
+        self.assertEqual(panel["title"], "Select model")
+        self.assertEqual([k["keys"] for k in panel["keys"]], [["Enter"], ["s"], ["Escape"]])
+        resume = app.command_panel(self.RESUME)
+        self.assertEqual([k["keys"] for k in resume["keys"]], [["C-a"], ["C-b"], ["Space"], ["C-r"], ["Escape"]])
+        self.assertIsNone(app.command_panel(self.IDLE))
+        self.assertEqual(app.hint_keys("⇧←/→ to browse · ↑/↓ to scroll · Type to filter")[0]["keys"], ["S-Left", "S-Right"])
+        self.assertEqual(app.hint_keys("↑/↓ to scroll")[0]["keys"], ["Up", "Down"])
+
+    def test_only_dialog_waits_count(self):
+        self.assertTrue(app.panel_allowed({"status": "waiting", "waitingFor": "dialog open"}))
+        self.assertFalse(app.panel_allowed({"status": "waiting", "waitingFor": "input needed"}))
+        self.assertTrue(app.panel_allowed({"status": "idle"}))
+
+    def test_keys_are_checked_against_the_panel(self):
+        pressed, typed = [], []
+        session = {"status": "waiting", "waitingFor": "dialog open", "tmux": "t"}
+        with mock.patch.object(app, "session_screen", lambda target: self.MODEL), \
+                mock.patch.object(app, "send_keys", lambda target, *keys: pressed.extend(keys) or True), \
+                mock.patch.object(app, "send_text", lambda target, text: typed.append(text) or True):
+            self.assertEqual(app.panel_action(session, "panelkey", {"key": "s"}), (True, "Sent."))
+            self.assertFalse(app.panel_action(session, "panelkey", {"key": "C-c"})[0])
+            self.assertFalse(app.panel_action({**session, "waitingFor": "input needed"}, "panelkey", {"key": "Enter"})[0])
+        self.assertEqual((pressed, typed), ([], ["s"]))
+
+    def test_picking_an_option_only_moves_to_it(self):
+        state = {"here": 2, "pressed": []}
+        lines = self.MODEL.split("\n")
+
+        def screen(target):
+            shown = [line.replace("❯", " ") if "❯" in line else line for line in lines]
+            row = [i for i, line in enumerate(shown) if line.strip().startswith(f"{state['here'] + 1}.")][0]
+            shown[row] = "   ❯" + shown[row][4:]
+            return "\n".join(shown)
+
+        def keys(target, *pressed):
+            for key in pressed:
+                state["pressed"].append(key)
+                state["here"] += {"Up": -1, "Down": 1}.get(key, 0)
+            return True
+        session = {"status": "waiting", "waitingFor": "dialog open", "tmux": "t"}
+        with mock.patch.object(app, "session_screen", screen), mock.patch.object(app, "send_keys", keys), \
+                mock.patch.object(app.time, "sleep"):
+            label = app.command_panel(screen(None))["options"][1]["label"]
+            self.assertEqual(app.panel_action(session, "panelchoose", {"key": "2", "label": label}), (True, "Sent."))
+        self.assertEqual(state["pressed"], ["Up"])  # No number and no Enter: /model would save a default.
+
+    def test_context_markdown(self):
+        text = """## Context Usage
+
+**Model:** claude-haiku-5-5  
+**Tokens:** 45.8k / 1m (5%)
+
+### Estimated usage by category
+
+| Category | Tokens | Percentage |
+|----------|--------|------------|
+| System prompt | 3.8k | 0.4% |
+| System tools (deferred) | 14.1k | 1.4% |
+| Messages | 33.6k | 3.4% |
+| Free space | 921.2k | 92.1% |
+
+### Skills
+
+| Skill | Source | Tokens |
+|-------|--------|--------|
+| hf-cli | User | ~340 |
+"""
+        parsed = app.parse_context(text)
+        self.assertEqual((parsed["used"], parsed["window"], parsed["percent"], parsed["model"]), ("45.8k", "1m", 5.0, "claude-haiku-5-5"))
+        self.assertEqual([c["name"] for c in parsed["categories"]], ["System prompt", "System tools (deferred)", "Messages", "Free space"])
+        self.assertTrue(parsed["details"].startswith("### Skills"))
+        self.assertIsNone(app.parse_context("Unknown command"))
+
+    def test_helper_runs_are_not_sessions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for pid in (11, 12):
+                with open(os.path.join(folder, f"{pid}.json"), "w") as handle:
+                    json.dump({"pid": pid, "sessionId": "x"}, handle)
+            with mock.patch.object(app, "SESSIONS_DIR", folder), mock.patch.object(app, "helper_pids", {12}):
+                self.assertEqual(set(app.read_session_files()), {11})
+
+
 class PreviewTests(unittest.TestCase):
     """A session can see the previews beside its chat, and is told about them once."""
 

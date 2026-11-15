@@ -102,7 +102,7 @@ MONITOR_DIR = os.path.join(CONFIG_DIR, "monitor")
 ATTENTION_DIR = os.path.join(MONITOR_DIR, "attention")
 NAMES_FILE = os.path.join(MONITOR_DIR, "names.json")
 QUEUE_FILE = os.path.join(MONITOR_DIR, "queue.json")
-BTW_FILE = os.path.join(MONITOR_DIR, "btw.json")  # Side questions (/btw): Claude Code keeps them only on screen.
+BTW_FILE = os.path.join(MONITOR_DIR, "commands.json")  # Side questions (/btw) and command panels: Claude Code keeps them only on screen.
 KNOWN_FILE = os.path.join(MONITOR_DIR, "known_sessions.json")
 # Claude Code sometimes continues by itself shortly after a limit resets, so wait to see if it does.
 RETRY_GRACE_SECONDS = 90
@@ -143,6 +143,8 @@ SLASH_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
 SHOWN_SYSTEM_NOTES = {"away_summary", "compact_boundary", "informational"}
 COMMAND_OUTPUT = re.compile(r"<local-command-(?:stdout|stderr)>(.*?)</local-command-(?:stdout|stderr)>", re.S)
 ANSI_CODES = re.compile(r"\x1b\[[0-9;]*m")
+MAX_COMMANDS = 50  # Slash commands kept for the Commands tab.
+MAX_COMMAND_OUTPUT = 20_000
 # What Claude Code says after /model (or a "switch to the fallback model" answer), checked against 2.1.319.
 MODEL_SET = re.compile(r"^(?:Set model to |Fast mode ON \u00b7 model set )`*([^`\n]+?)`*(?: and saved as your default for new sessions)?\s*$")
 # An automatic switch, e.g. "Switched to Sonnet 5.5 due to high demand for Opus 5.5".
@@ -721,6 +723,9 @@ AGENTS_RECHECK_SECONDS = 30
 SESSION_FILE_STATUS = {"idle": "idle", "busy": "busy", "shell": "busy", "waiting": "waiting"}
 
 
+helper_pids = set()  # Claude Code processes this app runs for itself, such as context checks: not sessions.
+
+
 def read_session_files():
     """{pid: contents} of Claude Code's own file for each running session, or None if they can't be read."""
     try:
@@ -730,7 +735,7 @@ def read_session_files():
     files = {}
     for name in names:
         stem, dot, extension = name.partition(".")
-        if extension != "json" or not stem.isdigit() or str(int(stem)) != stem:
+        if extension != "json" or not stem.isdigit() or str(int(stem)) != stem or int(stem) in helper_pids:
             continue
         try:
             with open(os.path.join(SESSIONS_DIR, name), encoding="utf-8") as handle:
@@ -754,6 +759,8 @@ class Monitor:
         self.history_lock = threading.Lock()
         self.history_reader = None
         self.git_states = {}  # Folder -> when git was last asked about it, and its answer.
+        self.contexts = {}  # Session id -> its latest context check.
+        self.panels = {}  # Session id -> the command panel open on its screen, if any.
         self.panes = {}
         self.pid_ids = {}
         self.id_changes = []
@@ -819,7 +826,8 @@ class Monitor:
             if status is None or not isinstance(session_id, str) or not SESSION_ID.match(session_id):
                 return None
             name = entry.get("name") if isinstance(entry.get("name"), str) else session.get("name")
-            sessions.append({**session, "sessionId": session_id, "status": status, "name": name})
+            waiting_for = entry.get("waitingFor") if isinstance(entry.get("waitingFor"), str) else ""
+            sessions.append({**session, "sessionId": session_id, "status": status, "name": name, "waitingFor": waiting_for})
         return sessions
 
     def _notice_new_ids(self):
@@ -963,6 +971,8 @@ class Monitor:
             "tmux": self.panes.get(session.get("pid")),
             "attention": read_attention(session),
             "heldBusy": bool(session.get("heldBusy")),
+            "panel": bool(self.panels.get(session["sessionId"])),
+            "waitingFor": str(session.get("waitingFor") or "")[:60],
         }
 
     def background_state(self, session, transcript):
@@ -1091,8 +1101,10 @@ class Monitor:
         """Conversation for a live session, or just {"unchanged"} if it matches revision `since`."""
         # Outside the lock below, so that a slow repository can't hold up other readers.
         git_state = self._git_state(session_id)
-        btw = [{k: e.get(k) for k in ("id", "question", "at", "state", "answer", "answered")} for e in btw_for(session_id)]
-        btw_revision = hashlib.sha256(json.dumps(btw).encode()).hexdigest()[:12] if btw else ""
+        btw = [{k: e.get(k) for k in ("id", "kind", "question", "command", "title", "text", "at", "state", "answer", "answered")}
+               for e in btw_for(session_id)]
+        context = self.context_usage(session_id)
+        btw_revision = hashlib.sha256(json.dumps([btw, context]).encode()).hexdigest()[:12] if btw or context else ""
         # A separate lock, so a very long transcript's first read doesn't hold up the session list.
         with self.history_lock:
             try:
@@ -1100,7 +1112,8 @@ class Monitor:
                 if not reader:
                     # A session that has only just started has no transcript yet.
                     if any(s["sessionId"] == session_id for s in self.sessions):
-                        return {"rev": "empty." + btw_revision, "messages": [], "omitted": 0, "changes": None, "btw": btw}
+                        return {"rev": "empty." + btw_revision, "messages": [], "omitted": 0, "changes": None, "btw": btw,
+                                "context": context}
                     return None
                 # Git's answer is part of the revision: files can change with nothing added to the transcript.
                 git_revision = git_state["rev"] if git_state else ""
@@ -1117,9 +1130,37 @@ class Monitor:
                     "changes": changes,
                     "requests": reader.request_list(),
                     "btw": btw,
+                    "commands": reader.commands,
+                    "context": context,
                 }
             except OSError:
                 return None
+
+    def context_usage(self, session_id, check=False):
+        """What fills a session's context window, from Claude Code's own /context, or None before the first check.
+
+        Running /context in the session would add it to the conversation, so a separate, headless Claude
+        Code reads the same conversation instead (a fork that's never saved, with no request to the
+        model). It's checked again when the conversation has grown, at most every CONTEXT_CHECK_SECONDS.
+        """
+        session = next((s for s in self.sessions if s.get("sessionId") == session_id), None)
+        with self.lock:
+            known = self.contexts.get(session_id)
+            transcript = self.transcripts.get(session_id)
+            size = transcript.offset if transcript else None
+            due = session and not (known and known.get("running")) and (check or not known or (
+                known.get("size") != size and time.time() - known.get("started", 0) > CONTEXT_CHECK_SECONDS))
+            if due:
+                known = {**(known or {}), "running": True, "started": time.time(), "size": size}
+                self.contexts[session_id] = known
+        if due:
+            threading.Thread(target=self._check_context, args=(session_id, session.get("cwd") or ".", known), daemon=True).start()
+        return {k: v for k, v in known.items() if k not in ("size", "started")} if known else None
+
+    def _check_context(self, session_id, cwd, known):
+        result = check_context(session_id, cwd)
+        with self.lock:
+            self.contexts[session_id] = {**known, **result, "running": False}
 
     def tool_details(self, session_id, tool_id, agent_id=None):
         with self.history_lock:
@@ -3044,6 +3085,7 @@ class HistoryReader:
         self.instructions = None  # For a subagent: the first message, which is what it was asked to do.
         self.report = ""  # For a subagent: what it handed back when it finished.
         self.requests = []  # Tool rows for shell commands that sent requests to this computer.
+        self.commands = []  # Slash commands run, with what they printed, for the Commands tab.
         self.model = ""  # The model of Claude's latest reply.
         self.model_noted = False  # A switch was already shown, so the next reply's new model needs no note.
         self.entry_at = 0  # When the transcript entry being read was written, for the page to show.
@@ -3084,12 +3126,14 @@ class HistoryReader:
         output = COMMAND_OUTPUT.fullmatch(text.strip())
         if output:  # A slash command's output is recorded as a user message, but the user didn't write it.
             self._add_note(ANSI_CODES.sub("", output.group(1)))
+            self._command_output(output.group(1))
             return
         command = SLASH_COMMAND.search(text) if text.lstrip().startswith("<command-") else None
         if command:
             # Slash commands are stored as tags. Show them as they were typed.
             arguments = SLASH_ARGS.search(text)
             text = f"{command.group(1)} {arguments.group(1) if arguments else ''}".strip()
+            self._command_run(text, entry)
         text, parts = pasted_parts(text)
         text = history_text(text, HISTORY_TEXT)
         # A message typed while Claude was busy is recorded when queued and again when delivered.
@@ -3153,7 +3197,12 @@ class HistoryReader:
                 content = str(entry.get("content", ""))
                 command = SLASH_COMMAND.search(content)
                 output = COMMAND_OUTPUT.search(content)
-                self._add_note(command.group(1) if command else output.group(1) if output else content)
+                self._add_note(command.group(1) if command else ANSI_CODES.sub("", output.group(1)) if output else content)
+                if command:
+                    arguments = SLASH_ARGS.search(content)
+                    self._command_run(f"{command.group(1)} {arguments.group(1) if arguments else ''}".strip(), entry)
+                elif output:
+                    self._command_output(output.group(1))
         elif kind in ("user", "assistant"):
             self._ingest_message(entry, kind, position)
 
@@ -3260,6 +3309,16 @@ class HistoryReader:
         if "question" in message:
             message["answers"] = given_answers(message["question"], entry.get("toolUseResult"), text, message["error"])
         note_file_change(self.turn["files"], entry.get("toolUseResult"))
+
+    def _command_run(self, text, entry):
+        if self.is_subagent:
+            return
+        self.commands.append({"command": history_text(text, 300), "at": entry_time(entry), "output": ""})
+        del self.commands[:-MAX_COMMANDS]
+
+    def _command_output(self, output):
+        if self.commands and not self.commands[-1]["output"]:
+            self.commands[-1]["output"] = ANSI_CODES.sub("", output).strip()[:MAX_COMMAND_OUTPUT]
 
     def request_list(self):
         """The latest requests sent by shell commands, with the status code when the output shows one."""
@@ -3873,7 +3932,7 @@ def menu_options(screen):
     return options if keys and keys == [str(k) for k in range(1, len(keys) + 1)] and at_bottom(end) else []
 
 
-def choose_answer(target, answer, text=None):
+def choose_answer(target, answer, text=None, by_number=True, press=True):
     """Pick one answer of the menu on a session's screen: by its number, or by moving the highlight
     onto it and pressing Enter. With text, the answer is "Type something" and the text is typed in.
 
@@ -3881,9 +3940,9 @@ def choose_answer(target, answer, text=None):
     so after the text the highlight moves on to the Next or Submit line and Enter is pressed there."""
     send = lambda *keys: send_keys(target, *keys)
     same = lambda option: option["key"] == answer["key"] and option["label"] == answer["label"]
-    if answer["key"] and text is None:
+    if answer["key"] and text is None and by_number:
         return send(answer["key"])
-    if answer["key"] and answer["checked"] is None:
+    if answer["key"] and answer["checked"] is None and text is not None:
         send(answer["key"])  # This only moves the highlight onto "Type something". On tick boxes it would tick it.
     for _ in range(MENU_STEPS):
         time.sleep(0.15)
@@ -3897,7 +3956,7 @@ def choose_answer(target, answer, text=None):
                 return False
             if text is not None and answer["checked"] is not None:
                 return move_to_next(target)
-            return send("Enter")
+            return send("Enter") if press else True
         send("Down" if to > at else "Up")
     return False
 
@@ -4389,8 +4448,10 @@ def send_queued_now(monitor, request):
         first_refresh = next((i for i in items if i.get("refresh")), None)
         if item.get("retry") or item.get("guard") or (item.get("refresh") and item is not first_refresh):
             return False, "That step only runs once the session is idle."
-        if session["status"] == "waiting":
+        if session["status"] == "waiting" and session.get("waitingFor") != PANEL_WAITING:
             return False, "It's waiting for an answer. Answer it first, then send this."
+        if session["status"] != "busy" and panel_open(session):
+            return False, "A command's panel is open on its screen. Close it from the Commands tab first."
         if session["status"] == "busy" and BTW_COMMAND.match(item["text"]):
             ok, message = send_btw_now(session, item["text"])
             if not ok:
@@ -4399,6 +4460,7 @@ def send_queued_now(monitor, request):
             ok, message = interrupt_and_type_command(session, item["text"])
             if not ok:
                 return False, message
+            sent_commands[session["id"]] = (item["text"].split()[0][:60], time.time())
             state["sent"][session["id"]] = time.time()
         elif session["status"] == "busy":
             before = input_box(session_screen(session["tmux"]))
@@ -4447,6 +4509,8 @@ def send_tracked(monitor, session, text, state, images=(), pasted=()):
     if succeeded:
         state["sent"][session["id"]] = time.time()
         note_btw(session, text)
+        if text.startswith("/") and not BTW_COMMAND.match(text):
+            sent_commands[session["id"]] = (text.split()[0][:60], time.time())
         if not text.startswith("/"):  # Slash commands aren't recorded as messages.
             state["checks"][session["id"]] = {"text": text, "images": list(images), "pasted": list(pasted), "count": before, "at": time.time()}
     return succeeded, message
@@ -4603,6 +4667,182 @@ def send_btw_now(session, text):
     return True, "Sent."
 
 
+# Panels that slash commands such as /status, /model, /config or /resume open at the bottom of the
+# screen, below a "▔▔▔" line, in place of the input box. Each ends in a line of key hints, such as
+# "Enter to set as default · s to use this session only · Esc to cancel", which the page turns into
+# buttons, so whatever a panel offers can be done from the app.
+PANEL_RULE = re.compile(r"^\s*▔{20,}")
+PANEL_KEYS = {"enter": "Enter", "esc": "Escape", "space": "Space", "tab": "Tab", "↑": "Up", "↓": "Down",
+              "←": "Left", "→": "Right", "⇧←": "S-Left", "⇧→": "S-Right", "⇧tab": "BTab", "shift+tab": "BTab",
+              "backspace": "BSpace", "pgup": "PPage", "pgdn": "NPage", "home": "Home", "end": "End"}
+# Always offered: moving, picking, switching tabs and closing work the same in every panel.
+PANEL_BASE_KEYS = [("↑", "Up"), ("↓", "Down"), ("←", "Left"), ("→", "Right"), ("Tab", "Tab"), ("Space", "Space"),
+                   ("⌫", "BSpace"), ("Enter", "Enter"), ("Esc", "Escape")]
+PANEL_SEND = {key for _, key in PANEL_BASE_KEYS} | set(PANEL_KEYS.values())
+PANEL_WAITING = "dialog open"
+CONTEXT_CHECK_SECONDS = 30
+CONTEXT_TIMEOUT = 60
+
+
+def panel_key(spec):
+    """tmux's name for a key as a hint writes it ("Enter", "Ctrl+A", "⇧←", "s"), or None."""
+    spec = spec.strip()
+    lower = spec.lower()
+    if lower in PANEL_KEYS:
+        return PANEL_KEYS[lower]
+    ctrl = re.fullmatch(r"ctrl\+([a-z])", lower)
+    if ctrl:
+        return "C-" + ctrl.group(1)
+    if len(spec) == 1 and spec.isprintable() and not spec.isspace():
+        return spec
+    return None
+
+
+def hint_keys(hint):
+    """[{label, keys: [tmux key...]}] for each "KEY to ACTION" part of a panel's hint line.
+    "↑/↓ to scroll" gives both keys; "Type to filter" gives none, as the page has a box for typing."""
+    found = []
+    for part in hint.split("·"):
+        match = re.match(r"^\s*(.+?)\s+to\s+(.+?)\s*$", part)
+        if not match:
+            continue
+        spec, action = match.groups()
+        if spec.lower() == "type":
+            continue
+        # "⇧←/→" is shift with each arrow.
+        pieces = spec.split("/") if spec != "/" else ["/"]
+        if len(pieces) == 2 and pieces[0].startswith("⇧") and not pieces[1].startswith("⇧"):
+            pieces[1] = "⇧" + pieces[1]
+        keys = [panel_key(piece) for piece in pieces]
+        if keys and all(keys):
+            found.append({"label": f"{spec}: {action}", "keys": keys})
+    return found
+
+
+def command_panel(screen):
+    """The panel a command has open at the bottom of the screen: {title, text, hint, keys, options}, or None."""
+    if input_box(screen) is not None:
+        return None
+    lines = [line.rstrip() for line in screen.split("\n")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    rule = next((i for i in range(len(lines) - 1, -1, -1) if PANEL_RULE.match(lines[i])), None)
+    if rule is None:
+        return None
+    body = lines[rule + 1:]
+    while body and not body[0].strip():
+        body.pop(0)
+    if not body:
+        return None
+    indent = min(len(line) - len(line.lstrip()) for line in body if line.strip())
+    # A long hint wraps onto the line above, which then also lists "KEY to ACTION" parts.
+    start = len(body) - 1
+    while start > 1 and "·" in body[start - 1] and re.search(r"\bto\b", body[start - 1]) and len(body) - start < 3:
+        start -= 1
+    hint = " ".join(line.strip() for line in body[start:])
+    return {"title": body[0].strip()[:120], "text": "\n".join(line[indent:] for line in body),
+            "hint": hint, "keys": hint_keys(hint) if " to " in hint else [], "options": menu_options(screen)}
+
+
+sent_commands = {}  # Session id -> the last slash command this app typed there, and when, to name its panel.
+
+
+def panel_allowed(session):
+    """Claude Code reports a session with a command's panel open as waiting, for a "dialog open". Other
+    waits are questions and permission prompts, which have their own buttons."""
+    return session["status"] != "waiting" or session.get("waitingFor") == PANEL_WAITING
+
+
+def panel_open(session):
+    """Whether a command's panel covers the input box, where anything typed would land in the panel."""
+    return bool(session.get("tmux")) and command_panel(session_screen(session["tmux"])) is not None
+
+
+def watch_panels(monitor):
+    """Note which hosted sessions have a panel open, and keep what each showed once it closes."""
+    snapshot = monitor.snapshot()
+    if snapshot["error"]:
+        return
+    seen = {}
+    for session in snapshot["sessions"]:
+        if not session["hosted"] or not panel_allowed(session):
+            continue
+        screen = session_screen(session["tmux"])
+        panel = command_panel(screen)
+        if panel and not btw_panel(screen):  # Side questions have their own entries.
+            seen[session["id"]] = panel
+    with monitor.lock:
+        before, monitor.panels = monitor.panels, seen
+    for session_id, panel in before.items():
+        if session_id in seen:
+            continue  # Still open, though perhaps on another step, such as /model asking to confirm.
+        # Closed: keep what it last showed, as nothing else records it.
+        with btw_lock:
+            data = read_btw()
+            entries = data.setdefault(session_id, [])
+            command, sent_at = sent_commands.get(session_id, ("", 0))
+            opened = panel.get("opened", time.time())
+            entries.append({"id": secrets.token_hex(6), "kind": "panel", "title": panel["title"], "text": panel["text"][:BTW_MAX_ANSWER],
+                            "command": command if opened - 30 <= sent_at <= opened + 5 else "", "at": opened, "answered": time.time()})
+            del entries[:-BTW_KEEP]
+            write_btw(data)
+    for session_id, panel in seen.items():
+        old = before.get(session_id)
+        panel["opened"] = old["opened"] if old else time.time()
+
+
+def check_context(session_id, cwd):
+    """Run /context on a never-saved fork of a session's conversation. No request goes to the model."""
+    command = ["claude", "-p", "/context", "--resume", session_id, "--fork-session", "--no-session-persistence"]
+    try:
+        process = subprocess.Popen(command, cwd=cwd if os.path.isdir(cwd) else None, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"at": time.time(), "error": f"Couldn't start Claude Code: {clean(exc)}"}
+    helper_pids.add(process.pid)
+    try:
+        out, err = process.communicate(timeout=CONTEXT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        return {"at": time.time(), "error": "Claude Code took too long to report the context."}
+    finally:
+        helper_pids.discard(process.pid)
+    parsed = parse_context(out)
+    if process.returncode != 0 or not parsed:
+        return {"at": time.time(), "error": clean(err or out)[:300] or "Claude Code didn't report the context."}
+    return {"at": time.time(), "error": "", **parsed}
+
+
+def parse_context(text):
+    """/context's Markdown: model, tokens used of the window, the categories table, then the rest."""
+    model = re.search(r"\*\*Model:\*\*\s*(.+?)\s*$", text, re.M)
+    tokens = re.search(r"\*\*Tokens:\*\*\s*([\d.,]+[kmKM]?)\s*/\s*([\d.,]+[kmKM]?)\s*\((\d+(?:\.\d+)?)%\)", text)
+    if not tokens:
+        return None
+    categories, rest = [], ""
+    heading = re.search(r"^###\s+Estimated usage by category\s*$", text, re.M)
+    if heading:
+        after = text[heading.end():]
+        table = re.match(r"\s*(\|.*\|\s*\n)+", after)
+        for row in re.findall(r"^\|(.+)\|\s*$", table.group(0) if table else "", re.M):
+            cells = [c.strip() for c in row.split("|")]
+            if len(cells) >= 3 and not set(cells[0]) <= set("-: ") and cells[0] != "Category":
+                percent = re.match(r"(\d+(?:\.\d+)?)%", cells[2])
+                categories.append({"name": cells[0][:80], "tokens": cells[1][:20], "percent": float(percent.group(1)) if percent else 0.0})
+        rest = after[table.end():] if table else after
+    return {"model": model.group(1)[:80] if model else "", "used": tokens.group(1), "window": tokens.group(2),
+            "percent": float(tokens.group(3)), "categories": categories, "details": rest.strip()[:40_000]}
+
+
+def recheck_context(monitor, request):
+    session = monitor.current(str(request.get("id", "")))
+    if not session:
+        return False, "That session is no longer running."
+    monitor.context_usage(session["id"], check=True)
+    return True, "Checking."
+
+
 def send_reply(monitor, request):
     """Send a message now if the session is free, otherwise add it to the end of its queue."""
     text = HISTORY_CONTROL_CHARS.sub(" ", str(request.get("text", ""))).strip()
@@ -4630,7 +4870,7 @@ def send_reply(monitor, request):
         if BTW_COMMAND.match(text) and session["status"] == "busy":
             # A side question is answered while Claude works, so it neither waits nor interrupts.
             return send_btw_now(session, text)
-        if not items and may_type_now(session, state):
+        if not items and may_type_now(session, state) and not panel_open(session):
             succeeded, message = send_tracked(monitor, session, text, state, images, pasted)
             if succeeded:
                 return True, message
@@ -4794,7 +5034,7 @@ def deliver_queued(monitor):
                 continue
             # Answers "still idle?" from a fresh listing, as the check above may be seconds old.
             session = hosted_session(monitor, {"id": session_id})
-            if not session or items[0].get("error") or not may_type_now(session, state):
+            if not session or items[0].get("error") or not may_type_now(session, state) or panel_open(session):
                 continue
             if items[0].get("retry") and not session["failure"]:
                 items.pop(0)  # It has already moved on, so there's nothing to retry.
@@ -4821,9 +5061,52 @@ def run_queue_delivery(monitor):
         except Exception as exc:  # This thread has to outlive any one failure.
             print(f"claude-monitor: queue delivery failed: {clean(exc)}", file=sys.stderr, flush=True)
         try:
+            watch_panels(monitor)
+        except Exception as exc:
+            print(f"claude-monitor: reading command panels failed: {clean(exc)}", file=sys.stderr, flush=True)
+        try:
             watch_btw(monitor)
         except Exception as exc:
             print(f"claude-monitor: reading side answers failed: {clean(exc)}", file=sys.stderr, flush=True)
+
+
+def panel_action(session, action, request):
+    """A key, typed text or a picked option for the command panel on a session's screen. Each is checked
+    against the panel showing now, so nothing lands anywhere else, such as Esc on a working Claude."""
+    if not panel_allowed(session):
+        return False, "It's waiting for an answer, so no panel is showing."
+    target = session["tmux"]
+    panel = command_panel(session_screen(target))
+    if not panel:
+        return False, "That panel has closed."
+    if action == "panelkey":
+        key = str(request.get("key", ""))
+        if key not in PANEL_SEND | {k for item in panel["keys"] for k in item["keys"]}:
+            return False, "That key isn't offered there."
+        ok = send_text(target, key) if len(key) == 1 else send_keys(target, key)
+    elif action == "paneltext":
+        text = CONTROL_CHARS.sub(" ", str(request.get("text", ""))).strip()[:200]
+        if not text:
+            return False, "Type something first."
+        ok = send_text(target, text)
+        # A panel still loading, such as /resume reading its list, drops keys, so check they landed.
+        shown = lambda: text[-20:] in session_screen(target)
+        if ok and not shown():
+            time.sleep(1)
+            if not shown():
+                ok = send_text(target, text)
+                time.sleep(0.5)
+                if not shown():
+                    return False, "The panel didn't take the text. Try again in a moment."
+    else:
+        key, label = str(request.get("key", "")), request.get("label")
+        answer = next((o for o in panel["options"] if o["key"] == key and o["label"] == label), None)
+        if not answer:
+            return False, "Those options are no longer showing."
+        # Only moved to: what Enter does differs by panel (/model's saves a default, and "s" uses it for
+        # this session only), so that's left to the panel's own buttons, as in the terminal.
+        ok = choose_answer(target, answer, by_number=False, press=False)
+    return (True, "Sent.") if ok else (False, "Could not reach the session.")
 
 
 def press_key(monitor, request):
@@ -4851,6 +5134,8 @@ def press_key(monitor, request):
         if not choose_answer(session["tmux"], answer, text):
             return False, "Could not pick that answer. Check the screen and try again."
         return True, "Sent."
+    if action in ("panelkey", "paneltext", "panelchoose"):
+        return panel_action(session, action, request)
     if action in ("approve", "deny"):
         # Tied to the prompt that was on screen, so it can't land on a newer one.
         if not is_permission or attention.get("at") != request.get("prompt"):
@@ -5208,6 +5493,7 @@ def hand_over():
 POST_ROUTES = {
     "/api/sessions/update": update_app,
     "/api/sessions/restart-app": restart_app,
+    "/api/sessions/context": recheck_context,
     "/api/sessions/rename": rename_session,
     "/api/sessions/new": start_session,
     "/api/sessions/send": send_reply,
@@ -6030,6 +6316,23 @@ dialog::backdrop{background:#0009}
 #reqBox[hidden]{display:none}
 #btwBox{flex:1 1 0;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:10px;font-size:13px;align-content:start}
 #btwBox[hidden]{display:none}
+#cmdHist{display:grid;grid-template-columns:minmax(0,1fr);gap:10px}
+#panelLive{border:1px solid var(--line);border-radius:8px;padding:10px;display:grid;gap:8px;background:var(--card)}
+#panelLive[hidden]{display:none}#panelLive h3{margin:0;font-size:13px}
+#panelText{margin:0;white-space:pre;overflow:auto;max-height:24em;font-size:12px;line-height:1.35}
+.panelbtns{display:flex;flex-wrap:wrap;gap:6px}.panelbtns:empty{display:none}.panelbtns button{font-size:12px;padding:4px 8px}
+#panelType{display:flex;gap:6px}#panelType input{flex:1;min-width:0}
+.btw.cmdrun{border-left-color:var(--dim)}.btw .cmdout.screen{white-space:pre;overflow:auto}.btw .cmdout{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--dim);font-size:12px;max-height:20em;overflow:auto}
+#ctxBox{flex:1 1 0;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:12px;font-size:13px;align-content:start}
+#ctxBox[hidden]{display:none}
+#ctxBox .ctxhero{font-size:28px;font-weight:600;line-height:1.1}#ctxBox .ctxsub{color:var(--dim);font-size:12px}
+.ctxbar{display:flex;gap:2px;height:12px;border-radius:6px;overflow:hidden;background:var(--line)}
+.ctxbar>span{display:block;min-width:2px;height:100%}.ctxbar>.free{flex:1;min-width:0;background:transparent}
+.ctxbar>.buffer{background:repeating-linear-gradient(45deg,var(--dim) 0 2px,transparent 2px 5px)}
+.ctxtable{border-collapse:collapse;width:100%;font-size:12px}.ctxtable td{padding:3px 6px;border-bottom:1px solid var(--line)}
+.ctxtable td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.ctxtable tr.later td{color:var(--dim)}
+.ctxswatch{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+#ctxBox .ctxmore summary{cursor:pointer;color:var(--dim)}#ctxBox .ctxmore table{font-size:12px}
 #btwBox h3{margin:0;font-size:13px}#btwBox .reqnote{color:var(--dim);font-size:12px}
 .btw{min-width:0;border-left:3px solid var(--line);padding-left:10px}
 .btw summary{overflow-wrap:anywhere;font-weight:600}
@@ -6222,7 +6525,7 @@ textarea{min-height:110px;resize:vertical}
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
 <dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="queue" hidden></div>
-<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Questions asked with /btw, answered on the side" hidden>Side questions</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Side questions" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
+<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Slash commands: what they showed, side questions (/btw), and any panel open now" hidden>Commands</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabContext" type="button" role="tab" title="What fills this session's context window">Context</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Commands" hidden><section id="panelLive" aria-label="Panel open on its screen" hidden><h3 id="panelTitle"></h3><div class="reqnote">A command has this panel open on the session’s screen. Use the buttons as you would the keys. Messages wait in the queue until it closes.</div><pre id="panelText"></pre><div id="panelOpts" class="panelbtns"></div><div id="panelKeys" class="panelbtns"></div><form id="panelType"><input id="panelTypeText" aria-label="Type into the panel" placeholder="Type into it, such as to search or filter" maxlength="200" autocomplete="off"><button type="submit">Type</button></form><div id="panelErr" class="err"></div></section><div id="cmdHist"></div></div><div id="ctxBox" aria-label="Context" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
 <ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p>
@@ -6748,9 +7051,9 @@ function renderDevices(sessions){
 // A tab only appears when it has something in it. The choice is remembered, and comes back
 // when that tab does.
 const roomyScreen=matchMedia('(min-width:1300px)');
-let changedCount=0,agentCount=0,requestCount=0,btwCount=0,sideTab='preview',shownSideTab='files';
+let changedCount=0,agentCount=0,requestCount=0,btwCount=0,panelShown='',lastContext=null,sideTab='preview',shownSideTab='files';
 try{sideTab=localStorage.getItem('sideTab')||'preview'}catch(e){}
-const SIDE_TABS={chat:'tabChat',preview:'tabPreview',requests:'tabRequests',btw:'tabBtw',files:'tabFiles',agents:'tabAgents'};
+const SIDE_TABS={chat:'tabChat',preview:'tabPreview',requests:'tabRequests',btw:'tabBtw',files:'tabFiles',context:'tabContext',agents:'tabAgents'};
 function selectSideTab(tab){
  if(tab==='chat'){setFilesOpen(false,true);layoutPreview();return}
  sideTab=tab;
@@ -6766,7 +7069,7 @@ function toggleSideTab(tab){
 }
 function availableTabs(){
  const box=$('histDevices'),hasPreview=!!(box.tiles&&box.tiles.size>0);
- return {chat:singleColumn.matches,preview:hasPreview&&!roomyScreen.matches,requests:requestCount>0,btw:btwCount>0,files:true,agents:agentCount>0};
+ return {chat:singleColumn.matches,preview:hasPreview&&!roomyScreen.matches,requests:requestCount>0,btw:btwCount>0||!!panelShown,files:true,context:true,agents:agentCount>0};
 }
 function layoutPreview(){
  const box=$('histDevices'),page=$('histPage'),side=$('histSide'),tabs=$('sideTabs');
@@ -6786,6 +7089,7 @@ function layoutPreview(){
  $('agentList').hidden=tab!=='agents';
  $('reqBox').hidden=tab!=='requests';
  $('btwBox').hidden=tab!=='btw';
+ $('ctxBox').hidden=tab!=='context';
  for(const [name,id] of Object.entries(SIDE_TABS)){
   $(id).hidden=!avail[name];
   $(id).setAttribute('aria-selected',String(name===active));
@@ -6796,8 +7100,9 @@ function layoutPreview(){
  const files='Files changed'+(changedCount?' ('+changedCount+')':'');
  $('tabFiles').textContent=narrow?'Files'+(changedCount?' ('+changedCount+')':''):files;  // Short enough for the tabs to fit on a phone.
  $('tabRequests').textContent='Requests'+(requestCount?' ('+requestCount+')':'');
- $('tabBtw').textContent=(narrow?'Side':'Side questions')+(btwCount?' ('+btwCount+')':'');
- const others=['preview','requests','btw'].filter(n=>avail[n]);
+ $('tabBtw').textContent=(narrow?'Cmds':'Commands')+(panelShown?' ●':btwCount?' ('+btwCount+')':'');
+ $('tabContext').textContent=narrow?'Ctx':'Context';
+ const others=['preview','requests','btw','context'].filter(n=>avail[n]);
  $('histFiles').textContent=others.length?'Side panel':files;
  sizePanes();
 }
@@ -7141,7 +7446,7 @@ function updateFoot(s){
  if($('histAgents').textContent!==label){$('histAgents').textContent=label;$('tabAgents').textContent=label}
  if(agentCount!==s.subagents.length){agentCount=s.subagents.length;layoutPreview()}
  $('histName').textContent=s.name;
- const a=s.attention||{},permission=s.status==='waiting'&&a.kind==='permission',waiting=s.status==='waiting';
+ const a=s.attention||{},permission=s.status==='waiting'&&a.kind==='permission',waiting=s.status==='waiting'&&!s.panel;
  $('histTerm').hidden=!(s.hosted||s.job);
  $('histEnd').hidden=!s.hosted;
  const refreshing=(s.queue||[]).filter(i=>i.refresh);
@@ -7154,9 +7459,9 @@ function updateFoot(s){
  // A question that takes its own answer is answered from the reply box, not a box of its own.
  const own=s.hosted&&options.find(o=>/^Type something\b/.test(o.label));
  answerFor=own?{prompt:a.at,key:own.key,label:own.label}:null;
- const sendsNow=s.status==='idle'&&!(s.queue&&s.queue.length);
+ const sendsNow=s.status==='idle'&&!(s.queue&&s.queue.length)&&!s.panel;
  $('replySend').textContent=answerFor?'Answer':sendsNow?'Send':'Queue';
- $('replyText').placeholder=answerFor?'Type your own answer, or pick one above (Enter to answer, Shift+Enter for a new line)':
+ $('replyText').placeholder=s.panel&&!waiting&&!answerFor?'A command’s panel is open on its screen (see Commands). Messages wait until it closes.':answerFor?'Type your own answer, or pick one above (Enter to answer, Shift+Enter for a new line)':
   (sendsNow?'Reply…':waiting?'Queue a message for after you answer the prompt…':'Queue a message for when it finishes…')+' (Enter to '+(sendsNow?'send':'queue')+', Shift+Enter for a new line)';
  $('replyNote').textContent=s.hosted?'':s.job?'Started outside this app. To reply, use Open in terminal.':'Started in its own terminal. Reply there.';
  const want=!s.hosted?'':waiting&&options.length?'menu:'+a.at+':'+JSON.stringify(options):permission?'perm:'+a.at:waiting?'wait':s.status==='busy'?'busy':'';
@@ -7462,22 +7767,128 @@ function renderRequests(list){
  box.scrollTop=keep;
  layoutPreview();
 }
-// Side questions (/btw): answered on the side, so they stay out of the main chat.
-function renderBtw(list){
- const box=$('btwBox'),shut=new Set([...box.querySelectorAll('details:not([open])')].map(d=>d.dataset.id)),keep=box.scrollTop;
- btwCount=list.length;
- const rows=[el('h3','',null,'Side questions ('+list.length+')'),el('div','reqnote',null,'Asked with /btw, newest first. Claude answers these on the side while it carries on: they aren’t part of the main chat, and Claude won’t remember them later.')];
- for(const q of [...list].reverse()){
-  const d=el('details','btw');d.dataset.id=q.id;d.open=!shut.has(q.id);
-  const s=el('summary','',d,q.question);
-  el('span','btwtime',s,new Date(q.at*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}));
-  if(q.state==='answered')el('div','btwanswer',d,q.answer||'(No answer text.)');
-  else el('div','btwwait',d,q.state==='lost'?'The answer couldn’t be read from the session’s screen. Look in its terminal.':'Answering…');
+// The Commands tab: slash commands run and what they printed, side questions (/btw) with their
+// answers, and what a command's panel showed before it closed. All of these stay out of the main chat.
+function renderBtw(list,commands){
+ const box=$('cmdHist'),shut=new Set([...box.querySelectorAll('details:not([open])')].map(d=>d.dataset.id)),keep=$('btwBox').scrollTop;
+ const ran=commands.map((c,i)=>({...c,kind:'command',id:'c'+i+'-'+c.at}));
+ // A panel closes as its command is recorded, so the two meet up within seconds.
+ const panels=list.filter(q=>q.kind==='panel').filter(p=>{
+  const c=ran.find(c=>!c.panel&&c.at>=p.at-10&&c.at<=(p.answered||p.at)+10&&(!p.command||c.command.split(' ')[0]===p.command));
+  if(c)c.panel=p.text;
+  return !c;
+ });
+ const items=[...list.filter(q=>q.kind!=='panel').map(q=>({...q,kind:q.kind||'btw'})),...panels,...ran].sort((a,b)=>b.at-a.at);
+ btwCount=items.length;
+ const rows=[el('h3','',null,'Commands ('+items.length+')'),el('div','reqnote',null,'Newest first. Side questions (/btw) are answered while Claude carries on: they aren’t part of the main chat, and Claude won’t remember them later.')];
+ const when=at=>new Date(at*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+ for(const q of items){
+  const d=el('details','btw'+(q.kind==='btw'?'':' cmdrun'));d.dataset.id=q.id;
+  const s=el('summary','',d,q.kind==='btw'?'/btw '+q.question:q.kind==='panel'?(q.command||'Panel: '+q.title):q.command);
+  el('span','btwtime',s,when(q.at));
+  if(q.kind==='btw'){
+   d.open=!shut.has(q.id);
+   if(q.state==='answered')el('div','btwanswer',d,q.answer||'(No answer text.)');
+   else el('div','btwwait',d,q.state==='lost'?'The answer couldn’t be read from the session’s screen. Look in its terminal.':'Answering…');
+  }else if(q.kind==='panel'){
+   d.open=false;
+   el('div','reqnote',d,'What it showed when it closed:');
+   el('pre','cmdout screen',d,q.text);
+  }else{
+   d.open=!!(q.output||q.panel)&&!shut.has(q.id);
+   if(q.output||!q.panel)el('pre','cmdout',d,q.output||'Nothing printed. If it opens a panel, that shows above while it’s open, and here once it closes.');
+   if(q.panel){el('div','reqnote',d,'What its panel showed when it closed:');el('pre','cmdout screen',d,q.panel)}
+  }
   rows.push(d);
  }
  box.replaceChildren(...rows);
- box.scrollTop=keep;
+ $('btwBox').scrollTop=keep;
  layoutPreview();
+}
+// A command's panel open on the session's screen now, with a button for each key it offers.
+function renderPanel(p){
+ const live=$('panelLive'),sig=p?JSON.stringify([p.text,p.keys,p.options]):'';
+ const opened=p&&panelShown!==p.title;
+ panelShown=p?p.title:'';
+ if(live.dataset.shown===sig){if(!p)live.hidden=true;return}
+ live.dataset.shown=sig;live.hidden=!p;
+ if(!p){layoutPreview();return}
+ $('panelTitle').textContent='Open on its screen now';
+ const atEnd=$('panelText').scrollHeight-$('panelText').scrollTop-$('panelText').clientHeight<24;
+ $('panelText').textContent=p.text;
+ if(atEnd)$('panelText').scrollTop=$('panelText').scrollHeight;
+ const send=(body)=>act('key',{id:histSession,...body}).then(ok=>{if(!ok){$('panelErr').textContent=$('replyErr').textContent}else $('panelErr').textContent=''});
+ const opts=$('panelOpts');opts.replaceChildren();
+ for(const o of p.options||[]){
+  if(!o.key)continue;  // Unnumbered lists, such as /config's settings, are moved through with the arrow keys.
+  const b=el('button',o.highlighted?'primary':'',opts,(o.checked===null?'':o.checked?'☑ ':'☐ ')+o.label);b.type='button';
+  b.title='Move to this one'+(o.description?' · '+o.description:'')+'. Then use the panel’s own keys below, such as Enter.';
+  b.addEventListener('click',()=>send({action:'panelchoose',key:o.key,label:o.label}));
+ }
+ const keys=$('panelKeys');keys.replaceChildren();
+ const keyButton2=(label,key,title)=>{const b=el('button','',keys,label);b.type='button';if(title)b.title=title;b.addEventListener('click',()=>send({action:'panelkey',key}))};
+ for(const k of p.keys||[]){
+  const [spec,action]=[k.label.slice(0,k.label.indexOf(':')),k.label.slice(k.label.indexOf(':')+2)];
+  const pieces=k.keys.length>1?spec.split('/'):[spec];
+  k.keys.forEach((key,i)=>keyButton2((pieces[i]||key)+(k.keys.length>1?'':' – '+action),key,action));
+ }
+ const offered=new Set((p.keys||[]).flatMap(k=>k.keys));
+ for(const [label,key] of [['↑','Up'],['↓','Down'],['←','Left'],['→','Right'],['Tab','Tab'],['Space','Space'],['⌫','BSpace'],['Enter','Enter'],['Esc','Escape']])
+  if(!offered.has(key))keyButton2(label,key,{Escape:'Close or go back',BSpace:'Delete a typed character',Tab:'Next field or tab'}[key]||'');
+ // A panel that has just opened is brought into view.
+ if(opened){selectSideTab('btw');setFilesOpen(true,true)}
+ layoutPreview();
+}
+$('panelType').addEventListener('submit',async e=>{
+ e.preventDefault();
+ const text=$('panelTypeText').value;
+ if(text.trim()&&await act('key',{id:histSession,action:'paneltext',text}))$('panelTypeText').value='';
+ else $('panelErr').textContent=$('replyErr').textContent;
+});
+// What fills the context window, from Claude Code's own /context, run separately on this conversation.
+const CTX_COLORS={'System prompt':'#3987e5','System tools':'#d95926','MCP tools':'#199e70','MCP server instructions':'#c98500','Skills':'#d55181','Memory files':'#0ca30c','Custom agents':'#9085e9','Messages':'#e66767'};
+function renderContext(c){
+ const sig=JSON.stringify(c);
+ if(sig===lastContext)return;
+ lastContext=sig;
+ const box=$('ctxBox'),rows=[];
+ const check=el('button','',null,c&&c.running?'Checking…':'Check now');check.type='button';check.disabled=!!(c&&c.running);
+ check.addEventListener('click',async()=>{check.disabled=true;check.textContent='Checking…';try{await post('context',{id:histSession})}catch(e){}setTimeout(loadHistory,2500)});
+ if(!c||!c.used){
+  rows.push(el('h3','',null,'Context'));
+  rows.push(el('div','ctxsub',null,c&&c.error?'Couldn’t check: '+c.error:'Checking what fills this session’s context…'));
+  if(c&&c.error)rows.push(check);
+  box.replaceChildren(...rows);return;
+ }
+ rows.push(el('div','ctxhero',null,c.used+' of '+c.window+' tokens'));
+ rows.push(el('div','ctxsub',null,c.percent+'% used'+(c.model?' · '+c.model:'')));
+ const counted=c.categories.filter(k=>!/\(deferred\)/i.test(k.name));
+ const bar=el('div','ctxbar');bar.setAttribute('role','img');
+ bar.setAttribute('aria-label',counted.map(k=>k.name+' '+k.tokens+' ('+k.percent+'%)').join(', '));
+ for(const k of counted){
+  if(/^Free space$/i.test(k.name)||!k.percent)continue;
+  if(/^Autocompact buffer$/i.test(k.name))continue;
+  const seg=el('span','',bar);seg.style.width=k.percent+'%';seg.style.background=CTX_COLORS[k.name]||'var(--dim)';seg.title=k.name+': '+k.tokens+' tokens ('+k.percent+'%)';
+ }
+ el('span','free',bar).title='Free space';
+ const buffer=counted.find(k=>/^Autocompact buffer$/i.test(k.name));
+ if(buffer&&buffer.percent){const seg=el('span','buffer',bar);seg.style.width=buffer.percent+'%';seg.title='Autocompact buffer: '+buffer.tokens+' tokens ('+buffer.percent+'%), kept free so the conversation can be compacted'}
+ rows.push(bar);
+ const table=el('table','ctxtable');
+ for(const k of c.categories){
+  const later=/\(deferred\)/i.test(k.name),tr=el('tr',later?'later':'',table),name=el('td','',tr);
+  const color=CTX_COLORS[k.name]||(/^Free space$/i.test(k.name)?'var(--line)':/^Autocompact buffer$/i.test(k.name)?'':'var(--dim)');
+  const sw=el('span','ctxswatch',name);
+  if(/^Autocompact buffer$/i.test(k.name))sw.style.background='repeating-linear-gradient(45deg,var(--dim) 0 2px,transparent 2px 5px)';else sw.style.background=color;
+  name.append(k.name);
+  if(later)name.title='Loaded only when needed, so not counted in the total yet';
+  el('td','num',tr,k.tokens);el('td','num',tr,k.percent+'%');
+ }
+ rows.push(table);
+ if(c.details){const more=el('details','ctxmore');el('summary','',more,'More detail');const body=el('div','',more);markdown(c.details,body);rows.push(more)}
+ rows.push(el('div','ctxsub',null,'Checked '+new Date(c.at*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+' by running Claude Code’s /context on a copy of this conversation that isn’t saved. That doesn’t touch the session or cost anything. It’s checked again as the conversation grows, at most every 30 seconds. All figures are Claude Code’s own estimates.'+(c.error?' The last check failed: '+c.error:'')));
+ rows.push(check);
+ box.replaceChildren(...rows);
 }
 function relativePath(p){return histCwd&&p.startsWith(histCwd+'/')?p.slice(histCwd.length+1):p}
 function renderChanges(c){
@@ -7600,13 +8011,14 @@ async function loadHistory(){
    const live=cards.get(id)&&cards.get(id).session;
    if(live)$('histHint').textContent=live.cwd+' · pid '+live.pid+(live.hosted?' · keeps running after you close this app':'');
   }
-  if(!h.unchanged){histRev=h.rev;renderHistory(h);renderChanges(h.changes);renderRequests(h.requests||[]);renderBtw(h.btw||[])}
+  if(!h.unchanged){histRev=h.rev;renderHistory(h);renderChanges(h.changes);renderRequests(h.requests||[]);renderBtw(h.btw||[],h.commands||[]);renderContext(h.context)}
   const s=cards.get(id)&&cards.get(id).session;
   let live=null;
-  if(s&&s.hosted&&(s.status==='waiting'||s.status==='busy')){
+  if(s&&s.hosted&&(s.status==='waiting'||s.status==='busy'||s.panel)){
    const sr=await fetch('/api/screen?id='+encodeURIComponent(id),{cache:'no-store'});
    if(sr.ok&&id===histSession){
     const shot=await sr.json();live=shot.live;
+    renderPanel(s.status!=='waiting'||s.waitingFor==='dialog open'?shot.panel:null);
     const at=String((s.attention||{}).at),list=shot.options||[];
     if(menuOptions.at!==at||JSON.stringify(menuOptions.list)!==JSON.stringify(list)){menuOptions={at,list};updateFoot(s)}
     if(s.status==='waiting'){
@@ -7619,6 +8031,7 @@ async function loadHistory(){
     }
    }
   }
+  else if(id===histSession&&panelShown)renderPanel(null);
   if(id===histSession){renderLive(s,live);await loadAgents()}
  }catch(e){if(id===histSession)$('histHint').textContent='Lost connection to claude-monitor; retrying…'}
 }
@@ -7630,7 +8043,7 @@ function openHistory(s,fromUrl){
  setRenaming(false);
  $('histBody').replaceChildren();shownMessages=[];$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
- $('replyErr').textContent='';$('replyText').value='';pendingImages=[];$('replySlow').textContent='';pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;$('btwBox').replaceChildren();$('btwBox').hidden=true;btwCount=0;
+ $('replyErr').textContent='';$('replyText').value='';pendingImages=[];$('replySlow').textContent='';pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;$('cmdHist').replaceChildren();$('btwBox').hidden=true;btwCount=0;panelShown='';$('panelLive').hidden=true;$('panelLive').dataset.shown='';$('ctxBox').replaceChildren();lastContext=null;
  updateFoot(s);
  let saved=null;try{saved=localStorage.getItem('filesOpen')}catch(e){}
  setFilesOpen(!singleColumn.matches&&(saved?saved==='1':innerWidth>=1100),false);  // On a phone, the chat comes first.
@@ -7722,14 +8135,14 @@ $('replyForm').addEventListener('submit',async e=>{
  if(echo){sentEcho=echo;showEcho()}
  $('replySlow').textContent='';
  const ok=await act('send',{id:sid,text,images,pasted});
- if(sentEcho===echo){
+ if(echo&&sentEcho===echo){
   if(ok&&lastActMessage==='Sent.'){echo.posting=false;echo.timing=lastActTiming;showEcho();quickPoll()}
   else{sentEcho=null;showEcho()}  // Queued messages show in the queue; failures say why below the box.
  }
  $('replySlow').textContent=slowSend(lastActTiming);
  if(ok){$('replyText').value='';pendingImages=[];pastedTexts=[];renderPending()}
  // The answer shows in its own tab, not the chat, so that tab opens.
- if(ok&&/^\/btw\s/.test(text.trim())&&lastActMessage==='Sent.'){selectSideTab('btw');setFilesOpen(true,true);quickPoll()}
+ if(ok&&/^\/\S/.test(text.trim())&&lastActMessage==='Sent.'){selectSideTab('btw');setFilesOpen(true,true);quickPoll()}
 });
 // "Reached Claude Code in 3.4 s: listing sessions 2.9 s, typing 0.4 s", only when it was slow.
 function slowSend(t){
@@ -8352,7 +8765,8 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                 session = next((s for s in monitor.snapshot()["sessions"] if s["id"] == session_id), None)
                 if session and session["hosted"]:
                     screen = session_screen(session["tmux"])
-                    self.send_json(200, {"screen": screen, "live": live_activity(screen), "options": menu_options(screen)})
+                    self.send_json(200, {"screen": screen, "live": live_activity(screen), "options": menu_options(screen),
+                                         "panel": command_panel(screen)})
                 else:
                     self.send_json(404, {"error": "Not available for this session."})
             else:
