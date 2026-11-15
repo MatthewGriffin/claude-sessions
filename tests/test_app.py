@@ -1802,6 +1802,32 @@ class CommandOptionTests(unittest.TestCase):
                          ["low", "medium", "high", "xhigh", "max", "auto"])
 
 
+class ChatOutputTests(unittest.TestCase):
+    """What the terminal shows reaches the chat: live output in its last row, other records folded."""
+
+    def test_live_output_without_the_frame(self):
+        screen = "\n".join([" ▐▛███▜▌   Claude Code v2.1.325", "▝▜█████▛▘  Haiku 5.5 · Claude Pro", "  ▘▘ ▝▝    /tmp/x",
+                             "● Printing lines · 21s", "  ⎿  $ for i in 1 2 3 (9s · 10 lines)", " " * 60 + "◐ medium · /effort",
+                             "✶ Fiddle-faddling… (11s · ↓ 131 tokens)", "─" * 60, "❯ ", "─" * 60])
+        live = app.live_activity(screen)
+        self.assertEqual(live["head"], "✶ Fiddle-faddling… (11s · ↓ 131 tokens)")
+        self.assertEqual(live["lines"], ["● Printing lines · 21s", "  ⎿  $ for i in 1 2 3 (9s · 10 lines)"])
+
+    def test_hook_records_are_folded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "t.jsonl")
+            with open(path, "w") as handle:
+                for entry in [{"type": "attachment", "attachment": {"type": "hook_additional_context", "content": ["Previews: phone"]}},
+                              {"type": "system", "subtype": "stop_hook_summary", "hookErrors": ["exit 1: boom"]},
+                              {"type": "system", "subtype": "bridge_status", "content": "/remote-control is active"}]:
+                    handle.write(json.dumps(entry) + "\n")
+            reader = app.HistoryReader(path)
+            reader.poll()
+        shown = [(m["role"], m.get("title"), m["text"]) for m in reader.messages]
+        self.assertEqual(shown, [("detail", "Context a hook added", "Previews: phone"), ("detail", "Hook error", "exit 1: boom"),
+                                 ("system", None, "/remote-control is active")])
+
+
 class PreviewTests(unittest.TestCase):
     """A session can see the previews beside its chat, and is told about them once."""
 

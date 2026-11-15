@@ -141,7 +141,8 @@ IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 MAX_DIFF_LINES_PER_FILE = 4000
 SLASH_COMMAND = re.compile(r"<command-name>(.*?)</command-name>", re.S)
 SLASH_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
-SHOWN_SYSTEM_NOTES = {"away_summary", "compact_boundary", "informational"}
+# System entries the terminal shows as a line of their own.
+SHOWN_SYSTEM_NOTES = {"away_summary", "compact_boundary", "informational", "scheduled_task_fire", "bridge_status"}
 COMMAND_OUTPUT = re.compile(r"<local-command-(?:stdout|stderr)>(.*?)</local-command-(?:stdout|stderr)>", re.S)
 ANSI_CODES = re.compile(r"\x1b\[[0-9;]*m")
 MAX_COMMANDS = 50  # Slash commands kept for the Commands tab.
@@ -3295,6 +3296,11 @@ class HistoryReader:
         if str(text or "").strip():
             self.add({"role": "system", "note": True, "text": history_text(text, HISTORY_TEXT)})
 
+    def _add_detail(self, title, text):
+        """Something the session recorded that isn't its output, shown folded, as thinking is."""
+        if str(text or "").strip() and not self.is_subagent:
+            self.add({"role": "detail", "title": title, "text": history_text(text, HISTORY_TEXT)})
+
     def _model_note(self, by, name, was=""):
         if by == "you":
             text = f"You switched the model to {name}"
@@ -3330,10 +3336,19 @@ class HistoryReader:
                     self.add({"role": "system", "text": history_text(attachment["prompt"], HISTORY_TEXT)})
             elif attachment.get("type") == "hook_system_message":
                 self._add_note(attachment.get("content"))
+            elif attachment.get("type") == "hook_additional_context":
+                # Context a hook gave Claude: not output as such, so it's folded away.
+                content = attachment.get("content")
+                text = "\n\n".join(map(str, content)) if isinstance(content, list) else str(content or "")
+                self._add_detail("Context a hook added", text)
         elif kind == "system":
             subtype = entry.get("subtype")
             if subtype in SHOWN_SYSTEM_NOTES and str(entry.get("content", "")).strip():
                 self.add({"role": "system", "text": history_text(entry["content"], HISTORY_TEXT)})
+            elif subtype == "stop_hook_summary" and entry.get("hookErrors"):
+                errors = entry["hookErrors"]
+                self._add_detail("Hook error", "\n".join(e if isinstance(e, str) else json.dumps(e) for e in errors)
+                                 if isinstance(errors, list) else str(errors))
             elif subtype == "turn_duration" and isinstance(entry.get("durationMs"), (int, float)):
                 self._add_note("Worked for " + format_age(entry["durationMs"] / 1000))
             elif subtype == "local_command":
@@ -4123,6 +4138,11 @@ def move_to_next(target):
     return False
 
 
+# Parts of Claude Code's screen that are its frame, not output: the logo banner and the lines beside it,
+# hints pushed to the right edge ("◐ medium · /effort", "Ctrl+Y to paste deleted text"), and tmux's notice.
+SCREEN_CHROME = re.compile(r"[▐▛▜▝▘▗▖█▌]{2}|^\s*Claude Code v\d|^\s{30,}\S|tmux focus-events")
+
+
 def live_activity(screen):
     """What the terminal shows above its input box: the status line, and the lines leading up to it.
 
@@ -4142,7 +4162,7 @@ def live_activity(screen):
         # The user's messages are in the chat already. On screen, each ends at a blank line.
         in_user_message = line.lstrip().startswith("❯") or (in_user_message and bool(line.strip()))
         # Keyboard hints mean nothing in the app, which can't receive those keys.
-        if line.strip() and not in_user_message and "(ctrl+" not in line:
+        if line.strip() and not in_user_message and "(ctrl+" not in line and not SCREEN_CHROME.search(line):
             shown.append(line)
     return {"head": head, "lines": shown[-LIVE_LINES:]}
 
@@ -6666,10 +6686,11 @@ html:has(#hist[open]){overflow:hidden}
 #histFiles{margin-left:auto}#histEnd{color:var(--bad)}
 #renameForm{display:flex;gap:6px;flex:1;min-width:0}#renameForm input{flex:1;min-width:0;padding:2px 6px}
 #histFoot{border-top:1px solid var(--line);padding:10px 16px;display:grid;gap:8px}
-#histLive{border-top:1px solid var(--line);padding:8px 16px;display:grid;gap:6px;font-size:12px;flex:none}
-#liveHead{color:var(--busy);overflow-wrap:anywhere}
-#liveText{margin:0;color:var(--dim);white-space:pre-wrap;overflow-wrap:anywhere;max-height:22vh;overflow:auto}
-#liveAgents{display:grid;gap:2px;overflow-wrap:anywhere;max-height:12vh;overflow-y:auto}
+.liverow summary{color:var(--busy);overflow-wrap:anywhere}
+.liverow.empty summary{list-style:none;cursor:default}.liverow.empty summary::-webkit-details-marker{display:none}
+.liverow pre{margin:4px 0 0;color:var(--dim);white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;max-height:40vh;overflow:auto}
+.liverow .livemore{display:grid;gap:2px;font-size:12px;color:var(--dim);overflow-wrap:anywhere;margin-top:4px}
+details.detail pre{margin:4px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;color:var(--dim);max-height:40vh;overflow:auto}
 .trunning{color:var(--busy);margin-left:8px}
 #screen{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;background:#14161f;border:1px solid var(--warn);border-radius:4px;padding:8px;max-height:40vh;overflow:auto;font-size:12px}
 #keys{display:flex;flex-wrap:wrap;gap:8px}
@@ -6769,7 +6790,7 @@ textarea{min-height:110px;resize:vertical}
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
 <dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
-<section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="replyDraft" hidden><span id="replyDraftText"></span> <button id="replyDraftClear" type="button">Empty its input box</button></div><div id="queue" hidden></div>
+<div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="replyDraft" hidden><span id="replyDraftText"></span> <button id="replyDraftClear" type="button">Empty its input box</button></div><div id="queue" hidden></div>
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Slash commands: what they showed, side questions (/btw), and any panel open now" hidden>Commands</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabContext" type="button" role="tab" title="What fills this session's context window">Context</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Commands" hidden><section id="panelLive" aria-label="Panel open on its screen" hidden><h3 id="panelTitle"></h3><div class="reqnote">A command has this panel open on the session’s screen. Use the buttons as you would the keys. Messages wait in the queue until it closes.</div><pre id="panelText"></pre><div id="panelOpts" class="panelbtns"></div><div id="panelKeys" class="panelbtns"></div><form id="panelType"><input id="panelTypeText" aria-label="Type into the panel" placeholder="Type into it, such as to search or filter" maxlength="200" autocomplete="off"><button type="submit">Type</button></form><div id="panelErr" class="err"></div></section><div id="cmdHist"></div></div><div id="ctxBox" aria-label="Context" hidden></div><div id="startedBox" aria-label="Sessions it started" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
@@ -7838,22 +7859,27 @@ function toolDetailsRow(m,open,agent){
  return d;
 }
 // What's happening right now, which the transcript doesn't record until it's finished.
+// What the terminal shows while Claude works, as the last row of the chat, as in Claude Code: its working
+// line ("✢ Warping… (9m 5s · ↓ 19.4k tokens)"), then folded like a tool row, the running output.
+const liveRow=el('details','liverow');liveRow.dataset.seq='live';
+const liveSummary=el('summary','',liveRow),liveOut=el('pre','',liveRow),liveMore=el('div','livemore',liveRow);
 function renderLive(s,live){
- const box=$('histLive'),agents=s?s.subagents.filter(a=>a.state==='working'):[],busy=s&&s.status==='busy',tasks=s&&s.background||[];
- box.hidden=!busy&&!agents.length&&!tasks.length;
- if(box.hidden)return;
- const output=$('liveText'),atEnd=output.scrollHeight-output.scrollTop-output.clientHeight<24;
+ const body=$('histBody'),agents=s?s.subagents.filter(a=>a.state==='working'):[],busy=s&&s.status==='busy',tasks=s&&s.background||[];
+ if(!busy&&!agents.length&&!tasks.length){liveRow.remove();return}
+ const atEnd=body.scrollHeight-body.scrollTop-body.clientHeight<40;
  const quiet=s.quiet!==null&&s.quiet>=5?' · last activity '+s.quiet+'s ago':'';
  const waitingOn=[agents.length&&'subagents',tasks.length&&'background tasks'].filter(Boolean).join(' and ');
  const head=(live&&live.head)||(busy&&!waitsOnTasks(s)?(s.now||'Working')+quiet:'Claude has finished its turn, but '+waitingOn+' are still running');
- if($('liveHead').textContent!==head)$('liveHead').textContent=head;
+ if(liveSummary.textContent!==head)liveSummary.textContent=head;
  const text=live?live.lines.join('\n'):'';
- if(output.textContent!==text)output.textContent=text;
- output.hidden=!text;
- $('liveAgents').replaceChildren(
+ if(liveOut.textContent!==text)liveOut.textContent=text;
+ liveOut.hidden=!text;
+ liveMore.replaceChildren(
   ...agents.map(a=>el('div','',null,'Subagent '+(a.description||a.type)+': '+(a.now||a.last||'working'))),
   ...tasks.map(t=>el('div','',null,'Background: '+t.description+(t.running!==null?' · running for '+age(t.running):''))));
- if(atEnd)output.scrollTop=output.scrollHeight;
+ liveRow.classList.toggle('empty',!text);
+ if(body.lastElementChild!==liveRow)body.append(liveRow);
+ if(atEnd&&histFollow)body.scrollTop=body.scrollHeight;
 }
 function questionRow(m){
  // A question Claude asked, and the answers given, as chat rather than a tool call.
@@ -7987,6 +8013,10 @@ function messageRow(m,open,agent,openSet){
   const d=el('details','thinking');d.dataset.seq=m.seq;d.open=open;
   el('summary','',d,'Thinking');markdown(m.text,el('div','md',d));return d;
  }
+ if(m.role==='detail'){
+  const d=el('details','thinking detail');d.dataset.seq=m.seq;d.open=open;
+  el('summary','',d,m.title);el('pre','',d,m.text);return d;
+ }
  const r=el('div','msg '+m.role);
  if(m.model){
   r.classList.add('model');
@@ -8027,6 +8057,7 @@ function renderHistory(h){
  body.replaceChildren(...rows);
  shownMessages=h.messages;
  showEcho();
+ if(liveRow.isConnected||liveSummary.textContent)body.append(liveRow);  // The live row stays last.
  // Loading earlier items adds above, so stay on the same message.
  if(histScrollTo==='keep'){body.scrollTop=keep+body.scrollHeight-height;histScrollTo=null}
  else body.scrollTop=histFollow?body.scrollHeight:keep;
@@ -8373,7 +8404,7 @@ function openHistory(s,fromUrl){
  setRenaming(false);
  $('histBody').replaceChildren();shownMessages=[];$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
- $('replyErr').textContent='';$('replyText').value='';pendingImages=[];$('replySlow').textContent='';pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('startedBox').replaceChildren();startedShown=0;startedSig='';$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;$('cmdHist').replaceChildren();$('btwBox').hidden=true;btwCount=0;panelShown='';$('panelLive').hidden=true;$('panelLive').dataset.shown='';$('ctxBox').replaceChildren();lastContext=null;
+ $('replyErr').textContent='';$('replyText').value='';pendingImages=[];$('replySlow').textContent='';pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;liveRow.remove();liveSummary.textContent='';liveRow.open=false;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('startedBox').replaceChildren();startedShown=0;startedSig='';$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;$('cmdHist').replaceChildren();$('btwBox').hidden=true;btwCount=0;panelShown='';$('panelLive').hidden=true;$('panelLive').dataset.shown='';$('ctxBox').replaceChildren();lastContext=null;
  updateFoot(s);
  let saved=null;try{saved=localStorage.getItem('filesOpen')}catch(e){}
  setFilesOpen(!singleColumn.matches&&(saved?saved==='1':innerWidth>=1100),false);  // On a phone, the chat comes first.
