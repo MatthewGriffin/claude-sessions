@@ -43,6 +43,7 @@ import re
 import secrets
 import socket
 import socketserver
+import shlex
 import shutil
 import signal
 import ssl
@@ -6014,6 +6015,72 @@ def hook_session_is_started():
     return started_by(pid) is not None and pid not in hosted_panes()
 
 
+# Starting the Android emulator without a window (-no-window) crashes on this computer unless it is told
+# which renderer to use: its default, SwiftShader, segfaults 10 to 45 seconds after starting (measured on
+# emulator 37.2.12, 2026-11-15; windowed launches are fine). `-gpu swangle_indirect` booted in 13 to 17 s
+# and stayed up, and so did `-gpu host`. A PreToolUse hook sees the command before it runs and, for a
+# headless launch that would crash, says what to run instead.
+EMULATOR_CRASHING_GPU = {"", "auto", "swiftshader", "swiftshader_indirect"}
+EMULATOR_GPU = "swangle_indirect"
+COMMAND_SEPARATORS = re.compile(r"&&|\|\||[;&|\n(){}`]")
+COMMAND_WRAPPERS = {"nohup", "setsid", "exec", "time", "command", "env", "stdbuf", "nice", "ionice", "timeout", "sudo", "unbuffer"}
+EMULATOR_ADVICE = """Headless emulator launch blocked: on this computer `emulator -no-window` with {using} crashes (a segmentation fault 10 to 45 seconds after it starts). Start it with `-gpu swangle_indirect` instead (it booted in about 15 s and stayed up; `-gpu host` works too):
+  emulator -avd <name> -no-window -no-audio -no-boot-anim -gpu swangle_indirect > emulator.log 2>&1 &
+{replace}Wait for it: `adb wait-for-device; until [ "$(adb shell getprop sys.boot_completed | tr -d '\\r')" = 1 ]; do sleep 2; done`. Stop it: `adb emu kill`. Then run your command again with that flag."""
+
+
+def emulator_launches(command):
+    """The arguments of each `emulator ...` launch in a shell command. Only a command that starts with the
+    emulator counts (after environment settings and wrappers such as nohup or timeout), so `echo emulator`,
+    `grep emulator log` and `ls sdk/emulator` don't."""
+    launches = []
+    for part in COMMAND_SEPARATORS.split(command or ""):
+        try:
+            words = shlex.split(part)
+        except ValueError:
+            continue
+        for i, word in enumerate(words[:10]):
+            if os.path.basename(word) == "emulator":
+                launches.append(words[i + 1:])
+                break
+            if not (re.match(r"^[A-Za-z_]\w*=", word) or word in COMMAND_WRAPPERS or word.startswith("-") or re.fullmatch(r"[\d.]+[smhd]?", word)):
+                break
+    return launches
+
+
+def emulator_problem(command):
+    """The renderer a headless emulator launch in this command would crash with ("default" if none is
+    named), or None if nothing in it would."""
+    for args in emulator_launches(command):
+        if not any(a == "-avd" or a.startswith("@") for a in args) or "-no-window" not in args:
+            continue  # Not starting one, or starting it with a window.
+        gpu = next((args[i + 1].lower() for i, a in enumerate(args[:-1]) if a == "-gpu"), "")
+        if gpu in EMULATOR_CRASHING_GPU:
+            return gpu or "default"
+    return None
+
+
+def run_emulator_guard():
+    """PreToolUse hook for Bash commands that mention the emulator: blocks a headless launch that would
+    crash, with what to run instead. Anything else, or anything unexpected, is left to run as it was."""
+    try:
+        payload = json.load(sys.stdin)
+        if payload.get("tool_name") != "Bash":
+            return 0
+        problem = emulator_problem(str((payload.get("tool_input") or {}).get("command", "")))
+        if problem is None:
+            return 0
+        named = problem != "default"
+        reason = EMULATOR_ADVICE.format(
+            using=f"`-gpu {problem}`" if named else "its default renderer",
+            replace=f"Replace the `-gpu {problem}` already in the command.\n" if named else "")
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                  "permissionDecisionReason": reason}}))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return 0
+
+
 def run_hook():
     """Handle one Claude Code hook event from stdin. Never fails the session it runs for."""
     try:
@@ -9475,6 +9542,15 @@ def run_setup(verbose=True):
             added.append("previews note")
     elif remove_own_hooks(groups, "--context"):
         added.append("previews note removed, as it slowed every message")
+    # A guard for Bash commands that start a headless Android emulator, which crashes here by default.
+    # The "if" has Claude Code run it only for commands that mention the emulator.
+    if not WINDOWS:
+        groups = hooks.setdefault("PreToolUse", [])
+        commands = [h.get("command", "") for g in groups if isinstance(g, dict) for h in g.get("hooks", []) if isinstance(h, dict)]
+        if not any(is_own_command(c, "--emulator-guard") for c in commands):
+            groups.append({"matcher": "Bash", "hooks": [{"type": "command", "if": "Bash(*emulator*)",
+                                                         "command": own_command_line("--emulator-guard"), "timeout": 5}]})
+            added.append("emulator guard")
     if "statusLine" not in settings:
         settings["statusLine"] = {"type": "command", "command": own_command_line("--statusline")}
         added.append("statusLine")
@@ -9514,7 +9590,7 @@ def run_setup(verbose=True):
     return 0
 
 
-OWN_FLAGS = ("--hook", "--context", "--statusline")
+OWN_FLAGS = ("--hook", "--context", "--statusline", "--emulator-guard")
 # On Windows each run of the one-file program takes a second or more to start (longer with
 # antivirus scanning it), and Claude Code waits for this hook before it takes each message.
 CONTEXT_HOOK = not WINDOWS
@@ -9714,6 +9790,7 @@ def main():
     parser.add_argument("--wait-for-port", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--hook", action="store_true", help="handle a Claude Code hook event from stdin")
     parser.add_argument("--context", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--emulator-guard", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--preview", action="store_true", help="for a session: save a picture of each preview beside its chat")
     parser.add_argument("--statusline", action="store_true", help="status line for Claude Code that also feeds this app")
     parser.add_argument("--setup", action="store_true", help="add this app's hooks (and a status line, if none) to Claude Code")
@@ -9724,6 +9801,8 @@ def main():
         return run_hook()
     if args.context:
         return run_context_hook()
+    if args.emulator_guard:
+        return run_emulator_guard()
     if args.preview:
         return run_preview()
     if args.statusline:

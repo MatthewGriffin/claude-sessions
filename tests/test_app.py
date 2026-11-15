@@ -1869,6 +1869,61 @@ class HookPingTests(unittest.TestCase):
         self.assertEqual(self.run_hook(request, started=False)[0], ["Test subagent (general-purpose) needs permission"])
 
 
+class EmulatorGuardTests(unittest.TestCase):
+    """Headless emulator launches that would crash are caught; everything else is left alone."""
+
+    def test_launches_that_crash(self):
+        crashing = {
+            "emulator -avd Medium_Phone -no-window": "default",
+            "ANDROID_AVD_HOME=$PWD/avd ANDROID_SDK_ROOT=$PWD/SDK SDK/emulator/emulator -avd Medium_Phone -no-window -no-audio "
+            "-no-snapshot-save -no-boot-anim > \"/tmp/x/emulator.log\" 2>&1 &": "default",
+            "cd /sdk && nohup timeout 600 /sdk/emulator/emulator @Pixel -no-window -no-audio &": "default",
+            "emulator -avd X -no-window -gpu swiftshader_indirect": "swiftshader_indirect",
+            "emulator -avd X -no-window -gpu auto": "auto",
+            "echo start; emulator -avd X -no-window && adb wait-for-device": "default",
+        }
+        for command, using in crashing.items():
+            self.assertEqual(app.emulator_problem(command), using, command)
+
+    def test_everything_else_runs(self):
+        fine = [
+            "emulator -avd X -no-window -gpu swangle_indirect", "emulator -avd X -no-window -gpu host",
+            "emulator -avd X -gpu swiftshader_indirect",  # With a window, which is fine.
+            "emulator -list-avds", "emulator -version", "adb emu kill", 'echo "emulator -avd X -no-window"',
+            "grep -n emulator emulator.log", "ls SDK/emulator", 'pgrep -f "emulator -avd"', "git log --oneline", "",
+        ]
+        for command in fine:
+            self.assertIsNone(app.emulator_problem(command), command)
+
+    def test_hook_output(self):
+        def run(payload):
+            out = io.StringIO()
+            with mock.patch.object(app.sys, "stdin", io.StringIO(json.dumps(payload))), contextlib.redirect_stdout(out):
+                app.run_emulator_guard()
+            return out.getvalue()
+        blocked = json.loads(run({"tool_name": "Bash", "tool_input": {"command": "emulator -avd X -no-window -gpu swiftshader_indirect"}}))
+        output = blocked["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn("-gpu swangle_indirect", output["permissionDecisionReason"])
+        self.assertIn("Replace the `-gpu swiftshader_indirect`", output["permissionDecisionReason"])
+        self.assertEqual(run({"tool_name": "Bash", "tool_input": {"command": "emulator -avd X -no-window -gpu host"}}), "")
+        self.assertEqual(run({"tool_name": "Read", "tool_input": {"file_path": "emulator -avd X -no-window"}}), "")
+        self.assertEqual(run({"nonsense": True}), "")
+
+    def test_setup_installs_it_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch.object(app, "SETTINGS_FILE", os.path.join(folder, "settings.json")), \
+                    mock.patch.object(app, "CONFIG_DIR", folder), mock.patch.object(app, "WINDOWS", False), \
+                    mock.patch.object(app.os.path, "exists", lambda path: True if "applications" in str(path) else os.path.lexists(path)):
+                for _ in range(2):
+                    app.run_setup(verbose=False)
+                with open(os.path.join(folder, "settings.json")) as handle:
+                    groups = json.load(handle)["hooks"]["PreToolUse"]
+        guards = [h for g in groups for h in g["hooks"] if "--emulator-guard" in h["command"]]
+        self.assertEqual(len(guards), 1)
+        self.assertEqual((guards[0]["if"], groups[0]["matcher"]), ("Bash(*emulator*)", "Bash"))
+
+
 class PreviewTests(unittest.TestCase):
     """A session can see the previews beside its chat, and is told about them once."""
 
