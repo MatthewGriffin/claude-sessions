@@ -1840,7 +1840,7 @@ class HookPingTests(unittest.TestCase):
         with mock.patch.object(app, "ATTENTION_DIR", folder), mock.patch.object(app, "WINDOWS", False), \
                 mock.patch.object(app.sys, "stdin", io.StringIO(json.dumps({"session_id": self.SID, "cwd": "/x", **payload}))), \
                 mock.patch.object(app, "started_by", lambda pid: (1, "parent") if started else None), \
-                mock.patch.object(app, "hosted_panes", lambda: {os.getpid(): "x"} if hosted else {}), \
+                mock.patch.object(app, "hosted_panes", lambda: {os.getpid(): "x", os.getppid(): "x"} if hosted else {}), \
                 mock.patch.object(app, "session_name", lambda sid, cwd: "Test"), \
                 mock.patch.dict(os.environ, env), \
                 mock.patch.object(app, "desktop_notify", lambda title, body, urgent, replaces=None: pings.append(title) or 7):
