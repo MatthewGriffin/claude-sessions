@@ -102,6 +102,7 @@ MONITOR_DIR = os.path.join(CONFIG_DIR, "monitor")
 ATTENTION_DIR = os.path.join(MONITOR_DIR, "attention")
 NAMES_FILE = os.path.join(MONITOR_DIR, "names.json")
 QUEUE_FILE = os.path.join(MONITOR_DIR, "queue.json")
+BTW_FILE = os.path.join(MONITOR_DIR, "btw.json")  # Side questions (/btw): Claude Code keeps them only on screen.
 KNOWN_FILE = os.path.join(MONITOR_DIR, "known_sessions.json")
 # Claude Code sometimes continues by itself shortly after a limit resets, so wait to see if it does.
 RETRY_GRACE_SECONDS = 90
@@ -1090,6 +1091,8 @@ class Monitor:
         """Conversation for a live session, or just {"unchanged"} if it matches revision `since`."""
         # Outside the lock below, so that a slow repository can't hold up other readers.
         git_state = self._git_state(session_id)
+        btw = [{k: e.get(k) for k in ("id", "question", "at", "state", "answer", "answered")} for e in btw_for(session_id)]
+        btw_revision = hashlib.sha256(json.dumps(btw).encode()).hexdigest()[:12] if btw else ""
         # A separate lock, so a very long transcript's first read doesn't hold up the session list.
         with self.history_lock:
             try:
@@ -1097,11 +1100,11 @@ class Monitor:
                 if not reader:
                     # A session that has only just started has no transcript yet.
                     if any(s["sessionId"] == session_id for s in self.sessions):
-                        return {"rev": "empty", "messages": [], "omitted": 0, "changes": None}
+                        return {"rev": "empty." + btw_revision, "messages": [], "omitted": 0, "changes": None, "btw": btw}
                     return None
                 # Git's answer is part of the revision: files can change with nothing added to the transcript.
                 git_revision = git_state["rev"] if git_state else ""
-                revision = f"{reader.offset}.{reader.subagent_bytes()}.{limit}.{git_revision}"
+                revision = f"{reader.offset}.{reader.subagent_bytes()}.{limit}.{git_revision}.{btw_revision}"
                 if revision == since:
                     return {"rev": revision, "unchanged": True}
                 messages = reader.messages[-limit:]
@@ -1113,6 +1116,7 @@ class Monitor:
                     "omitted": len(reader.messages) - len(messages),
                     "changes": changes,
                     "requests": reader.request_list(),
+                    "btw": btw,
                 }
             except OSError:
                 return None
@@ -4387,7 +4391,11 @@ def send_queued_now(monitor, request):
             return False, "That step only runs once the session is idle."
         if session["status"] == "waiting":
             return False, "It's waiting for an answer. Answer it first, then send this."
-        if session["status"] == "busy" and item["text"].startswith("/"):
+        if session["status"] == "busy" and BTW_COMMAND.match(item["text"]):
+            ok, message = send_btw_now(session, item["text"])
+            if not ok:
+                return False, message
+        elif session["status"] == "busy" and item["text"].startswith("/"):
             ok, message = interrupt_and_type_command(session, item["text"])
             if not ok:
                 return False, message
@@ -4438,9 +4446,161 @@ def send_tracked(monitor, session, text, state, images=(), pasted=()):
     succeeded, message = type_message(session, text, images, pasted)
     if succeeded:
         state["sent"][session["id"]] = time.time()
+        note_btw(session, text)
         if not text.startswith("/"):  # Slash commands aren't recorded as messages.
             state["checks"][session["id"]] = {"text": text, "images": list(images), "pasted": list(pasted), "count": before, "at": time.time()}
     return succeeded, message
+
+
+# Side questions (/btw). Claude Code answers them in a panel at the bottom of its screen and
+# saves them nowhere, so the app notes each one it sends and reads the answer off the screen.
+BTW_COMMAND = re.compile(r"^/btw\s+(\S.*)$", re.S)
+BTW_HINT = re.compile(r"\bEsc to close\s*$")
+BTW_QUESTION = re.compile(r"^ {2,8}/btw\s+(\S.*)$")
+BTW_KEEP = 30  # Per session.
+BTW_WAIT_SECONDS = 300  # No answer on screen by then, and it's given up on.
+BTW_MAX_ANSWER = 100_000
+# Big enough that a long answer isn't cut off at the panel's bottom or wrapped at its edge.
+BTW_READ_COLUMNS, BTW_READ_ROWS = 400, 500
+btw_lock = threading.Lock()
+
+
+def read_btw():
+    try:
+        with open(BTW_FILE) as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_btw(data):
+    write_json_file(BTW_FILE, data)
+
+
+def btw_for(session_id):
+    with btw_lock:
+        return read_btw().get(session_id, [])
+
+
+def note_btw(session, text):
+    """Record a side question just sent, so its answer can be looked for."""
+    match = BTW_COMMAND.match(text)
+    if not match:
+        return
+    with btw_lock:
+        data = read_btw()
+        entries = data.setdefault(session["id"], [])
+        entries.append({"id": secrets.token_hex(6), "question": " ".join(match.group(1).split()), "at": time.time(),
+                        "state": "answering", "answer": "", "tmux": session["tmux"]})
+        del entries[:-BTW_KEEP]
+        write_btw(data)
+
+
+def move_btw(changes):
+    """After /clear a session has a new id, and its side questions go with it."""
+    with btw_lock:
+        data = read_btw()
+        moved = False
+        for old, new in changes:
+            if old in data:
+                data[new] = data.pop(old) + data.get(new, [])
+                moved = True
+        if moved:
+            write_btw(data)
+
+
+def btw_panel(screen):
+    """The side-question panel at the bottom of a screen: {question, answer, done}, or None.
+
+    It ends in a hint line such as "↑/↓ to scroll · c to copy · f to fork · Esc to close". The
+    questions asked so far are listed above the answer, each as "/btw ...". "c to copy" shows
+    only once the answer is complete; until then the answer reads "Answering…".
+    """
+    lines = [line.rstrip() for line in screen.split("\n")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or not BTW_HINT.search(lines[-1]):
+        return None
+    last = next((i for i in range(len(lines) - 2, -1, -1) if BTW_QUESTION.match(lines[i])), None)
+    if last is None:
+        return None
+    body = lines[last + 1:-1]
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and not body[-1].strip():
+        body.pop()
+    indent = min((len(line) - len(line.lstrip()) for line in body if line.strip()), default=0)
+    answer = "\n".join(line[indent:] for line in body)
+    done = "c to copy" in lines[-1]
+    return {"question": " ".join(BTW_QUESTION.match(lines[last]).group(1).split()), "answer": answer if done else "", "done": done}
+
+
+def whole_screen(session_id):
+    """The screen with room for everything on it. On Linux the terminal is made much bigger for a
+    moment, so Claude Code redraws a long panel whole and unwrapped, then put back as it was."""
+    if WINDOWS:
+        return session_screen(session_id)
+    target = tmux_target(session_id)
+    size = tmux("display-message", "-p", "-t", target, "#{window_width} #{window_height}").stdout.split()
+    if len(size) != 2 or not all(n.isdigit() for n in size):
+        return session_screen(session_id)
+    tmux("resize-window", "-t", target, "-x", str(BTW_READ_COLUMNS), "-y", str(BTW_READ_ROWS))
+    try:
+        time.sleep(1)  # Claude Code redraws after a resize.
+        return session_screen(session_id)
+    finally:
+        tmux("resize-window", "-t", target, "-x", size[0], "-y", size[1])
+        tmux("set-option", "-w", "-u", "-t", target, "window-size")  # Follow an attached terminal again.
+
+
+def same_question(asked, shown):
+    """Whether the panel's question is the one sent. A question too long for the line is cut short."""
+    return asked == shown or (len(shown) >= 20 and asked.startswith(shown.rstrip("…").rstrip()))
+
+
+def watch_btw(monitor):
+    """Read the answers to side questions the app sent, then close the panel so the input box shows again."""
+    with btw_lock:
+        pending = [(sid, e) for sid, entries in read_btw().items() for e in entries if e.get("state") == "answering"]
+    for session_id, entry in pending:
+        state, answer = None, ""
+        panel = btw_panel(session_screen(entry["tmux"]))
+        if panel and panel["done"] and same_question(entry["question"], panel["question"]):
+            whole = btw_panel(whole_screen(entry["tmux"]))
+            answer = (whole if whole and same_question(entry["question"], whole["question"]) else panel)["answer"]
+            state = "answered"
+            # Closed only while it still shows, as Esc anywhere else would interrupt Claude.
+            again = btw_panel(session_screen(entry["tmux"]))
+            if again and again["done"]:
+                send_keys(entry["tmux"], "Escape")
+        elif time.time() - entry["at"] > BTW_WAIT_SECONDS or entry["tmux"] not in hosted_sessions():
+            state = "lost"
+        if not state:
+            continue
+        with btw_lock:
+            data = read_btw()
+            for e in data.get(session_id, []):
+                if e["id"] == entry["id"] and e.get("state") == "answering":
+                    e.update(state=state, answer=answer[:BTW_MAX_ANSWER], answered=time.time())
+            write_btw(data)
+
+
+def send_btw_now(session, text):
+    """Type a side question into a busy session's input box and press Enter, without interrupting."""
+    before = input_box(session_screen(session["tmux"]))
+    if before is None:
+        return False, "Its input box isn't showing right now, so nothing was typed. Try again in a moment."
+    if before:
+        return False, "There's text in its input box, so the side question wasn't typed. Check the terminal."
+    if not send_text(session["tmux"], text):
+        return False, "Could not type into the session."
+    time.sleep(0.2)
+    if input_box(session_screen(session["tmux"])) is None:
+        return False, "Something appeared on its screen while typing, so Enter wasn't pressed. Check the terminal."
+    send_keys(session["tmux"], "Enter")
+    note_btw(session, text)
+    return True, "Sent."
 
 
 def send_reply(monitor, request):
@@ -4467,6 +4627,9 @@ def send_reply(monitor, request):
             return False, NOT_HOSTED
         items = state["messages"].setdefault(session["id"], [])
         item = {"id": secrets.token_hex(8), "text": text, **({"images": images} if images else {}), **({"pasted": pasted} if pasted else {})}
+        if BTW_COMMAND.match(text) and session["status"] == "busy":
+            # A side question is answered while Claude works, so it neither waits nor interrupts.
+            return send_btw_now(session, text)
         if not items and may_type_now(session, state):
             succeeded, message = send_tracked(monitor, session, text, state, images, pasted)
             if succeeded:
@@ -4615,6 +4778,7 @@ def deliver_queued(monitor):
                 if old in state["sent"]:
                     state["sent"][new] = state["sent"].pop(old)
                 state["checks"].pop(old, None)
+        move_btw(changes)
     sessions = {s["id"]: s for s in snapshot["sessions"]}
     with queue_locked() as state:
         settle_retries_and_checks(state, sessions, monitor)
@@ -4656,6 +4820,10 @@ def run_queue_delivery(monitor):
             deliver_queued(monitor)
         except Exception as exc:  # This thread has to outlive any one failure.
             print(f"claude-monitor: queue delivery failed: {clean(exc)}", file=sys.stderr, flush=True)
+        try:
+            watch_btw(monitor)
+        except Exception as exc:
+            print(f"claude-monitor: reading side answers failed: {clean(exc)}", file=sys.stderr, flush=True)
 
 
 def press_key(monitor, request):
@@ -5860,6 +6028,14 @@ dialog::backdrop{background:#0009}
 #histSide #histDevices{flex:1;width:100%}
 #reqBox{flex:1 1 0;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:6px;font-size:12px;align-content:start}
 #reqBox[hidden]{display:none}
+#btwBox{flex:1 1 0;min-height:0;overflow:auto;padding:12px 16px;display:grid;grid-template-columns:minmax(0,1fr);grid-auto-rows:max-content;gap:10px;font-size:13px;align-content:start}
+#btwBox[hidden]{display:none}
+#btwBox h3{margin:0;font-size:13px}#btwBox .reqnote{color:var(--dim);font-size:12px}
+.btw{min-width:0;border-left:3px solid var(--line);padding-left:10px}
+.btw summary{overflow-wrap:anywhere;font-weight:600}
+.btw .btwtime{font-weight:400;color:var(--dim);font-size:11px;margin-left:6px}
+.btw .btwanswer{margin-top:4px;white-space:pre-wrap;overflow-wrap:anywhere}
+.btw .btwwait{margin-top:4px;color:var(--dim)}
 #reqBox .reqnote{color:var(--dim)}
 .reqwhere{display:inline-block;margin-right:6px;padding:0 5px;border-radius:3px;font-size:11px;background:#2b2e40;color:var(--dim)}
 .reqwhere.network{background:#1d3129;color:#a8e6c4}.reqwhere.internet{background:#3a2f4a;color:#d7c2f5}
@@ -6046,7 +6222,7 @@ textarea{min-height:110px;resize:vertical}
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
 <dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <section id="histLive" aria-label="What it’s doing now" hidden><b id="liveHead"></b><pre id="liveText"></pre><div id="liveAgents"></div></section><div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="queue" hidden></div>
-<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
+<div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Questions asked with /btw, answered on the side" hidden>Side questions</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Side questions" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
 <section id="printerBox" aria-labelledby="printerTitle"><h3 id="printerTitle">3D printer cameras</h3><p class="note">For Anycubic printers with LAN mode turned on. A printer's camera shows beside sessions doing 3D printing work, and is only on while you're watching it.</p>
 <ul id="printerList"></ul><form id="printerForm"><input id="printerHost" aria-label="Printer IP address" placeholder="Printer IP address, such as 192.168.0.50" inputmode="decimal" autocomplete="off"><button type="submit">Add printer</button><button type="button" id="printerFind">Find on my network</button></form><div id="printerFound"></div><p id="printerErr" role="alert"></p>
@@ -6572,9 +6748,9 @@ function renderDevices(sessions){
 // A tab only appears when it has something in it. The choice is remembered, and comes back
 // when that tab does.
 const roomyScreen=matchMedia('(min-width:1300px)');
-let changedCount=0,agentCount=0,requestCount=0,sideTab='preview',shownSideTab='files';
+let changedCount=0,agentCount=0,requestCount=0,btwCount=0,sideTab='preview',shownSideTab='files';
 try{sideTab=localStorage.getItem('sideTab')||'preview'}catch(e){}
-const SIDE_TABS={chat:'tabChat',preview:'tabPreview',requests:'tabRequests',files:'tabFiles',agents:'tabAgents'};
+const SIDE_TABS={chat:'tabChat',preview:'tabPreview',requests:'tabRequests',btw:'tabBtw',files:'tabFiles',agents:'tabAgents'};
 function selectSideTab(tab){
  if(tab==='chat'){setFilesOpen(false,true);layoutPreview();return}
  sideTab=tab;
@@ -6590,7 +6766,7 @@ function toggleSideTab(tab){
 }
 function availableTabs(){
  const box=$('histDevices'),hasPreview=!!(box.tiles&&box.tiles.size>0);
- return {chat:singleColumn.matches,preview:hasPreview&&!roomyScreen.matches,requests:requestCount>0,files:true,agents:agentCount>0};
+ return {chat:singleColumn.matches,preview:hasPreview&&!roomyScreen.matches,requests:requestCount>0,btw:btwCount>0,files:true,agents:agentCount>0};
 }
 function layoutPreview(){
  const box=$('histDevices'),page=$('histPage'),side=$('histSide'),tabs=$('sideTabs');
@@ -6609,6 +6785,7 @@ function layoutPreview(){
  $('histChanges').hidden=tab!=='files';
  $('agentList').hidden=tab!=='agents';
  $('reqBox').hidden=tab!=='requests';
+ $('btwBox').hidden=tab!=='btw';
  for(const [name,id] of Object.entries(SIDE_TABS)){
   $(id).hidden=!avail[name];
   $(id).setAttribute('aria-selected',String(name===active));
@@ -6619,7 +6796,8 @@ function layoutPreview(){
  const files='Files changed'+(changedCount?' ('+changedCount+')':'');
  $('tabFiles').textContent=narrow?'Files'+(changedCount?' ('+changedCount+')':''):files;  // Short enough for the tabs to fit on a phone.
  $('tabRequests').textContent='Requests'+(requestCount?' ('+requestCount+')':'');
- const others=['preview','requests'].filter(n=>avail[n]);
+ $('tabBtw').textContent=(narrow?'Side':'Side questions')+(btwCount?' ('+btwCount+')':'');
+ const others=['preview','requests','btw'].filter(n=>avail[n]);
  $('histFiles').textContent=others.length?'Side panel':files;
  sizePanes();
 }
@@ -7284,6 +7462,23 @@ function renderRequests(list){
  box.scrollTop=keep;
  layoutPreview();
 }
+// Side questions (/btw): answered on the side, so they stay out of the main chat.
+function renderBtw(list){
+ const box=$('btwBox'),shut=new Set([...box.querySelectorAll('details:not([open])')].map(d=>d.dataset.id)),keep=box.scrollTop;
+ btwCount=list.length;
+ const rows=[el('h3','',null,'Side questions ('+list.length+')'),el('div','reqnote',null,'Asked with /btw, newest first. Claude answers these on the side while it carries on: they aren’t part of the main chat, and Claude won’t remember them later.')];
+ for(const q of [...list].reverse()){
+  const d=el('details','btw');d.dataset.id=q.id;d.open=!shut.has(q.id);
+  const s=el('summary','',d,q.question);
+  el('span','btwtime',s,new Date(q.at*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}));
+  if(q.state==='answered')el('div','btwanswer',d,q.answer||'(No answer text.)');
+  else el('div','btwwait',d,q.state==='lost'?'The answer couldn’t be read from the session’s screen. Look in its terminal.':'Answering…');
+  rows.push(d);
+ }
+ box.replaceChildren(...rows);
+ box.scrollTop=keep;
+ layoutPreview();
+}
 function relativePath(p){return histCwd&&p.startsWith(histCwd+'/')?p.slice(histCwd.length+1):p}
 function renderChanges(c){
  lastChanges=c;
@@ -7405,7 +7600,7 @@ async function loadHistory(){
    const live=cards.get(id)&&cards.get(id).session;
    if(live)$('histHint').textContent=live.cwd+' · pid '+live.pid+(live.hosted?' · keeps running after you close this app':'');
   }
-  if(!h.unchanged){histRev=h.rev;renderHistory(h);renderChanges(h.changes);renderRequests(h.requests||[])}
+  if(!h.unchanged){histRev=h.rev;renderHistory(h);renderChanges(h.changes);renderRequests(h.requests||[]);renderBtw(h.btw||[])}
   const s=cards.get(id)&&cards.get(id).session;
   let live=null;
   if(s&&s.hosted&&(s.status==='waiting'||s.status==='busy')){
@@ -7435,7 +7630,7 @@ function openHistory(s,fromUrl){
  setRenaming(false);
  $('histBody').replaceChildren();shownMessages=[];$('histChanges').replaceChildren();changedCount=0;
  $('histHint').textContent=s.cwd+' · pid '+s.pid+(s.hosted?' · keeps running after you close this app':'');
- $('replyErr').textContent='';$('replyText').value='';pendingImages=[];$('replySlow').textContent='';pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;
+ $('replyErr').textContent='';$('replyText').value='';pendingImages=[];$('replySlow').textContent='';pastedTexts=[];renderPending();keysFor=null;$('keys').replaceChildren();$('screen').textContent='';delete $('screen').dataset.prompt;$('histLive').hidden=true;agentsOpen.clear();agentsSeen.clear();agentRev=null;commandList=[];commandsFor=null;closeCommands();loadCommands();$('agentList').replaceChildren();$('reqBox').replaceChildren();$('reqBox').hidden=true;requestCount=0;$('btwBox').replaceChildren();$('btwBox').hidden=true;btwCount=0;
  updateFoot(s);
  let saved=null;try{saved=localStorage.getItem('filesOpen')}catch(e){}
  setFilesOpen(!singleColumn.matches&&(saved?saved==='1':innerWidth>=1100),false);  // On a phone, the chat comes first.
@@ -7533,6 +7728,8 @@ $('replyForm').addEventListener('submit',async e=>{
  }
  $('replySlow').textContent=slowSend(lastActTiming);
  if(ok){$('replyText').value='';pendingImages=[];pastedTexts=[];renderPending()}
+ // The answer shows in its own tab, not the chat, so that tab opens.
+ if(ok&&/^\/btw\s/.test(text.trim())&&lastActMessage==='Sent.'){selectSideTab('btw');setFilesOpen(true,true);quickPoll()}
 });
 // "Reached Claude Code in 3.4 s: listing sessions 2.9 s, typing 0.4 s", only when it was slow.
 function slowSend(t){

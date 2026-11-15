@@ -1553,6 +1553,44 @@ class TickBoxAnswerTests(unittest.TestCase):
         self.assertEqual((state["typed"], state["ticked"], state["entered_on"]), ("all of them", True, 3))
 
 
+class SideQuestionTests(unittest.TestCase):
+    """/btw answers are read off Claude Code's screen, since it saves them nowhere."""
+
+    RULE = "▔" * 60
+    ANSWERING = "\n".join(["● Hi there", "", RULE, "", "    /btw what is 2+2?", "    /btw capital of Peru?", "",
+                            "      ✢ Answering…", "", "    ⇧←/→ to browse · x to clear history · Esc to close"])
+    DONE = "\n".join(["● Hi there", "", RULE, "", "    /btw what is 2+2?", "    /btw capital of Peru?", "",
+                       "      The capital of Peru is Lima.", "        - on the coast", "",
+                       "    ⇧←/→ to browse · c to copy · f to fork · x to clear history · Esc to close", ""])
+
+    def test_panel(self):
+        self.assertEqual(app.btw_panel(self.ANSWERING), {"question": "capital of Peru?", "answer": "", "done": False})
+        self.assertEqual(app.btw_panel(self.DONE),
+                         {"question": "capital of Peru?", "answer": "The capital of Peru is Lima.\n  - on the coast", "done": True})
+        self.assertIsNone(app.btw_panel("❯ \n" + "─" * 40 + "\n  Haiku 5.5 | Ctx 4%"))
+        self.assertTrue(app.same_question("list the 30 largest countries by area", "list the 30 largest countries"))
+        self.assertFalse(app.same_question("capital of Peru?", "capital"))
+
+    def test_answer_is_read_then_panel_closed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            screens = [self.DONE]
+            pressed = []
+            with mock.patch.object(app, "BTW_FILE", os.path.join(folder, "btw.json")), \
+                    mock.patch.object(app, "session_screen", lambda target: screens[-1]), \
+                    mock.patch.object(app, "whole_screen", lambda target: screens[-1]), \
+                    mock.patch.object(app, "send_keys", lambda target, *keys: pressed.extend(keys) or True), \
+                    mock.patch.object(app, "hosted_sessions", lambda: {"t"}):
+                app.note_btw({"id": "s1", "tmux": "t"}, "/btw  capital of\nPeru?")
+                app.note_btw({"id": "s1", "tmux": "t"}, "not a side question")
+                self.assertEqual([e["state"] for e in app.btw_for("s1")], ["answering"])
+                app.watch_btw(None)
+                entry = app.btw_for("s1")[0]
+                self.assertEqual((entry["state"], entry["answer"].splitlines()[0]), ("answered", "The capital of Peru is Lima."))
+                self.assertEqual(pressed, ["Escape"])
+                app.move_btw([("s1", "s2")])
+                self.assertEqual(len(app.btw_for("s2")), 1)
+
+
 class PreviewTests(unittest.TestCase):
     """A session can see the previews beside its chat, and is told about them once."""
 
