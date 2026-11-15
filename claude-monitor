@@ -6043,17 +6043,28 @@ def connected_connectors():
         return []
 
 
-def unusable_skills(report):
+def switched_off_skills():
+    """The skills this app switched off, from its own record."""
+    try:
+        with open(SKILLS_FILE, encoding="utf-8") as handle:
+            return {n for n in json.load(handle) if isinstance(n, str)}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def unusable_skills(report, also=()):
     """{skill name: why} for each skill a CLI session with this start-up report can't use. The report is
-    Claude Code's own: its skills, its tool names and its connectors."""
+    Claude Code's own: its skills, its tool names and its connectors. A skill that is switched off isn't in
+    the report's skills at all, so those named in also (the ones this app switched off) are judged too."""
     tools = [t for t in report.get("tools", []) if isinstance(t, str)]
     servers = [x for x in report.get("mcp_servers", []) if isinstance(x, dict)]
     # A quick headless run reports connectors as "pending" before they connect, so the connectors the account
     # has are also read from the list Claude Code keeps of those it has connected.
     have = " ".join([t for t in tools if t.startswith("mcp__")] + [str(x.get("name", "")) for x in servers] + connected_connectors())
     found = {}
-    for name in report.get("skills", []):
-        if not isinstance(name, str) or name.split(":")[-1] in SKILL_KEEP:
+    names = [n for n in report.get("skills", []) if isinstance(n, str)]
+    for name in names + sorted(set(also) - set(names)):
+        if name.split(":")[-1] in SKILL_KEEP:
             continue
         bare = name.split(":")[-1]
         prefixes = SKILL_TOOL_PREFIX.findall(skill_text(name))
@@ -6101,11 +6112,7 @@ def apply_skill_overrides(off):
             settings = json.load(handle)
     except (OSError, ValueError):
         return [], []  # No settings to change, or not readable (maybe being written).
-    try:
-        with open(SKILLS_FILE, encoding="utf-8") as handle:
-            mine = set(json.load(handle))
-    except (OSError, ValueError, TypeError):
-        mine = set()
+    mine = switched_off_skills()
     if not isinstance(settings, dict) or not isinstance(settings.get("skillOverrides", {}), dict):
         return [], []
     overrides = settings.setdefault("skillOverrides", {})
@@ -6139,7 +6146,7 @@ def trim_skills(verbose=False):
     report = skills_report()
     if not report:
         return None
-    off = unusable_skills(report)
+    off = unusable_skills(report, also=switched_off_skills())
     changed = apply_skill_overrides(off)
     if verbose:
         for name, why in sorted(off.items()):

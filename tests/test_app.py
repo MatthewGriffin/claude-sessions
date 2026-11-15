@@ -1978,6 +1978,24 @@ class SkillTrimmingTests(unittest.TestCase):
         self.assertEqual(app.apply_skill_overrides({}), ([], []))
         self.assertEqual(read()["skillOverrides"]["b"], "name-only")
 
+    def test_a_second_check_changes_nothing(self):
+        # Once skills are switched off Claude Code's report no longer lists them, so they must still be judged.
+        path = os.path.join(self.folder, "settings.json")
+        with open(path, "w") as handle:
+            json.dump({"theme": "dark"}, handle)
+        full, listed = self.report(), self.report()
+        listed["skills"] = ["anthropic-skills:plain", "anthropic-skills:chrome-browser"]  # As after the first check.
+        reports = iter([full, listed, listed])
+        with mock.patch.object(app, "skills_report", lambda: next(reports)):
+            self.assertEqual(app.trim_skills(), (["anthropic-skills:desk", "anthropic-skills:google-workspace"], []))
+            self.assertEqual(app.trim_skills(), ([], []))
+            self.assertEqual(app.trim_skills(), ([], []))
+        self.assertEqual(sorted(json.load(open(path))["skillOverrides"]), ["anthropic-skills:desk", "anthropic-skills:google-workspace"])
+        # And one whose connector arrives is switched back on, though the report doesn't list it.
+        listed["tools"].append("mcp__claude_ai_Google_Drive__search")
+        with mock.patch.object(app, "skills_report", lambda: listed):
+            self.assertEqual(app.trim_skills(), ([], ["anthropic-skills:google-workspace"]))
+
     def test_nothing_left_removes_the_setting(self):
         path = os.path.join(self.folder, "settings.json")
         with open(path, "w") as handle:
