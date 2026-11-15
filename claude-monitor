@@ -6578,7 +6578,11 @@ dialog::backdrop{background:#0009}
 #histSide{flex:none;width:min(50%,800px);border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
 #histPage.withPreview #histSide{width:min(38%,800px)}
 @media(max-width:900px){#histSide,#histPage.withPreview #histSide{width:100%;border-left:0}#histPage.files #histChat{display:none}}
-#sideTabs{display:flex;flex:none;gap:4px;padding:8px 12px 0;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:thin}
+#sideTabs{display:flex;flex:none;gap:4px;padding:8px 12px 0;border-bottom:1px solid var(--line);overflow:hidden}
+/* Too many tabs for one row: split over rows, rather than scrolling sideways. */
+#sideTabs.wrapped{flex-wrap:wrap;row-gap:2px}
+#sideTabs .tabbreak{flex:0 0 100%;height:0}
+#sideTabs.wrapped button{flex:1 1 auto}
 #sideTabs[hidden]{display:none}
 #sideTabs button{flex:none;white-space:nowrap}
 /* In one column the tabs sit above everything, with Chat as one of them. */
@@ -7425,7 +7429,7 @@ for(const [name,id] of Object.entries(SIDE_TABS))$(id).addEventListener('click',
 $('sideTabs').addEventListener('keydown',e=>{
  const step=e.key==='ArrowRight'?1:e.key==='ArrowLeft'?-1:0;
  if(!step&&e.key!=='Home'&&e.key!=='End')return;
- const shown=[...$('sideTabs').children].filter(b=>!b.hidden);
+ const shown=[...$('sideTabs').children].filter(b=>b.tagName==='BUTTON'&&!b.hidden);
  let i=shown.indexOf(document.activeElement);
  i=e.key==='Home'?0:e.key==='End'?shown.length-1:(i+step+shown.length)%shown.length;
  e.preventDefault();shown[i].focus();shown[i].click();
@@ -7452,7 +7456,36 @@ function autoPreviewWidth(box,total){
  const text=!sideOpen?CHAT_COMFORT:paneWidths.side?paneWidths.side+CHAT_COMFORT+HANDLE:(CHAT_COMFORT+HANDLE)/DEFAULT_CHAT_SHARE;
  return Math.max(PREVIEW_FLOOR,Math.min(fill,total-text-HANDLE));
 }
+// The tabs go on one row if they fit. If not, they're split over the fewest rows that fit, as evenly as
+// possible (half on a second row, say), each row's tabs sharing its width.
+function fitTabs(){
+ const bar=$('sideTabs');
+ if(bar.hidden)return;
+ bar.querySelectorAll('.tabbreak').forEach(b=>b.remove());
+ bar.classList.remove('wrapped');
+ const shown=[...bar.children].filter(b=>!b.hidden);
+ if(shown.length<2||bar.scrollWidth<=bar.clientWidth)return;
+ const css=getComputedStyle(bar),gap=parseFloat(css.columnGap)||4;
+ const inner=bar.clientWidth-parseFloat(css.paddingLeft)-parseFloat(css.paddingRight);
+ const widths=shown.map(b=>b.getBoundingClientRect().width);
+ const size=(rows,r)=>Math.floor(shown.length/rows)+(r<shown.length%rows?1:0);  // The first rows take any extra tab.
+ let rows=2;
+ for(;rows<shown.length;rows++){
+  let at=0,fits=true;
+  for(let r=0;r<rows&&fits;r++){
+   const n=size(rows,r);
+   fits=widths.slice(at,at+n).reduce((a,b)=>a+b,0)+gap*(n-1)<=inner+.5;
+   at+=n;
+  }
+  if(fits)break;
+ }
+ bar.classList.add('wrapped');
+ let at=0;
+ for(let r=0;r<rows-1;r++){at+=size(rows,r);shown[at-1].after(el('span','tabbreak'))}
+}
+new ResizeObserver(()=>{const w=$('sideTabs').clientWidth;if(w!==fitTabs.width){fitTabs.width=w;fitTabs()}}).observe($('sideTabs'));
 function sizePanes(){
+ fitTabs();
  const box=$('histDevices'),side=$('histSide'),total=innerWidth;
  const inColumn=box.parentNode===$('hist')&&!box.hidden;
  $('previewHandle').hidden=!inColumn;
