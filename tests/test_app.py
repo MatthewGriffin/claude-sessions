@@ -801,6 +801,18 @@ class NewSessionModelTests(unittest.TestCase):
         self.assertIn("--model=sonnet", self.given[-1][1])
         self.assertEqual(self.given[-1][1][:2], ["claude", "--resume"])
 
+    def test_chrome_is_passed_on_and_kept_for_resume(self):
+        self.assertNotIn("--chrome", self.start()[1])
+        self.assertNotIn("--chrome", self.start(chrome="yes")[1])  # Only a real true counts.
+        self.assertIn("--chrome", self.start(chrome=True)[1])
+        session_id = self.given[0][0]
+        monitor = app.Monitor()
+        monitor.transcripts[session_id] = types.SimpleNamespace(path=__file__, permission_mode="default", resume_model=None)
+        monitor._update_known([{"id": session_id, "name": "t", "cwd": CONFIG, "title": ""}])  # Must not drop it.
+        app.resume_session(self.monitor, {"id": session_id})
+        self.assertIn("--chrome", self.given[-1][1])
+        self.assertEqual(self.given[-1][1][:2], ["claude", "--resume"])
+
     def test_model_picked_with_slash_model(self):
         self.assertEqual([app.model_alias(n) for n in ("Opus 5.5", "Sonnet 5.5 (1M context)", "Default (recommended)", "Opus Plan Mode", "Something new")],
                          ["opus", "sonnet[1m]", "", "opusplan", None])
