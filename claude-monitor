@@ -4292,6 +4292,18 @@ def launch_session(monitor, session_id, command, cwd, trust_approved):
     return False, "The session didn't start in time. Its screen showed: " + clean(screen)[-300:]
 
 
+def resume_command(session_id, entry):
+    """claude's command line for bringing a session back as it was (mode, model, Chrome), from its remembered entry."""
+    # Claude Code records asking first as "default". Anything not offered for new sessions,
+    # such as bypassPermissions, also falls back to asking first.
+    mode = {"default": "manual"}.get(entry.get("mode"), entry.get("mode"))
+    mode = mode if mode in NEW_SESSION_MODES else "manual"
+    command = ["claude", "--resume", session_id, f"--permission-mode={mode}", *resume_model_flag(entry.get("model"))]
+    if entry.get("chrome") is True:
+        command.append("--chrome")
+    return command
+
+
 def resume_session(monitor, request):
     """Bring back a remembered session, in the permission mode it had."""
     session_id = str(request.get("id", ""))
@@ -4304,13 +4316,7 @@ def resume_session(monitor, request):
     cwd = entry.get("cwd", "")
     if not os.path.isdir(cwd):
         return False, f"Its folder no longer exists: {cwd}"
-    # Claude Code records asking first as "default". Anything not offered for new sessions,
-    # such as bypassPermissions, also falls back to asking first.
-    mode = {"default": "manual"}.get(entry.get("mode"), entry.get("mode"))
-    mode = mode if mode in NEW_SESSION_MODES else "manual"
-    command = ["claude", "--resume", session_id, f"--permission-mode={mode}", *resume_model_flag(entry.get("model"))]
-    if entry.get("chrome") is True:
-        command.append("--chrome")
+    command = resume_command(session_id, entry)
     return launch_session(monitor, session_id, command, cwd, bool(cwd) and same_folder(request.get("trust"), cwd))
 
 
@@ -5488,11 +5494,7 @@ def hand_to_console(monitor, session):
     cwd = session.get("cwd") or entry.get("cwd") or ""
     if not os.path.isdir(cwd):
         return False, f"Its folder no longer exists: {cwd or '(unknown)'}"
-    mode = {"default": "manual"}.get(entry.get("mode"), entry.get("mode"))
-    mode = mode if mode in NEW_SESSION_MODES else "manual"
-    command = ["claude", "--resume", session_id, f"--permission-mode={mode}", *resume_model_flag(entry.get("model"))]
-    if entry.get("chrome") is True:
-        command.append("--chrome")
+    command = resume_command(session_id, entry)
     if not kill_terminal(session["tmux"]):
         return False, "Could not end the copy running in the app, so nothing was opened."
     monitor.invalidate()
@@ -9828,6 +9830,8 @@ def run_setup(verbose=True):
         say(f"Updated {SETTINGS_FILE}: {', '.join(added)}. Sessions started from now on use them.")
     else:
         say("Claude Code is already set up for this app.")
+    if install_adopt_skill():
+        say(f"Added the /to-app skill ({ADOPT_SKILL}).")
     if not WINDOWS and not FROZEN:
         applications = os.path.expanduser("~/.local/share/applications")
         icons = os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps")
@@ -9846,6 +9850,153 @@ def run_setup(verbose=True):
                     f"StartupWMClass={APP_CLASS}\nStartupNotify=true\n"
                 )
             say(f"Added Claude Sessions to the applications menu ({launcher}).")
+    return 0
+
+
+ADOPT_WAIT_SECONDS = 600  # How long to wait for the session's turn to end.
+ADOPT_SKILL = os.path.join(CONFIG_DIR, "skills", "to-app", "SKILL.md")
+ADOPT_SKILL_MARK = "<!-- written by claude-sessions --setup -->"
+
+
+def adopt_skill_text():
+    return f"""---
+name: to-app
+description: Move this session into the Claude Sessions app, so it can be read and answered there. Use when the user asks to move, hand over or continue this session in the app.
+disable-model-invocation: true
+---
+{ADOPT_SKILL_MARK}
+Run this command with the Bash tool, exactly as written:
+
+    {own_command_line("--adopt")}
+
+It closes this terminal session once this turn is over, and brings the same session back inside Claude Sessions (same conversation, folder, permission mode and model).
+After it prints its message, tell the user in one short sentence that the session is moving to the app, then end your turn. Do not run anything else.
+If the command prints an error, show the user that error.
+"""
+
+
+def install_adopt_skill():
+    """Write the /to-app skill, or bring it up to date. Leaves alone a file of the user's own. Returns whether it changed."""
+    text = adopt_skill_text()
+    try:
+        with open(ADOPT_SKILL, encoding="utf-8") as handle:
+            current = handle.read()
+        if ADOPT_SKILL_MARK not in current or current == text:
+            return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    os.makedirs(os.path.dirname(ADOPT_SKILL), exist_ok=True)
+    write_json_file_text(ADOPT_SKILL, text)
+    return True
+
+
+def write_json_file_text(path, text):
+    temporary = f"{path}.{os.getpid()}"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(temporary, path)
+
+
+def adopt_notify(message, failed=True):
+    with contextlib.suppress(Exception):
+        if WINDOWS:
+            message_box("Claude Sessions", message)
+        else:
+            desktop_notify("Claude Sessions", message, failed)
+
+
+def run_adopt(requested):
+    """From inside a terminal session: hand it over to this app. A detached helper waits for the turn to
+    end, closes the terminal copy and resumes the same session in the app's own terminal."""
+    pid = int(os.environ["CLAUDE_PID"]) if os.environ.get("CLAUDE_PID", "").isdigit() else None
+    entry = (read_session_files() or {}).get(pid) or {}
+    session_id = entry.get("sessionId") or requested or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not pid or not SESSION_ID.match(session_id or ""):
+        print("claude-monitor: this isn't running inside a Claude Code session, so there is nothing to move.", file=sys.stderr)
+        return 1
+    if session_id in hosted_sessions():
+        print("This session is already running in the app.")
+        return 0
+    cwd = entry.get("cwd") or os.getcwd()
+    flags = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+    command = own_command("--adopt-worker", f"{session_id}:{pid}:{cwd}")
+    if WINDOWS:
+        detached = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        try:
+            subprocess.Popen(command, creationflags=detached | 0x01000000, **flags)  # CREATE_BREAKAWAY_FROM_JOB
+        except OSError:
+            subprocess.Popen(command, creationflags=detached, **flags)  # The job doesn't allow leaving it.
+    else:
+        subprocess.Popen(command, start_new_session=True, **flags)
+    print("Moving this session to the app. This terminal closes when the current turn ends, and the session reopens in Claude Sessions.")
+    return 0
+
+
+def session_is_idle(pid):
+    entry = (read_session_files() or {}).get(pid)
+    return entry is None or entry.get("status") != "busy"
+
+
+def process_exists(pid):
+    if WINDOWS:
+        return pid in (read_session_files() or {})  # Claude Code removes its file as it exits.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    with contextlib.suppress(OSError, IndexError):
+        with open(f"/proc/{pid}/stat") as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0] != "Z"  # Ended, but its parent hasn't collected it yet.
+    return True
+
+
+def run_adopt_worker(spec):
+    session_id, _, rest = spec.partition(":")
+    pid_text, _, cwd = rest.partition(":")
+    pid = int(pid_text) if pid_text.isdigit() else 0
+    if not SESSION_ID.match(session_id) or not pid or not os.path.isdir(cwd):
+        return 1
+    time.sleep(3)  # The turn that ran the command has to finish and its answer to be shown.
+    deadline = time.time() + ADOPT_WAIT_SECONDS
+    idle_since = None
+    while time.time() < deadline:
+        if session_is_idle(pid):
+            idle_since = idle_since or time.time()
+            if time.time() - idle_since >= 2:  # Idle for a moment, not between two steps.
+                break
+        else:
+            idle_since = None
+        time.sleep(0.5)
+    else:
+        adopt_notify("The session was still working, so it wasn't moved to the app.")
+        return 1
+    if process_exists(pid):
+        if WINDOWS:
+            subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True, stdin=subprocess.DEVNULL)  # No /T: that would end this helper too.
+        else:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)  # Claude Code exits on this, as on Ctrl+C.
+        for _ in range(60):
+            if not process_exists(pid):
+                break
+            time.sleep(0.5)
+        else:
+            adopt_notify("The terminal session wouldn't close, so it wasn't moved to the app.")
+            return 1
+    time.sleep(1)
+    entry = read_known()["sessions"].get(session_id) or {}
+    started, error = new_terminal(session_id, cwd, resume_command(session_id, entry))
+    if not started:
+        adopt_notify(f"The terminal session was closed, but it couldn't be reopened in the app ({error}). Run: claude --resume {session_id}")
+        return 1
+    if os.environ.get("CLAUDE_SESSIONS_NO_WINDOW"):
+        return 0
+    subprocess.Popen(own_command("--app"), start_new_session=not WINDOWS, close_fds=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)  # Opens the window, or brings the open one up.
     return 0
 
 
@@ -10053,6 +10204,8 @@ def main():
     parser.add_argument("--trim-skills", action="store_true", help="switch off the skills a Claude Code session can't use, and show which")
     parser.add_argument("--preview", action="store_true", help="for a session: save a picture of each preview beside its chat")
     parser.add_argument("--statusline", action="store_true", help="status line for Claude Code that also feeds this app")
+    parser.add_argument("--adopt", nargs="?", const="", metavar="ID", help="from inside a terminal session: move it into the app")
+    parser.add_argument("--adopt-worker", help=argparse.SUPPRESS)
     parser.add_argument("--setup", action="store_true", help="add this app's hooks (and a status line, if none) to Claude Code")
     parser.add_argument("--session-host", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--version", action="version", version=f"claude-sessions {APP_VERSION}")
@@ -10071,6 +10224,10 @@ def main():
         return run_statusline()
     if args.setup:
         return run_setup()
+    if args.adopt is not None:
+        return run_adopt(args.adopt)
+    if args.adopt_worker:
+        return run_adopt_worker(args.adopt_worker)
     if args.session_host:
         return run_session_host()
     wait_for_port = args.wait_for_port

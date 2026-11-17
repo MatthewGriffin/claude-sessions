@@ -2337,3 +2337,53 @@ class FolderApprovalTests(unittest.TestCase):
             self.assertTrue(app.TRUST_YES_SELECTED.search(screen), pointer)
         self.assertFalse(app.TRUST_YES_SELECTED.search("   1. Yes, I trust this folder\n > 2. No, exit"))
         self.assertTrue(app.TRUST_YES_NUMBERED.search("   1. Yes, I trust this folder"))
+
+
+class AdoptTests(unittest.TestCase):
+    """Moving a terminal session into the app: the /to-app skill, and the helper that resumes it there."""
+
+    def test_the_skill_is_written_and_kept_current_but_not_over_the_users_own(self):
+        module = load(SOURCE, "adopt_skill_" + secrets.token_hex(4))
+        folder = tempfile.mkdtemp(prefix="claude-sessions-skill-")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        module.ADOPT_SKILL = os.path.join(folder, "skills", "to-app", "SKILL.md")
+        self.assertTrue(module.install_adopt_skill())
+        self.assertFalse(module.install_adopt_skill())
+        with open(module.ADOPT_SKILL, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("--adopt", text)
+        self.assertTrue(text.startswith("---\nname: to-app\n"))
+        with open(module.ADOPT_SKILL, "w", encoding="utf-8") as handle:
+            handle.write("my own skill")
+        self.assertFalse(module.install_adopt_skill())
+
+    @unittest.skipUnless(shutil.which("tmux") and not WINDOWS, "needs tmux on Linux")
+    def test_a_terminal_session_is_closed_and_resumed_in_the_app(self):
+        folder = tempfile.mkdtemp(prefix="claude-sessions-adopt-")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        config = os.path.join(folder, "config")
+        os.makedirs(os.path.join(config, "sessions"))
+        bin_dir = os.path.join(folder, "bin")
+        os.makedirs(bin_dir)
+        marker = os.path.join(folder, "resumed")
+        with open(os.path.join(bin_dir, "claude"), "w") as handle:  # Stands in for Claude Code.
+            handle.write(f'#!/bin/sh\necho "$@" > "{marker}"\nsleep 60\n')
+        os.chmod(os.path.join(bin_dir, "claude"), 0o755)
+        session_id = "11111111-2222-3333-4444-555555555555"
+        old = subprocess.Popen(["sleep", "60"])  # The terminal's Claude Code.
+        self.addCleanup(old.kill)
+        with open(os.path.join(config, "sessions", f"{old.pid}.json"), "w") as handle:
+            json.dump({"pid": old.pid, "sessionId": session_id, "cwd": folder, "status": "idle"}, handle)
+        environment = {**os.environ, "CLAUDE_CONFIG_DIR": config, "PATH": bin_dir + os.pathsep + os.environ["PATH"],
+                       "CLAUDE_SESSIONS_TMUX_SOCKET": "adopt-test-" + secrets.token_hex(4), "CLAUDE_SESSIONS_NO_WINDOW": "1",
+                       "CLAUDE_PID": str(old.pid), "CLAUDE_CODE_SESSION_ID": session_id}
+        self.addCleanup(subprocess.run, ["tmux", "-L", environment["CLAUDE_SESSIONS_TMUX_SOCKET"], "kill-server"], capture_output=True)
+        first = subprocess.run([sys.executable, SOURCE, "--adopt"], env=environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("Moving this session", first.stdout)
+        self.assertTrue(wait_for(lambda: os.path.exists(marker), 30), "the session was not resumed")
+        with open(marker) as handle:
+            self.assertIn(f"--resume {session_id}", handle.read())
+        self.assertIsNotNone(wait_for(lambda: old.poll() is not None or None, 10), "the terminal copy was not closed")
+        again = subprocess.run([sys.executable, SOURCE, "--adopt"], env=environment, capture_output=True, text=True, timeout=30)
+        self.assertIn("already running in the app", again.stdout)

@@ -43,8 +43,12 @@ hooks at itself, and deletes earlier versions once no session started before the
 
 Windows has no tmux, so sessions started from the app run in a small background session host
 (the same program, with `--session-host`), which keeps them going while the app restarts or updates.
-It exits on its own once it has no sessions left. Sessions started from the app can only be used
-from the app; **Open in terminal** isn't available for them. Desktop notifications aren't built yet.
+It exits on its own once it has no sessions left. On Windows, **Open in terminal** ends the copy in
+the app and resumes the session by id in a console window. Desktop notifications aren't built yet.
+
+**Terminal to app:** `--setup` adds a `/to-app` skill. Typed in a terminal session, it runs
+`claude-monitor --adopt`, which waits for the turn to end, closes the terminal copy and resumes the
+same session inside the app.
 
 ## 3D printer cameras
 
