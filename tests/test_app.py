@@ -190,6 +190,21 @@ class UpdateTests(unittest.TestCase):
         if WINDOWS:
             self.assertEqual(versioned, "claude-sessions-windows-1.2.0.exe")
 
+    def test_a_failed_check_says_why(self):
+        self.old.releases.check_now()  # Nothing published: 404.
+        self.assertIn("Couldn't reach GitHub", self.old.releases.problem)
+        self.publish("1.2.0", b"x")
+        self.assertEqual(self.old.releases.check_now(), (True, "A newer version is available."))
+        self.assertEqual(self.old.releases.problem, "")
+
+    def test_a_release_without_a_download_for_this_computer_says_so(self):
+        self.publish("1.2.0", b"x")
+        listing = json.loads(self.files["/latest"])
+        listing["assets"] = []
+        self.files["/latest"] = json.dumps(listing).encode()
+        self.old.releases.check()
+        self.assertIn("no download", self.old.releases.problem)
+
     def test_no_offer_for_the_same_or_an_older_version(self):
         for version in ("1.0.0", "0.9.9"):
             self.publish(version, self.stamped(version).encode())
@@ -2303,3 +2318,22 @@ function show(n){if(typeof n==='string')return n;const inner=n.children.map(show
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FolderApprovalTests(unittest.TestCase):
+    def test_an_approval_matches_however_the_path_was_typed(self):
+        app = load(SOURCE, "folders_" + secrets.token_hex(4))
+        home = os.path.expanduser("~")
+        self.assertTrue(app.same_folder(home, "~"))
+        self.assertTrue(app.same_folder(home + os.sep, home))
+        self.assertFalse(app.same_folder(home, os.path.join(home, "other")))
+        self.assertFalse(app.same_folder("", home))
+        self.assertFalse(app.same_folder(None, home))
+
+    def test_the_trust_menu_is_read_with_either_pointer(self):
+        app = load(SOURCE, "trust_" + secrets.token_hex(4))
+        for pointer in ("❯", ">"):
+            screen = f" {pointer} 1. Yes, I trust this folder\n   2. No, exit\n"
+            self.assertTrue(app.TRUST_YES_SELECTED.search(screen), pointer)
+        self.assertFalse(app.TRUST_YES_SELECTED.search("   1. Yes, I trust this folder\n > 2. No, exit"))
+        self.assertTrue(app.TRUST_YES_NUMBERED.search("   1. Yes, I trust this folder"))

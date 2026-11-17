@@ -234,7 +234,7 @@ def port_choices(port):
     return [port] + [port + step for step in (10000, 20000, 30000, 40000) if port + step < 65536]
 HOST_IDLE_SECONDS = 120  # How long the session host waits with no sessions before it exits.
 TERM_COLUMNS, TERM_ROWS = 120, 40
-START_TIMEOUT_SECONDS = 20
+START_TIMEOUT_SECONDS = 45 if WINDOWS else 20  # A cold claude.exe, scanned by antivirus, is slow.
 MAX_REPLY_BYTES = 32768
 MAX_IMAGES = 5  # Pictures in one message.
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # One picture, after the page has shrunk it.
@@ -255,9 +255,10 @@ SCREENCAP_TIMEOUT_SECONDS = 10
 FRAME_MIN_SECONDS = 0.12
 FRAME_MAX_SECONDS = 1.0  # How far captures slow down while the screen isn't changing.
 FRAME_BACKOFF = 1.5
-TRUST_YES = re.compile(r"^\s*(?:❯\s*)?(?:\d+\.\s*)?Yes\b.*trust this folder", re.M)
-TRUST_YES_SELECTED = re.compile(r"^\s*❯\s*(?:\d+\.\s*)?Yes\b.*trust this folder", re.M)
+TRUST_YES = re.compile(r"^\s*(?:[❯>]\s*)?(?:\d+\.\s*)?Yes\b.*trust this folder", re.M)
+TRUST_YES_SELECTED = re.compile(r"^\s*[❯>]\s*(?:\d+\.\s*)?Yes\b.*trust this folder", re.M)
 TRUST_MENU_STEPS = 4
+TRUST_YES_NUMBERED = re.compile(r"^\s*(?:[❯>]\s*)?1\.\s*Yes\b.*trust this folder", re.M)
 EMULATOR_SERIAL = re.compile(r"\bemulator-\d{1,5}\b")
 BROWSER_PORT_ARG = re.compile(rb"--remote-debugging-port=(\d{1,5})")
 # How a shell command names a browser's debugging port: in the flag, or in an address.
@@ -1065,7 +1066,7 @@ class Monitor:
                 self._update_known(sessions)
                 self.cached = {
                     "version": RUNNING_VERSION, "updateReady": script_version() != RUNNING_VERSION,
-                    "appVersion": APP_VERSION, "release": releases.offer(),
+                    "appVersion": APP_VERSION, "release": releases.offer(), "releaseProblem": releases.problem if version_tuple(APP_VERSION) else "",
                     "error": self.error, "sessions": sessions, "devices": self.linked_devices(sessions), "usage": usage,
                     "previous": self.previous, "remember": self.remember,
                 }
@@ -4180,6 +4181,15 @@ def trusted_folders():
         return []
 
 
+def same_folder(approved, cwd):
+    """Whether an approval names this folder, however its path was typed (~, slashes, a trailing separator, case on Windows)."""
+    if not approved or not cwd:
+        return False
+    def norm(path):
+        return os.path.normcase(os.path.normpath(os.path.expanduser(str(path))))
+    return norm(approved) == norm(cwd)
+
+
 def accept_trust_prompt(session_id):
     """Select Yes on Claude Code's trust menu and confirm it. The menu starts on No and its
     order isn't guaranteed, so Enter is only ever pressed with Yes seen to be selected."""
@@ -4191,6 +4201,15 @@ def accept_trust_prompt(session_id):
             return False
         send_keys(session_id, "Down")
         time.sleep(0.2)
+    # The pointer wasn't recognised (Windows terminals can draw it differently). Option 1 is the Yes, and a number picks it.
+    if TRUST_YES_NUMBERED.search(session_screen(session_id)):
+        send_keys(session_id, "1")
+        time.sleep(0.5)
+        screen = session_screen(session_id)
+        if "trust this folder" not in screen:
+            return True
+        if TRUST_YES_SELECTED.search(screen):
+            return send_keys(session_id, "Enter")
     return False
 
 
@@ -4204,7 +4223,7 @@ def start_session(monitor, request):
     prompt = str(request.get("prompt", "")).strip()
     name = clean(request.get("name", ""))
     mode = str(request.get("mode") or "manual")
-    trust_approved = bool(cwd) and request.get("trust") == cwd
+    trust_approved = bool(cwd) and same_folder(request.get("trust"), cwd)
     if not os.path.isabs(cwd) or not os.path.isdir(cwd):
         return False, f"Not an existing folder: {cwd or '(empty)'}"
     if not prompt:
@@ -4263,8 +4282,9 @@ def launch_session(monitor, session_id, command, cwd, trust_approved):
                 kill_terminal(session_id)
                 return False, {"error": "This folder isn't trusted yet.", "needsTrust": True, "cwd": cwd}
             if not accept_trust_prompt(session_id):
+                shown = clean(session_screen(session_id))[-300:]
                 kill_terminal(session_id)
-                return False, f"Could not answer the trust prompt. Run claude in {cwd} once and accept it, then retry."
+                return False, f"Could not answer the trust prompt. Run claude in {cwd} once and accept it, then retry. Its screen showed: {shown}"
             trust_answered = True
         time.sleep(0.5)
     screen = session_screen(session_id)
@@ -4291,7 +4311,7 @@ def resume_session(monitor, request):
     command = ["claude", "--resume", session_id, f"--permission-mode={mode}", *resume_model_flag(entry.get("model"))]
     if entry.get("chrome") is True:
         command.append("--chrome")
-    return launch_session(monitor, session_id, command, cwd, bool(cwd) and request.get("trust") == cwd)
+    return launch_session(monitor, session_id, command, cwd, bool(cwd) and same_folder(request.get("trust"), cwd))
 
 
 def forget_session(monitor, request):
@@ -5437,7 +5457,7 @@ def open_terminal(monitor, request):
     if not session:
         return False, "That session is no longer running."
     if session["hosted"] and WINDOWS:
-        return False, "On Windows, sessions started here can only be used from this app."
+        return hand_to_console(monitor, session)
     if session["hosted"]:
         command = ["tmux", "-L", TMUX_SOCKET, "attach-session", "-t", tmux_target(session["tmux"])]
     elif session["job"]:
@@ -5454,6 +5474,33 @@ def open_terminal(monitor, request):
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True, "Opened."
     return False, "No terminal program was found."
+
+
+def hand_to_console(monitor, session):
+    """Windows: a session running inside the app's own host can't be shown in a window, so the copy
+    here is ended and the same session is resumed by id in a console window of its own. It must be
+    idle, since ending a working copy would cut off its turn."""
+    if session.get("status") == "busy":
+        return False, "It's working. Wait until it's done (or interrupt it), because opening it in a terminal ends the copy running here."
+    session_id = session["id"]
+    with monitor.lock:
+        entry = read_known()["sessions"].get(session_id) or {}
+    cwd = session.get("cwd") or entry.get("cwd") or ""
+    if not os.path.isdir(cwd):
+        return False, f"Its folder no longer exists: {cwd or '(unknown)'}"
+    mode = {"default": "manual"}.get(entry.get("mode"), entry.get("mode"))
+    mode = mode if mode in NEW_SESSION_MODES else "manual"
+    command = ["claude", "--resume", session_id, f"--permission-mode={mode}", *resume_model_flag(entry.get("model"))]
+    if entry.get("chrome") is True:
+        command.append("--chrome")
+    if not kill_terminal(session["tmux"]):
+        return False, "Could not end the copy running in the app, so nothing was opened."
+    monitor.invalidate()
+    try:
+        subprocess.Popen(["cmd.exe", "/k", *command], cwd=cwd, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
+    except OSError as exc:
+        return False, f"The copy in the app was ended, but the terminal wouldn't open ({clean(exc)}). Run: claude --resume {session_id}"
+    return True, "Opened. The session now runs in that window."
 
 
 def rename_session(monitor, request):
@@ -5616,6 +5663,7 @@ class Releases:
     def __init__(self):
         self.latest = None
         self.staged = None  # Windows: the downloaded new version, waiting to be run.
+        self.problem = ""  # Why the last check failed, so the app can say so instead of staying quiet.
         self.lock = threading.Lock()
 
     def check(self):
@@ -5628,13 +5676,27 @@ class Releases:
         if version_tuple(version) and assets.get(name) and assets.get("SHA256SUMS"):
             self.latest = {"version": version, "url": assets[name], "sums": assets["SHA256SUMS"], "asset": name,
                            "page": str(release.get("html_url", ""))}
+            self.problem = ""
+        else:
+            self.problem = f"The latest release ({version or 'unnamed'}) has no download for this computer."
+
+    def check_now(self):
+        """Check immediately. Returns (succeeded, message), the message saying why when it failed."""
+        try:
+            self.check()
+        except Exception as exc:
+            self.problem = f"Couldn't reach GitHub to look for updates: {clean(exc)}"
+        if self.problem:
+            return False, self.problem
+        return True, "A newer version is available." if self.offer() else "This is the newest version."
 
     def watch(self):
         while True:
             try:
                 self.check()
-                time.sleep(RELEASE_CHECK_SECONDS)
-            except Exception:  # Offline, rate-limited or a surprise reply: try again later.
+                time.sleep(RELEASE_CHECK_SECONDS if not self.problem else RELEASE_RETRY_SECONDS)
+            except Exception as exc:  # Offline, rate-limited or a surprise reply: try again later.
+                self.problem = f"Couldn't reach GitHub to look for updates: {clean(exc)}"
                 time.sleep(RELEASE_RETRY_SECONDS)
 
     def offer(self):
@@ -5688,6 +5750,12 @@ class Releases:
 
 
 releases = Releases()
+
+
+def check_update(monitor, request):
+    succeeded, message = releases.check_now()
+    monitor.invalidate()
+    return succeeded, message
 
 
 def update_app(monitor, request):
@@ -5757,6 +5825,7 @@ def hand_over():
 
 POST_ROUTES = {
     "/api/sessions/update": update_app,
+    "/api/sessions/check-update": check_update,
     "/api/sessions/restart-app": restart_app,
     "/api/sessions/context": recheck_context,
     "/api/sessions/end-started": end_started,
@@ -7866,16 +7935,31 @@ function noticeVersion(d){
  }
 }
 let updating=false;
+let releaseOffered=null,releaseProblem='';
 function noticeRelease(d){
+ releaseOffered=d.release||null;releaseProblem=d.releaseProblem||'';
  for(const id of ['updateApp','histUpdateApp']){
   const b=$(id);
-  b.hidden=!d.release&&!updating;
+  b.hidden=!d.release&&!updating&&!releaseProblem;
   b.disabled=updating;
-  b.lastChild.textContent=updating?'Updating…':d.release?'Update to '+d.release.version:'';
-  b.title=d.release?'Version '+d.release.version+' is out (you have '+d.appVersion+'). Downloads it and restarts the app. Your sessions keep running.':'';
+  b.lastChild.textContent=updating?'Updating…':d.release?'Update to '+d.release.version:releaseProblem?'Update check failed':'';
+  b.title=d.release?'Version '+d.release.version+' is out (you have '+d.appVersion+'). Downloads it and restarts the app. Your sessions keep running.':releaseProblem;
  }
+ offerUpdate(d);
+}
+// Once for each new version, so an update is never missed. Not over a dialog that is already open.
+async function offerUpdate(d){
+ if(!d.release||updating||document.querySelector('dialog[open]'))return;
+ let seen='';try{seen=localStorage.getItem('updateOffered')||''}catch(e){}
+ if(seen===d.release.version)return;
+ try{localStorage.setItem('updateOffered',d.release.version)}catch(e){}
+ if(await ask('Version '+d.release.version+' of Claude Sessions is out (you have '+d.appVersion+'). Update now? Your sessions keep running.',{yes:'Update',no:'Later'}))updateApp();
 }
 async function updateApp(){
+ if(!releaseOffered&&releaseProblem){
+  const c=await post('check-update',{}).catch(()=>({error:'Could not reach the app.'}));
+  await tell(c.error||c.message||releaseProblem);refresh();return;
+ }
  updating=true;restarting=true;
  noticeRelease({});
  const d=await post('update',{}).catch(()=>({error:'Could not reach the app.'}));
