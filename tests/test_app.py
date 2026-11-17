@@ -131,7 +131,7 @@ class TerminalTests(unittest.TestCase):
             self.assertIn(b"TEXT from the window", received)
         # The app still sees it, and the terminal goes back to the app's size when the window leaves.
         self.assertTrue(self.shows("TEXT from the window"))
-        self.assertTrue(wait_for(lambda: app.session_screen(self.name).count("\n") + 1 == app.TERM_ROWS, 10))
+        self.assertTrue(wait_for(lambda: app.host_call("screen", name=self.name)["screen"].count("\n") + 1 == app.TERM_ROWS, 10))
 
     def test_ended(self):
         self.assertTrue(app.kill_terminal(self.name))
