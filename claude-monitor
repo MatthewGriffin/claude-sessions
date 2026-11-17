@@ -39,6 +39,7 @@ import json
 import mmap
 import os
 import platform
+import queue
 import re
 import secrets
 import socket
@@ -3827,6 +3828,7 @@ class HostedTerminal:
         self.ended = False
         self.screen = Screen(TERM_COLUMNS, TERM_ROWS)
         self.stream = pyte.Stream(self.screen)
+        self.subscribers = set()  # Queues of terminal windows attached to this session, each given its output.
         program = shutil.which(command[0]) or command[0]
         self.process = PtyProcess.spawn([program, *command[1:]], cwd=cwd, dimensions=(TERM_ROWS, TERM_COLUMNS))
         threading.Thread(target=self.read_output, daemon=True).start()
@@ -3840,6 +3842,8 @@ class HostedTerminal:
             if data:
                 with self.lock:
                     self.stream.feed(data)
+                    for updates in self.subscribers:
+                        updates.put(data)
             elif not self.process.isalive():
                 break
         self.ended = True
@@ -3850,6 +3854,30 @@ class HostedTerminal:
             return True
         except Exception:
             return False
+
+    def resize(self, columns, rows, repaint=False):
+        """Make the terminal this size, for the app and every window attached. With repaint, the program is
+        first given a different size, so that it draws itself again."""
+        columns, rows = min(max(int(columns), 20), 400), min(max(int(rows), 6), 200)
+        with contextlib.suppress(Exception):
+            if repaint:
+                self.process.setwinsize(rows - 1, columns)
+                time.sleep(0.15)
+            self.process.setwinsize(rows, columns)
+        with self.lock:
+            self.screen.resize(rows, columns)
+
+    def subscribe(self, updates, columns, rows):
+        with self.lock:
+            self.subscribers.add(updates)
+        self.resize(columns, rows, repaint=True)  # Its window starts empty, so the program draws itself into it.
+
+    def unsubscribe(self, updates):
+        with self.lock:
+            self.subscribers.discard(updates)
+            last = not self.subscribers
+        if last:
+            self.resize(TERM_COLUMNS, TERM_ROWS, repaint=True)
 
     def alive(self):
         try:
@@ -3867,6 +3895,56 @@ class HostedTerminal:
         with contextlib.suppress(Exception):
             self.process.close(force=True)
         self.ended = True
+
+
+ATTACH_FRAME = struct.Struct(">cI")  # What a window sends: "d" typed text, or "r" its size as "columns,rows"; then that many bytes.
+ATTACH_MAX_FRAME = 1024 * 1024
+
+
+def attach_frame(kind, payload):
+    return ATTACH_FRAME.pack(kind, len(payload)) + payload
+
+
+def serve_attach(rfile, connection, terminal, columns, rows):
+    """Join a console window to a hosted terminal until either end goes: the terminal's output flows to it,
+    and what it sends is typed into the terminal, as with tmux attach."""
+    updates = queue.SimpleQueue()
+    terminal.subscribe(updates, columns, rows)
+    try:
+        connection.sendall(b'{"ok": true}\n')
+
+        def forward():
+            while True:
+                try:
+                    data = updates.get(timeout=0.5)
+                except queue.Empty:
+                    if not terminal.alive():
+                        break
+                    continue
+                try:
+                    connection.sendall(data.encode("utf-8", "replace"))
+                except OSError:
+                    break
+            with contextlib.suppress(OSError):
+                connection.shutdown(socket.SHUT_RDWR)
+
+        threading.Thread(target=forward, daemon=True).start()
+        while True:
+            header = rfile.read(ATTACH_FRAME.size)
+            if len(header) < ATTACH_FRAME.size:
+                break
+            kind, length = ATTACH_FRAME.unpack(header)
+            payload = rfile.read(length) if length <= ATTACH_MAX_FRAME else b""
+            if len(payload) < length:
+                break
+            if kind == b"d":
+                terminal.write(payload.decode("utf-8", "replace"))
+            elif kind == b"r":
+                with contextlib.suppress(ValueError):
+                    wide, _, high = payload.decode("ascii", "replace").partition(",")
+                    terminal.resize(int(wide), int(high))
+    finally:
+        terminal.unsubscribe(updates)
 
 
 def run_session_host():
@@ -3887,7 +3965,7 @@ def run_session_host():
     def answer(request):
         op, name = request.get("op"), str(request.get("name", ""))
         if op == "ping":
-            return {"ok": True, "version": APP_VERSION}
+            return {"ok": True, "version": APP_VERSION, "attach": True}
         if op == "list":
             tree = windows_process_tree()
             return {"ok": True, "sessions": [
@@ -3946,6 +4024,12 @@ def run_session_host():
                 request = json.loads(self.rfile.readline(1024 * 1024))
                 if not isinstance(request, dict) or not hmac.compare_digest(str(request.get("token", "")).encode(), token.encode()):
                     reply = {"denied": True}
+                elif request.get("op") == "attach":
+                    terminal = live_terminals().get(str(request.get("name", "")))
+                    if terminal:
+                        serve_attach(self.rfile, self.request, terminal, request.get("columns", TERM_COLUMNS), request.get("rows", TERM_ROWS))
+                        return
+                    reply = {"ok": False, "error": "No such session."}
                 else:
                     reply = answer(request)
             except Exception as exc:
@@ -5463,7 +5547,7 @@ def open_terminal(monitor, request):
     if not session:
         return False, "That session is no longer running."
     if session["hosted"] and WINDOWS:
-        return hand_to_console(monitor, session)
+        return attach_in_terminal(session) or hand_to_console(monitor, session)
     if session["hosted"]:
         command = ["tmux", "-L", TMUX_SOCKET, "attach-session", "-t", tmux_target(session["tmux"])]
     elif session["job"]:
@@ -5480,6 +5564,24 @@ def open_terminal(monitor, request):
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True, "Opened."
     return False, "No terminal program was found."
+
+
+def attach_in_terminal(session):
+    """Windows: a console window joined to the session, which carries on in the app. A host from before
+    this existed can't do that, so the session is moved to a window of its own instead."""
+    if not (host_call("ping") or {}).get("attach"):
+        return None
+    command = own_command("--attach", session["tmux"])
+    try:
+        terminal = shutil.which("wt")  # Windows Terminal, where it's installed: it handles keys and pasting better.
+        if terminal:
+            subprocess.Popen([terminal, "new-tab", "--title", f"Claude: {session['name']}"[:60], *command],
+                             close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(command, creationflags=0x00000010, close_fds=True)  # CREATE_NEW_CONSOLE
+    except OSError as exc:
+        return False, f"The terminal wouldn't open ({clean(exc)})."
+    return True, "Opened."
 
 
 def hand_to_console(monitor, session):
@@ -10000,6 +10102,119 @@ def run_adopt_worker(spec):
     return 0
 
 
+def run_attach(name):
+    """Windows: show a hosted session in this console and send it what is typed here. The app keeps using it too."""
+    if not WINDOWS or not SESSION_ID.match(name or ""):
+        return 1
+    import codecs
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.ReadConsoleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    kernel32.WriteConsoleW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    invalid = ctypes.c_void_p(-1).value
+
+    def open_console():
+        # The built program has no console of its own (it's a windowed program), so these are opened by name.
+        return [kernel32.CreateFileW(device, 0xC0000000, 3, None, 3, 0, None) for device in ("CONIN$", "CONOUT$")]
+
+    keyboard, screen = open_console()
+    if invalid in (keyboard, screen) or keyboard is None or screen is None:
+        kernel32.AllocConsole()
+        keyboard, screen = open_console()
+    if invalid in (keyboard, screen) or keyboard is None or screen is None:
+        return 1
+
+    def write(text):
+        done = wintypes.DWORD()
+        kernel32.WriteConsoleW(screen, text, len(text), ctypes.byref(done), None)
+
+    try:
+        with open(HOST_TOKEN_FILE, encoding="utf-8") as handle:
+            token, port = handle.read().split()[:2]
+        connection = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
+    except (OSError, ValueError) as exc:
+        write(f"Couldn't reach the session host: {exc}\r\n")
+        time.sleep(5)
+        return 1
+    saved = []
+    for handle_, add, remove in ((keyboard, 0x0200, 0x0001 | 0x0002 | 0x0004), (screen, 0x0004 | 0x0001, 0)):
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(handle_, ctypes.byref(mode)):
+            saved.append((handle_, mode.value))
+            kernel32.SetConsoleMode(handle_, (mode.value | add) & ~remove)  # Keys arrive as terminal codes, none handled here.
+
+    def size():
+        wide, high = shutil.get_terminal_size((TERM_COLUMNS, TERM_ROWS))
+        return wide, high
+
+    columns, rows = size()
+    connection.sendall(json.dumps({"op": "attach", "name": name, "token": token, "columns": columns, "rows": rows}).encode() + b"\n")
+    line = b""
+    while not line.endswith(b"\n"):
+        byte = connection.recv(1)
+        if not byte:
+            break
+        line += byte
+    connection.settimeout(None)
+    try:
+        ok = json.loads(line).get("ok")
+        problem = json.loads(line).get("error", "")
+    except ValueError:
+        ok, problem = False, "unexpected reply"
+    if not ok:
+        write(f"Couldn't join the session: {problem}\r\n")
+        time.sleep(5)
+        return 1
+    write("\x1b[2J\x1b[H")
+
+    def restore():
+        for handle_, mode in saved:
+            kernel32.SetConsoleMode(handle_, mode)
+
+    def show():
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        while True:
+            try:
+                data = connection.recv(65536)
+            except OSError:
+                data = b""
+            if not data:
+                break
+            write(decoder.decode(data))
+        restore()
+        write("\x1b[0m\r\n[The session ended or its connection closed.]\r\n")
+        time.sleep(1.5)
+        os._exit(0)
+
+    def watch_size():
+        nonlocal columns, rows
+        while True:
+            time.sleep(0.5)
+            now = size()
+            if now != (columns, rows):
+                columns, rows = now
+                with contextlib.suppress(OSError):
+                    connection.sendall(attach_frame(b"r", f"{columns},{rows}".encode()))
+
+    threading.Thread(target=show, daemon=True).start()
+    threading.Thread(target=watch_size, daemon=True).start()
+    buffer = ctypes.create_unicode_buffer(2048)
+    count = wintypes.DWORD()
+    while True:
+        if not kernel32.ReadConsoleW(keyboard, buffer, 2048, ctypes.byref(count), None):
+            break
+        text = buffer.value[: count.value].encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        try:
+            connection.sendall(attach_frame(b"d", text.encode("utf-8")))
+        except OSError:
+            break
+    restore()
+    return 0
+
+
 OWN_FLAGS = ("--hook", "--context", "--statusline", "--emulator-guard")
 # On Windows each run of the one-file program takes a second or more to start (longer with
 # antivirus scanning it), and Claude Code waits for this hook before it takes each message.
@@ -10205,6 +10420,7 @@ def main():
     parser.add_argument("--preview", action="store_true", help="for a session: save a picture of each preview beside its chat")
     parser.add_argument("--statusline", action="store_true", help="status line for Claude Code that also feeds this app")
     parser.add_argument("--adopt", nargs="?", const="", metavar="ID", help="from inside a terminal session: move it into the app")
+    parser.add_argument("--attach", metavar="ID", help=argparse.SUPPRESS)
     parser.add_argument("--adopt-worker", help=argparse.SUPPRESS)
     parser.add_argument("--setup", action="store_true", help="add this app's hooks (and a status line, if none) to Claude Code")
     parser.add_argument("--session-host", action="store_true", help=argparse.SUPPRESS)
@@ -10224,6 +10440,8 @@ def main():
         return run_statusline()
     if args.setup:
         return run_setup()
+    if args.attach:
+        return run_attach(args.attach)
     if args.adopt is not None:
         return run_adopt(args.adopt)
     if args.adopt_worker:

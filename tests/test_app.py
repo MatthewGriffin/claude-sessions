@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -112,6 +113,25 @@ class TerminalTests(unittest.TestCase):
     def test_paste_keeps_line_breaks(self):
         self.assertTrue(app.paste_text(self.name, "first line\nsecond line"))
         self.assertTrue(self.shows('PASTE["first line\\rsecond line"]'), app.session_screen(self.name))
+
+    @unittest.skipUnless(WINDOWS, "attaching is for the Windows session host")
+    def test_a_window_can_attach_and_type(self):
+        token, port = open(app.HOST_TOKEN_FILE).read().split()[:2]
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=10) as connection:
+            connection.sendall(json.dumps({"op": "attach", "name": self.name, "token": token, "columns": 100, "rows": 30}).encode() + b"\n")
+            received = b""
+            deadline = time.time() + 15
+            while b"\n" not in received and time.time() < deadline:
+                received += connection.recv(4096)
+            self.assertTrue(json.loads(received.split(b"\n")[0])["ok"], received)
+            connection.sendall(app.attach_frame(b"d", b"from the window"))
+            deadline = time.time() + 15
+            while b"TEXT from the window" not in received and time.time() < deadline:
+                received += connection.recv(4096)
+            self.assertIn(b"TEXT from the window", received)
+        # The app still sees it, and the terminal goes back to the app's size when the window leaves.
+        self.assertTrue(self.shows("TEXT from the window"))
+        self.assertTrue(wait_for(lambda: app.session_screen(self.name).count("\n") + 1 == app.TERM_ROWS, 10))
 
     def test_ended(self):
         self.assertTrue(app.kill_terminal(self.name))
@@ -2387,3 +2407,59 @@ class AdoptTests(unittest.TestCase):
         self.assertIsNotNone(wait_for(lambda: old.poll() is not None or None, 10), "the terminal copy was not closed")
         again = subprocess.run([sys.executable, SOURCE, "--adopt"], env=environment, capture_output=True, text=True, timeout=30)
         self.assertIn("already running in the app", again.stdout)
+
+
+class AttachProtocolTests(unittest.TestCase):
+    """What the session host does when a console window joins, against a stand-in terminal (the real one needs Windows)."""
+
+    class Fake:
+        def __init__(self):
+            self.subscribers, self.typed, self.sizes, self.up = [], [], [], True
+
+        def subscribe(self, updates, columns, rows):
+            self.subscribers.append(updates)
+            self.sizes.append((columns, rows))
+
+        def unsubscribe(self, updates):
+            self.subscribers.remove(updates)
+            self.sizes.append("left")
+
+        def resize(self, columns, rows, repaint=False):
+            self.sizes.append((columns, rows))
+
+        def write(self, text):
+            self.typed.append(text)
+            return True
+
+        def alive(self):
+            return self.up
+
+    def test_output_flows_out_and_typing_flows_in(self):
+        terminal = self.Fake()
+        host_side, window_side = socket.socketpair()
+        self.addCleanup(window_side.close)
+        thread = threading.Thread(target=app.serve_attach, args=(host_side.makefile("rb"), host_side, terminal, 100, 30), daemon=True)
+        thread.start()
+        window = window_side.makefile("rb")
+        self.assertTrue(json.loads(window.readline())["ok"])
+        self.assertEqual(terminal.sizes[0], (100, 30))
+        terminal.subscribers[0].put("hello \u00e9")
+        self.assertEqual(window.read(len("hello é".encode())), "hello é".encode())
+        window_side.sendall(app.attach_frame(b"d", "typed é".encode()) + app.attach_frame(b"r", b"90,25"))
+        self.assertTrue(wait_for(lambda: terminal.typed == ["typed é"] and (90, 25) in terminal.sizes))
+        window_side.shutdown(socket.SHUT_WR)  # The window closes.
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(terminal.subscribers, [])
+        self.assertEqual(terminal.sizes[-1], "left")
+
+    def test_the_window_is_told_when_the_session_ends(self):
+        terminal = self.Fake()
+        host_side, window_side = socket.socketpair()
+        self.addCleanup(window_side.close)
+        threading.Thread(target=app.serve_attach, args=(host_side.makefile("rb"), host_side, terminal, 80, 24), daemon=True).start()
+        window = window_side.makefile("rb")
+        window.readline()
+        terminal.subscribers[0].put("last words")
+        terminal.up = False
+        self.assertEqual(window.read(), b"last words")  # Then the connection closes.
