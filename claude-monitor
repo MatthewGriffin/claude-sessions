@@ -265,6 +265,8 @@ BROWSER_PORT_ARG = re.compile(rb"--remote-debugging-port=(\d{1,5})")
 # How a shell command names a browser's debugging port: in the flag, or in an address.
 # Claude Code tells a session a background task is over with one of these.
 TASK_NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
+TASK_SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
+TASK_OUTPUT_PATH = re.compile(r"<output-file>(.*?)</output-file>", re.S)
 TASK_ID = re.compile(r"<task-id>([A-Za-z0-9_-]{1,40})</task-id>")
 TASK_STATUS = re.compile(r"<status>(\w+)</status>")
 # A background task writes to <temp>/claude-<uid>/<project>/<session id>/tasks/<task id>.output while it runs.
@@ -499,7 +501,11 @@ class Transcript:
         elif kind == "permission-mode":
             self.permission_mode = str(entry.get("permissionMode", ""))
         elif kind == "last-prompt":
-            self.prompt = clean(entry.get("lastPrompt", ""))
+            last = str(entry.get("lastPrompt", ""))
+            if "<task-notification>" in last:
+                last = TASK_NOTIFICATION.sub("", last).strip()  # Not something the user wrote.
+            if last or "<task-notification>" not in str(entry.get("lastPrompt", "")):
+                self.prompt = clean(last)
         elif kind in ("assistant", "user") and (self.is_subagent or not entry.get("isSidechain")):
             self.branch = entry.get("gitBranch") or self.branch
             # Each message records the mode it was sent in. After /clear, this can be the only record.
@@ -3223,6 +3229,7 @@ class HistoryReader:
         self.offset = 0
         self.messages = []
         self.tools = {}
+        self.task_noticed = set()  # Background task notifications already shown.
         self.seen = set()
         self.turn = self.new_turn("", 0)
         self.changed_turn = None
@@ -3267,7 +3274,33 @@ class HistoryReader:
                 if isinstance(entry, dict):
                     self._ingest(entry, start)
 
+    def _task_notices(self, text):
+        """Show Claude Code's background task notifications as what they say, not as raw tags.
+        Returns the rest of the message once they are taken out."""
+        for note in TASK_NOTIFICATION.findall(text):
+            task, status = TASK_ID.search(note), TASK_STATUS.search(note)
+            summary = TASK_SUMMARY.search(note)
+            summary = html.unescape(summary.group(1)).strip() if summary else ""
+            output = TASK_OUTPUT_PATH.search(note)
+            key = (task.group(1) if task else "", status.group(1) if status else "", summary[:80])
+            if key in self.task_noticed:
+                continue
+            self.task_noticed.add(key)
+            first = summary.split("\n")[0] if summary else f"Background task {status.group(1) if status else 'update'}"
+            self._add_note(history_text(first, 240))
+            detail = "\n".join(part for part in (
+                summary if summary != first else "",
+                f"Task: {task.group(1)}" if task else "", f"Status: {status.group(1)}" if status else "",
+                f"Output: {output.group(1).strip()}" if output else "") if part)
+            if summary != first or output:
+                self._add_detail("Background task details", detail)
+        return TASK_NOTIFICATION.sub("", text).strip()
+
     def _human_message(self, text, entry):
+        if "<task-notification>" in text:
+            text = self._task_notices(text)
+            if not text:
+                return
         if self.is_subagent and self.instructions is None:
             self.instructions = history_text(text, HISTORY_TEXT)
             return
@@ -3336,6 +3369,10 @@ class HistoryReader:
                 origin = attachment.get("origin") if isinstance(attachment.get("origin"), dict) else {}
                 if origin.get("kind", "human") == "human":
                     self._human_message(attachment["prompt"], entry)
+                elif "<task-notification>" in attachment["prompt"]:
+                    rest = self._task_notices(attachment["prompt"])
+                    if rest:
+                        self.add({"role": "system", "text": history_text(rest, HISTORY_TEXT)})
                 else:
                     self.add({"role": "system", "text": history_text(attachment["prompt"], HISTORY_TEXT)})
             elif attachment.get("type") == "hook_system_message":

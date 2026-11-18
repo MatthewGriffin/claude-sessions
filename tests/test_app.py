@@ -2463,3 +2463,35 @@ class AttachProtocolTests(unittest.TestCase):
         terminal.subscribers[0].put("last words")
         terminal.up = False
         self.assertEqual(window.read(), b"last words")  # Then the connection closes.
+
+
+class TaskNotificationTextTests(unittest.TestCase):
+    """A finished background task reads as a line of its own, with the rest folded away, not as raw tags."""
+
+    def read(self, *contents):
+        path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "t.jsonl")
+        with open(path, "w") as handle:
+            for n, content in enumerate(contents):
+                handle.write(json.dumps({"type": "user", "uuid": str(n), "message": {"role": "user", "content": content}}) + "\n")
+        history = app.HistoryReader(path)
+        history.poll()
+        return history.messages
+
+    def test_shown_as_a_note_and_not_as_something_you_said(self):
+        note = ("<task-notification>\n<task-id>b33</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n"
+                "<output-file>/tmp/x/tasks/b33.output</output-file>\n<status>completed</status>\n"
+                "<summary>Background command \"python3 -I - &lt;&lt;'EOF'\nimport re\nEOF\" completed (exit code 0)</summary>\n"
+                "</task-notification>")
+        messages = self.read(note, note)  # Recorded twice, shown once.
+        self.assertEqual([m["role"] for m in messages], ["system", "detail"])
+        self.assertTrue(messages[0]["note"])
+        self.assertIn("<<'EOF'", messages[1]["text"])
+        self.assertIn("Output: /tmp/x/tasks/b33.output", messages[1]["text"])
+        self.assertFalse(any("task-notification" in m["text"] for m in messages))
+
+    def test_text_beside_a_notification_is_still_a_message(self):
+        note = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Done</summary>\n</task-notification>"
+        messages = self.read(note + "\n\nand then stop")
+        self.assertEqual([m["role"] for m in messages], ["system", "you"])
+        self.assertEqual(messages[0]["text"], "Done")
+        self.assertEqual(messages[1]["text"], "and then stop")
