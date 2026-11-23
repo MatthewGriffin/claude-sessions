@@ -2918,6 +2918,14 @@ class CopilotHostedTests(unittest.TestCase):
         self.assertTrue(app.hand_to_console(app.Monitor(), session)[0])
         self.assertEqual(opened, [["cmd.exe", "/k", "copilot", "--resume=abc-123"]])
 
+    def test_a_panel_open_shows_in_its_state(self):
+        monitor, state = self.state_of({101: "term-1"})
+        self.assertEqual((state["panel"], state["draft"]), (False, ""))
+        monitor.panels["cop"] = {"title": "/model", "text": "", "keys": [], "options": []}
+        monitor.drafts["cop"] = "half written"
+        state = monitor.session_state(monitor.sessions[0])
+        self.assertEqual((state["panel"], state["draft"]), (True, "half written"))
+
     def test_the_page_offers_both_programs(self):
         self.assertIn("$('histRefresh').hidden=!s.hosted||s.provider==='copilot'", app.PAGE)  # Fresh start is Claude Code's.
         for expected in ('id="newProg"', "const NEW_MODES=", "provider:$('newProg').value", 'id="histAllow"', "'/allow-all'", "'/autopilot'"):
@@ -3071,3 +3079,112 @@ class CopilotAskTests(unittest.TestCase):
     def test_the_page_names_the_command_it_was_asked_with(self):
         self.assertIn("(q.verb||'/btw')+' '+q.question", app.PAGE)
         self.assertIn("Side questions (/ask)", app.PAGE)
+
+
+SESSION_PANEL = """\
+ Session                           Status            Last updated Created       Location
+ ┃ ❯ ○ first thing                  —                 1h ago       1h ago      ● ~
+ ┃   ○ second thing                 —                 2d ago       2d ago      ● ~
+ / search · ↑/↓ navigate · enter open · ←/→ change source · r refresh · s sort:relevance · n new session · e
+ environments · esc cancel
+app | Copilot Fusion · Standard | Session: 0h 00m | Ctx: 8% | Today: 1 credits | Month: 2 credits | Unlimited"""
+
+
+class CopilotPanelTests(unittest.TestCase):
+    """The panels Copilot's slash commands open, which replace its input box and end in a line of keys."""
+
+    def setUp(self):
+        self.saved = {n: getattr(app, n) for n in ("session_screen", "send_keys", "send_text")}
+        self.screen, self.keys, self.texts = screen_of("copilot-idle.txt"), [], []
+        app.session_screen = lambda target: self.screen
+        app.send_keys = lambda target, *keys: self.keys.append(keys) or True
+        app.send_text = lambda target, text: self.texts.append(text) or True
+        self.session = {"id": "c1", "tmux": "term", "provider": "copilot", "status": "idle", "waitingFor": "", "hosted": True}
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+
+    def panel(self, name):
+        return app.copilot_command_panel(screen_of(name))
+
+    def test_each_panel_is_found_with_its_title_and_keys(self):
+        expected = {"copilot-panel-permissions.txt": ("Select Permission Mode", ["1-3: select", "↑/↓: navigate", "enter: confirm", "esc: cancel"]),
+                    "copilot-panel-limits.txt": ("Session Limits", ["↑/↓: navigate", "enter: select/change", "esc: cancel"]),
+                    "copilot-panel-tasks.txt": ("Tasks", ["a: levels:all", "f: finished:hidden", "esc: close"]),
+                    "copilot-panel-rewind.txt": ("Rewind to a previous point", ["Enter: Select", "Esc: Cancel"]),
+                    "copilot-panel-help.txt": ("GLOBAL", ["↑/↓: scroll", "esc: close"])}
+        for name, (title, keys) in expected.items():
+            panel = self.panel(name)
+            self.assertEqual((panel["title"], [k["label"] for k in panel["keys"]]), (title, keys), name)
+
+    def test_the_model_picker_offers_its_own_keys(self):
+        panel = self.panel("copilot-panel-model.txt")
+        labels = [k["label"] for k in panel["keys"]]
+        for expected in ("←/→: routing profile", "tab: context window", "enter: select", "esc: cancel"):
+            self.assertIn(expected, labels)
+        self.assertIn(["Left", "Right"], [k["keys"] for k in panel["keys"]])
+
+    def test_a_number_range_is_each_number(self):
+        keys = {tuple(k["keys"]) for k in self.panel("copilot-panel-permissions.txt")["keys"]}
+        self.assertIn(("1", "2", "3"), keys)
+        self.assertIn(("Enter",), keys)
+
+    def test_a_hint_that_wraps_onto_two_lines(self):
+        panel = app.copilot_command_panel(SESSION_PANEL)
+        keys = {k["label"]: k["keys"] for k in panel["keys"]}
+        self.assertEqual(keys["e: environments"], ["e"])
+        self.assertEqual(keys["esc: cancel"], ["Escape"])
+        self.assertEqual(keys["n: new session"], ["n"])
+        self.assertEqual(panel["title"], "Session                           Status            Last updated Created       Location")
+
+    def test_a_panel_is_found_below_an_old_input_box(self):
+        # Output scrolls up with an earlier input box in it, which says nothing about a panel opened since.
+        old_box = "╻" + "▄" * 40 + "\n┃\n╹" + "▀" * 40 + "\n"
+        panel = app.copilot_command_panel(old_box + screen_of("copilot-panel-permissions.txt"))
+        self.assertEqual(panel["title"], "Select Permission Mode")
+
+    def test_no_panel_where_the_input_box_is_showing_or_a_prompt_is(self):
+        for name in ("copilot-idle.txt", "copilot-working.txt", "copilot-allowall.txt", "copilot-permission.txt", "copilot-question.txt",
+                     "copilot-trust.txt", "copilot-ask-done.txt", "copilot-ask-thinking.txt"):
+            self.assertIsNone(app.copilot_command_panel(screen_of(name)), name)
+
+    def test_claude_codes_panels_are_read_as_before(self):
+        self.assertIsNone(app.command_panel(screen_of("copilot-panel-permissions.txt")))  # Not its layout.
+        self.assertIsNotNone(app.command_panel(screen_of("copilot-panel-permissions.txt"), copilot=True))
+
+    def test_nothing_is_typed_while_a_panel_is_open(self):
+        self.screen = screen_of("copilot-panel-model.txt")
+        self.assertTrue(app.panel_open(self.session))
+        self.assertFalse(app.panel_open({**self.session, "provider": "claude"}))
+        self.screen = screen_of("copilot-idle.txt")
+        self.assertFalse(app.panel_open(self.session))
+
+    def watch(self, *screens):
+        monitor = types.SimpleNamespace(lock=threading.Lock(), panels={}, drafts={}, snapshot=lambda: {"error": "", "sessions": [self.session]})
+        for screen in screens:
+            self.screen = screen
+            app.watch_panels(monitor)
+        return monitor
+
+    def test_what_a_panel_showed_is_kept_when_it_closes(self):
+        before = len(app.btw_for("c1"))
+        monitor = self.watch(screen_of("copilot-panel-permissions.txt"), screen_of("copilot-idle.txt"))
+        self.assertEqual(monitor.panels, {})
+        kept = app.btw_for("c1")[before:]
+        self.assertEqual([(e["kind"], e["title"]) for e in kept], [("panel", "Select Permission Mode")])
+        self.assertIn("Manual Approval", kept[0]["text"])
+
+    def test_keys_are_checked_against_what_the_panel_offers(self):
+        self.screen = screen_of("copilot-panel-permissions.txt")
+        self.assertEqual(app.panel_action(self.session, "panelkey", {"key": "2"}), (True, "Sent."))  # 1-3 to select.
+        self.assertEqual(self.texts, ["2"])
+        self.assertEqual(app.panel_action(self.session, "panelkey", {"key": "Escape"}), (True, "Sent."))
+        self.assertEqual(self.keys[-1], ("Escape",))
+        self.assertEqual(app.panel_action(self.session, "panelkey", {"key": "x"})[0], False)  # Not offered here.
+
+    def test_keys_are_refused_once_the_panel_has_closed(self):
+        self.screen = screen_of("copilot-idle.txt")
+        self.assertEqual(app.panel_action(self.session, "panelkey", {"key": "Escape"}), (False, "That panel has closed."))
+        self.assertEqual(self.keys, [])
+

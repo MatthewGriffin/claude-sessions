@@ -66,7 +66,11 @@ permission, answer its questions, interrupt, switch on **Allow all** or **Autopi
 first message is checked against Copilot's own log and typed again if it didn't arrive. `/ask` works as
 `/btw` does for Claude: it's answered while the session carries on, the whole answer is read from the panel
 (the terminal is made big for a moment, so a long one isn't cut off) and kept under Commands, and the panel
-is closed again. Nothing is typed into the session while its panel is open; messages wait instead. Copilot sessions
+is closed again. Nothing is typed into the session while its panel is open; messages wait instead.
+Panels that Copilot's other commands open (`/model`, `/permissions`, `/session`, `/tasks`, `/rewind`, `/limits`,
+`/help`) are shown live as Claude's are, with a button for each key the panel's hint line offers, and what
+one showed is kept under Commands once it closes. What a command such as `/context` or `/usage` prints
+into the chat isn't, because Copilot doesn't record it. Copilot sessions
 you started in your own terminal are shown read-only; reply to those there. `copilot` must be on your PATH.
 
 ## 3D printer cameras
