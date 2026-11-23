@@ -4419,7 +4419,7 @@ class TrayTests(unittest.TestCase):
         self.assertEqual(sorted(self.calls), ["open", "open", "quit"])
 
     def test_the_tooltip_says_how_many_sessions_need_you(self):
-        self.assertEqual(self.tray().tip(), "Claude Sessions\n2 live · 1 need you")
+        self.assertEqual(self.tray().tip(), app.TRAY_TITLE + "\n2 live · 1 need you")
         self.assertLessEqual(len(self.tray(status=lambda: "x" * 500).tip()), 127)  # All the notification area will show.
 
     def test_stopping_takes_the_icon_away(self):
@@ -4690,3 +4690,85 @@ renderPrevious(sessions(25),true);const label=$('prevAll').textContent;$('prevAl
     def test_a_list_that_fits_on_one_page_asks_about_all_of_it(self):
         out = self.run_js("renderPrevious(sessions(7),true);$('prevAll').onclick().then(()=>console.log(JSON.stringify(asked)))")
         self.assertEqual(out, [["Resume all 7 sessions? They stay idle until you message them.", "Resume all"]])
+
+
+class AppNameTests(unittest.TestCase):
+    """The app is called Bullpen. Its files, repository and data folder keep their old names, which installed copies and the updater use."""
+
+    def test_the_name_is_the_same_everywhere_it_is_shown(self):
+        self.assertEqual((app.APP_NAME, app.TRAY_TITLE), ("Bullpen", "Bullpen"))
+        self.assertIn("<title>Bullpen</title>", app.PAGE)
+        self.assertIn("<h1>Bullpen</h1>", app.PAGE)
+        self.assertIn("+'Bullpen'", app.PAGE)  # The title the page gives itself while sessions need attention.
+
+    def test_the_old_name_is_not_shown_to_anyone(self):
+        self.assertNotIn("Claude Sessions", app.PAGE)
+        with open(SOURCE, encoding="utf-8") as handle:
+            source = handle.read()
+        left = [line.strip() for line in source.split("\n") if "Claude Sessions" in line]
+        self.assertEqual(len(left), 2, left)  # The name it had, and the folder old versions installed into.
+        self.assertTrue(any("OLD_APP_NAME" in line for line in left) and any("WINDOWS_INSTALL_DIR" in line for line in left))
+
+    def test_what_updating_depends_on_is_unchanged(self):
+        self.assertEqual(app.GITHUB_REPO, "MatthewGriffin/claude-sessions")
+        self.assertEqual(app.RELEASE_ASSET, "claude-sessions-windows.exe" if WINDOWS else "claude-monitor")
+        self.assertEqual(app.versioned_asset("1.2.3"), "claude-sessions-windows-1.2.3.exe" if WINDOWS else "claude-monitor-1.2.3")
+        self.assertEqual(app.folder_asset("1.2.3"), "claude-sessions-windows-1.2.3.zip")
+        self.assertTrue(app.WINDOWS_BUILD_NAME.match("claude-sessions-windows-1.2.3.exe"))
+        self.assertTrue(app.CONFIG_DIR.endswith(".claude") or os.environ.get("CLAUDE_CONFIG_DIR"))
+
+    def test_the_version_is_still_the_last_word_it_prints(self):
+        shown = subprocess.run([sys.executable, SOURCE, "--version"], capture_output=True, text=True, timeout=60).stdout.strip()
+        self.assertEqual(shown, f"bullpen {app.APP_VERSION}")
+        self.assertEqual(shown.split()[-1], app.APP_VERSION)
+
+
+@unittest.skipUnless(WINDOWS, "windows are found by their title on Windows")
+class AppWindowTitleTests(unittest.TestCase):
+    def test_the_title_the_page_gives_itself_is_recognised(self):
+        for title in ("Bullpen", "(2 need you) Bullpen", "(1 busy) Bullpen", "(10 need you) Bullpen"):
+            self.assertTrue(app.APP_WINDOW_TITLE.fullmatch(title), title)
+        for title in ("Bullpen tray", "Bullpen notes - Notepad", "Claude Sessions", "My Bullpen", ""):
+            self.assertFalse(app.APP_WINDOW_TITLE.fullmatch(title), title)
+
+
+@unittest.skipUnless(WINDOWS, "the Start menu is Windows")
+class StartMenuShortcutTests(unittest.TestCase):
+    """The Start menu's entry has the new name, and the one under the old name goes."""
+
+    def setUp(self):
+        self.menu = tempfile.mkdtemp(prefix="start-menu-")
+        self.addCleanup(shutil.rmtree, self.menu, True)
+        patches = [mock.patch.dict(os.environ, {"CS_PROGRAMS": self.menu}), mock.patch.object(app, "PROGRAM_PATH", sys.executable)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def shortcut(self, name):
+        script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:PATH_LNK);"
+                  "Write-Output ($s.TargetPath + '|' + $s.Arguments + '|' + $s.Description)")
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], capture_output=True, text=True, timeout=60,
+                                env={**os.environ, "PATH_LNK": os.path.join(self.menu, name + ".lnk")})
+        return result.stdout.strip()
+
+    def test_it_is_made_under_the_new_name_and_points_at_this_copy(self):
+        app.start_menu_shortcut()
+        self.assertTrue(os.path.exists(os.path.join(self.menu, "Bullpen.lnk")))
+        target, arguments, description = self.shortcut("Bullpen").split("|")
+        self.assertEqual((os.path.normcase(target), arguments), (os.path.normcase(sys.executable), "--app"))
+        self.assertIn("GitHub Copilot CLI", description)
+
+    def test_the_one_with_the_old_name_is_taken_away(self):
+        script = "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:PATH_LNK);$s.TargetPath=$env:T;$s.Save()"
+        subprocess.run(["powershell.exe", "-NoProfile", "-Command", script], timeout=60,
+                       env={**os.environ, "PATH_LNK": os.path.join(self.menu, "Claude Sessions.lnk"), "T": sys.executable})
+        self.assertTrue(os.path.exists(os.path.join(self.menu, "Claude Sessions.lnk")))
+        app.start_menu_shortcut()
+        self.assertFalse(os.path.exists(os.path.join(self.menu, "Claude Sessions.lnk")))
+        self.assertTrue(os.path.exists(os.path.join(self.menu, "Bullpen.lnk")))
+
+    def test_other_shortcuts_are_left_alone(self):
+        other = os.path.join(self.menu, "Something Else.lnk")
+        open(other, "w").close()
+        app.start_menu_shortcut()
+        self.assertTrue(os.path.exists(other))

@@ -1,9 +1,13 @@
-# Claude Sessions
+# Bullpen
 
-A window that shows every Claude Code session running on your computer. You can watch them, reply to
-them, answer their questions and permission prompts, queue messages for when they're free, and start
-new ones. It also shows each session's changed files, subagents, usage, and any Android emulator or
-browser a session is testing with.
+A window that shows every AI coding session running on your computer, from Claude Code and from GitHub
+Copilot CLI, side by side. You can watch them, reply to them, answer their questions and permission
+prompts, queue messages for when they're free, and start new ones. It also shows each session's changed
+files, subagents, usage, and any Android emulator or browser a session is testing with.
+
+It was called Claude Sessions until it learned to watch Copilot too. Its program files, release downloads and
+repository keep the old names (`claude-monitor`, `claude-sessions-windows-<version>`) for now, so that copies
+already installed can keep updating themselves.
 
 It's one Python file (`claude-monitor`) that serves its page on `127.0.0.1` and opens it in a
 Chromium-family browser's app window.
@@ -21,7 +25,7 @@ claude-monitor --setup
 ```
 
 `--setup` adds the app's hooks to `~/.claude/settings.json` (backing it up first), adds a status line if
-you don't have one, and puts **Claude Sessions** in your applications menu.
+you don't have one, and puts **Bullpen** in your applications menu.
 
 Sessions can see the previews shown beside their chat (an emulator, a browser, a 3D printer camera):
 `claude-monitor --preview` saves a current picture of each and prints where, and a hook tells Claude
@@ -32,7 +36,7 @@ about it the first time a preview is linked to its session.
 Needs Claude Code's native install (`claude.exe`) and Microsoft Edge, Chrome or Brave.
 
 Download `claude-sessions-windows-<version>.exe` from the [latest release](https://github.com/MatthewGriffin/claude-sessions/releases/latest)
-and open it. It runs from where it is, adds **Claude Sessions** to the Start menu, sets up Claude Code's
+and open it. It runs from where it is, adds **Bullpen** to the Start menu, sets up Claude Code's
 hooks and opens. A few seconds later it moves to the faster one-folder build of the same version
 (`claude-sessions-windows-<version>.zip` in the release), which starts in about 0.2 s instead of a
 second or more. That matters because Claude Code starts the program for every hook and status line.
