@@ -50,6 +50,25 @@ the app and resumes the session by id in a console window. Desktop notifications
 `claude-monitor --adopt`, which waits for the turn to end, closes the terminal copy and resumes the
 same session inside the app.
 
+## GitHub Copilot CLI sessions
+
+Running `copilot` sessions are listed beside Claude's, each marked with a **Claude** or **Copilot** badge
+(and a coloured edge on its card) so you can tell them apart at a glance, in the list and in the session
+view. They are read from the files Copilot keeps in `~/.copilot` (or `$COPILOT_HOME`), so nothing needs
+installing: you see what each one is doing, when it is waiting for a permission or a question, its model and
+context, the conversation and the files it changed.
+
+Copilot's log format and screen are internal, so fields may go blank after an update.
+
+Sessions you start from the app (**New session**, then choose **GitHub Copilot CLI**: ask first, allow
+everything, or autopilot) can be driven from it like Claude's: reply, queue messages, approve or deny a
+permission, answer its questions, interrupt, switch on **Allow all** or **Autopilot**, and end it. The
+first message is checked against Copilot's own log and typed again if it didn't arrive. `/ask` works as
+`/btw` does for Claude: it's answered while the session carries on, the whole answer is read from the panel
+(the terminal is made big for a moment, so a long one isn't cut off) and kept under Commands, and the panel
+is closed again. Nothing is typed into the session while its panel is open; messages wait instead. Copilot sessions
+you started in your own terminal are shown read-only; reply to those there. `copilot` must be on your PATH.
+
 ## 3D printer cameras
 
 An Anycubic printer's built-in camera (tested on a Kobra X) can show beside sessions doing 3D printing

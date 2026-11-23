@@ -1,0 +1,40 @@
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ /ask list 40 different fruits, one per line, numbered, no other text                                                 │
+│                                                                                                                      │
+│  7. Cantaloupe                                                                                                     ┃ │
+│  8. Cherry                                                                                                         ┃ │
+│  9. Clementine                                                                                                     ┃ │
+│  10. Coconut                                                                                                       ┃ │
+│  11. Cranberry                                                                                                     ┃ │
+│  12. Dragon fruit                                                                                                  ┃ │
+│  13. Durian                                                                                                        ┃ │
+│  14. Elderberry                                                                                                    ┃ │
+│  15. Fig                                                                                                           ┃ │
+│  16. Gooseberry                                                                                                    ┃ │
+│  17. Grapefruit                                                                                                    ┃ │
+│  18. Grapes                                                                                                        ┃ │
+│  19. Guava                                                                                                         ┃ │
+│  20. Honeydew melon                                                                                                ┃ │
+│  21. Kiwi                                                                                                          ┃ │
+│  22. Lemon                                                                                                         ┃ │
+│  23. Lime                                                                                                          ┃ │
+│  24. Lychee                                                                                                        ┃ │
+│  25. Mango                                                                                                         ┃ │
+│  26. Nectarine                                                                                                     ┃ │
+│  27. Orange                                                                                                        ┃ │
+│  28. Papaya                                                                                                        ┃ │
+│  29. Passion fruit                                                                                                 ┃ │
+│  30. Peach                                                                                                         ┃ │
+│  31. Pear                                                                                                          ┃ │
+│  32. Persimmon                                                                                                     ┃ │
+│  33. Pineapple                                                                                                     ┃ │
+│  34. Plum                                                                                                          ┃ │
+│  35. Pomegranate                                                                                                   ┃ │
+│  36. Rambutan                                                                                                      ┃ │
+│  37. Raspberry                                                                                                     ┃ │
+│  38. Strawberry                                                                                                    ┃ │
+│  39. Tangerine                                                                                                     ┃ │
+│  40. Watermelon                                                                                                    ┃ │
+│                                                                                                                      │
+│ esc to dismiss · ctrl+e to collapse · ctrl+y to copy answer                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
