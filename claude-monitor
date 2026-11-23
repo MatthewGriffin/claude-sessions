@@ -7223,6 +7223,7 @@ def restart_server():
             # this one's port, and the session host and app window carry on as they are.
             subprocess.Popen(own_command(*arguments, "--wait-for-port"), close_fds=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stop_tray()
             os._exit(0)
         command = own_command(*arguments)
         os.execv(command[0], command)
@@ -7497,6 +7498,7 @@ def hand_over():
     """Leave, for the copy that waits for this port. Not while a message is being typed."""
     stop_share()
     with queue_locked():
+        stop_tray()
         os._exit(0)
 
 
@@ -11032,6 +11034,246 @@ def open_app_window(browser, url):
     return start_app_window(browser, url).wait()
 
 
+TRAY_TITLE = "Claude Sessions"
+TRAY_CALLBACK = 0x8001  # WM_APP + 1: what the notification area sends for a click on the icon.
+WINDOW_RECENT_SECONDS = 30  # A page that asked for the session list this recently is an open window.
+active_tray = None  # The notification-area icon of this copy, so a restart can take it away first.
+
+if WINDOWS:
+    class _NotifyIconData(ctypes.Structure):  # NOTIFYICONDATAW
+        _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND), ("uID", wintypes.UINT), ("uFlags", wintypes.UINT),
+                    ("uCallbackMessage", wintypes.UINT), ("hIcon", wintypes.HICON), ("szTip", wintypes.WCHAR * 128),
+                    ("dwState", wintypes.DWORD), ("dwStateMask", wintypes.DWORD), ("szInfo", wintypes.WCHAR * 256),
+                    ("uVersion", wintypes.UINT), ("szInfoTitle", wintypes.WCHAR * 64), ("dwInfoFlags", wintypes.DWORD),
+                    ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wintypes.HICON)]
+
+    class _WindowClass(ctypes.Structure):  # WNDCLASSW
+        _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", ctypes.c_void_p), ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON), ("hCursor", wintypes.HANDLE),
+                    ("hbrBackground", wintypes.HBRUSH), ("lpszMenuName", wintypes.LPCWSTR), ("lpszClassName", wintypes.LPCWSTR)]
+
+    _WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    _WM_NULL, _WM_DESTROY, _WM_CLOSE, _WM_COMMAND, _WM_TIMER = 0x0000, 0x0002, 0x0010, 0x0111, 0x0113
+    _WM_CONTEXTMENU, _WM_LBUTTONUP, _WM_LBUTTONDBLCLK, _WM_RBUTTONUP = 0x007B, 0x0202, 0x0203, 0x0205
+
+    _bindings = {}
+
+    def _user32():
+        if "user32" in _bindings:
+            return _bindings["user32"]
+        user32 = _bindings["user32"] = ctypes.WinDLL("user32", use_last_error=True)
+        user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(_WindowClass)]
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.TranslateMessage.argtypes = user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.PostMessageW.argtypes = user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.DestroyWindow.argtypes = user32.SetForegroundWindow.argtypes = user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
+        user32.CreatePopupMenu.restype = wintypes.HMENU
+        user32.DestroyMenu.argtypes = [wintypes.HMENU]
+        user32.SetMenuDefaultItem.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.UINT]
+        user32.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.LPVOID]
+        user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, wintypes.LPVOID]
+        user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+        return user32
+
+    def app_windows():
+        """Handles of the app's open windows: visible top-level windows with the page's title."""
+        user32, found = _user32(), []
+
+        def each(handle, _):
+            if user32.IsWindowVisible(handle):
+                text = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(handle, text, 256)
+                if text.value == TRAY_TITLE:
+                    found.append(handle)
+            return True
+
+        user32.EnumWindows(ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(each), 0)
+        return found
+
+    def focus_app_window():
+        """Bring the app's open window to the front, restoring it if it was minimised. False if there isn't one."""
+        user32 = _user32()
+        for handle in app_windows():
+            user32.ShowWindow(handle, 9)  # SW_RESTORE
+            user32.SetForegroundWindow(handle)
+            return True
+        return False
+
+    def close_app_windows():
+        user32 = _user32()
+        for handle in app_windows():
+            user32.PostMessageW(handle, _WM_CLOSE, 0, 0)
+
+    class Tray:
+        """An icon in the notification area: click it to open the window, right-click for Open and Quit.
+
+        The Win32 calls are made directly, so it needs nothing installed. Its tooltip says how many sessions
+        are live and how many need you, and it is kept up to date while the window is closed."""
+
+        OPEN, UPDATE, QUIT = 1, 2, 3
+
+        def __init__(self, status, offer, on_open, on_quit):
+            self.status, self.offer, self.on_open, self.on_quit = status, offer, on_open, on_quit
+            self.hwnd, self.added, self.ready = None, False, threading.Event()
+            self.thread = None
+            self._proc_ref = _WNDPROC(self._proc)  # Kept, or the callback is collected and the next message crashes.
+
+        def start(self):
+            """Show the icon. True once it is showing; False if there is no notification area to put it in."""
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+            self.ready.wait(10)
+            if not self.added:
+                self.stop()
+            return self.added
+
+        def stop(self):
+            user32 = _user32()
+            if self.hwnd and user32.IsWindow(self.hwnd):
+                user32.PostMessageW(self.hwnd, _WM_CLOSE, 0, 0)
+            if self.thread and self.thread is not threading.current_thread():
+                self.thread.join(3)
+
+        def command(self, command):
+            """What choosing a menu item does. Also how a test presses one."""
+            return _user32().SendMessageW(self.hwnd, _WM_COMMAND, command, 0)
+
+        def tip(self):
+            text = f"{TRAY_TITLE}\n{self.status()}".strip()
+            return text[:127]
+
+        def _data(self, flags):
+            data = _NotifyIconData()
+            data.cbSize, data.hWnd, data.uID, data.uFlags = ctypes.sizeof(_NotifyIconData), self.hwnd, 1, flags
+            data.uCallbackMessage, data.hIcon, data.szTip = TRAY_CALLBACK, self.icon, self.tip()
+            return data
+
+        def _notify(self, action):
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(_NotifyIconData)]
+            shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+            return bool(shell32.Shell_NotifyIconW(action, ctypes.byref(self._data(0x7))))  # NIF_MESSAGE | NIF_ICON | NIF_TIP
+
+        def _icon(self):
+            user32, shell32 = _user32(), ctypes.WinDLL("shell32", use_last_error=True)
+            small = ctypes.windll.user32.GetSystemMetrics(49), ctypes.windll.user32.GetSystemMetrics(50)  # SM_CXSMICON, SM_CYSMICON
+            beside = os.path.join(os.path.dirname(os.path.abspath(PROGRAM_PATH)), "assets", "claude-sessions.ico")
+            if os.path.exists(beside):  # A copy run from a checkout.
+                handle = user32.LoadImageW(None, beside, 1, small[0], small[1], 0x10)  # IMAGE_ICON, LR_LOADFROMFILE
+                if handle:
+                    return handle
+            icon = wintypes.HICON()
+            shell32.ExtractIconExW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(wintypes.HICON), wintypes.UINT]
+            if shell32.ExtractIconExW(PROGRAM_PATH, 0, None, ctypes.byref(icon), 1) and icon:  # The built program's own.
+                return icon
+            return user32.LoadImageW(None, ctypes.cast(32512, wintypes.LPCWSTR), 1, 0, 0, 0x8040)  # The default application icon.
+
+        def _run(self):
+            user32, kernel32 = _user32(), ctypes.WinDLL("kernel32", use_last_error=True)
+            try:
+                kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+                instance = kernel32.GetModuleHandleW(None)
+                window_class = _WindowClass()
+                window_class.lpfnWndProc = ctypes.cast(self._proc_ref, ctypes.c_void_p)
+                self.class_name = f"ClaudeSessionsTray{id(self)}"  # Its own, so a second icon in this process never gets the first one's callback.
+                window_class.hInstance, window_class.lpszClassName = instance, self.class_name
+                user32.RegisterClassW(ctypes.byref(window_class))
+                self.taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")  # Sent when Explorer restarts, and the icon is gone.
+                self.hwnd = user32.CreateWindowExW(0, self.class_name, TRAY_TITLE + " tray", 0, 0, 0, 0, 0, None, None, instance, None)
+                self.icon = self._icon()
+                self.added = bool(self.hwnd) and self._notify(0)  # NIM_ADD
+                user32.SetTimer(self.hwnd, 1, 5000, None)
+            except Exception:
+                self.added = False
+            finally:
+                self.ready.set()
+            if not self.hwnd:
+                return
+            message = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+
+        def _proc(self, hwnd, message, wparam, lparam):
+            user32 = _user32()
+            try:
+                if message == TRAY_CALLBACK:
+                    if lparam in (_WM_LBUTTONUP, _WM_LBUTTONDBLCLK):
+                        self._act(self.OPEN)
+                    elif lparam in (_WM_RBUTTONUP, _WM_CONTEXTMENU):
+                        self._menu(hwnd)
+                    return 0
+                if message == _WM_COMMAND:
+                    self._act(wparam & 0xFFFF)
+                    return 0
+                if message == _WM_TIMER:
+                    self._notify(1)  # NIM_MODIFY: the tooltip's figures.
+                    return 0
+                if message == getattr(self, "taskbar_created", -1):
+                    self._notify(0)
+                    return 0
+                if message == _WM_DESTROY:
+                    self._notify(2)  # NIM_DELETE
+                    user32.PostQuitMessage(0)
+                    return 0
+            except Exception:
+                return 0  # A failure here mustn't take the message loop, and with it the icon, down.
+            return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+        def _act(self, command):
+            """Opening a window starts a program and quitting ends this one, so neither is done on the message loop's thread."""
+            if command in (self.OPEN, self.UPDATE):
+                threading.Thread(target=self.on_open, daemon=True).start()
+            elif command == self.QUIT:
+                threading.Thread(target=self.on_quit, daemon=True).start()
+
+        def _menu(self, hwnd):
+            user32 = _user32()
+            menu = user32.CreatePopupMenu()
+            user32.AppendMenuW(menu, 0, self.OPEN, f"Open {TRAY_TITLE}")
+            offered = self.offer()
+            if offered:
+                user32.AppendMenuW(menu, 0, self.UPDATE, f"Update to {offered['version']}: open to install")
+            user32.AppendMenuW(menu, 0x800, 0, None)  # A separator.
+            user32.AppendMenuW(menu, 0, self.QUIT, "Quit")
+            user32.SetMenuDefaultItem(menu, 0, 1)
+            point = wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+            user32.SetForegroundWindow(hwnd)  # Or the menu stays open when the user clicks elsewhere.
+            chosen = user32.TrackPopupMenu(menu, 0x0100 | 0x0002, point.x, point.y, 0, hwnd, None)  # TPM_RETURNCMD | TPM_RIGHTBUTTON
+            user32.PostMessageW(hwnd, _WM_NULL, 0, 0)
+            user32.DestroyMenu(menu)
+            if chosen:
+                self._act(chosen)
+else:
+    Tray = None
+
+    def focus_app_window():
+        return False
+
+    def close_app_windows():
+        pass
+
+
+def stop_tray():
+    """Take the icon away, before this process hands over to a new one or ends. Otherwise it stays until the mouse passes over it."""
+    if active_tray:
+        active_tray.stop()
+
+
 def wait_for_window():
     """Block until the app window closes. After a restart it's still this process's child, by id."""
     if WINDOWS:
@@ -11126,7 +11368,7 @@ serving_port = None  # The port this copy's server got, which a restart keeps.
 
 
 def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=None, fixed_port=True):
-    global attached_browser_pid, serving_port
+    global attached_browser_pid, serving_port, active_tray
     token = access_token()
     # Process arguments are visible to other users, so the app window gets a single-use code.
     app_codes = {secrets.token_urlsafe(32)} if app_browser_command else set()
@@ -11381,6 +11623,37 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
     if app_browser_command:
         threading.Thread(target=server.serve_forever, daemon=True).start()
         attached_browser_pid = browser_pid or start_app_window(app_browser_command, app_url).pid
+        quit_chosen = threading.Event()
+
+        def open_window():
+            """From the icon: the open window to the front, else a new one."""
+            if time.monotonic() - page_seen["at"] < WINDOW_RECENT_SECONDS and focus_app_window():
+                return
+            while len(app_codes) >= 5:
+                app_codes.pop()
+            code = secrets.token_urlsafe(32)  # Its cookie went with the last window, so it gets a single-use code.
+            app_codes.add(code)
+            start_app_window(app_browser_command, f"http://127.0.0.1:{port}/?t={code}")
+
+        def tray_status():
+            sessions = (monitor.cached or {}).get("sessions", [])
+            waiting = sum(1 for s in sessions if s.get("status") == "waiting")
+            return f"{len(sessions)} live" + (f" · {waiting} need you" if waiting else "")
+
+        active_tray = None
+        if WINDOWS and Tray and os.environ.get("CLAUDE_SESSIONS_NO_TRAY") != "1":
+            active_tray = Tray(tray_status, releases.offer, open_window, quit_chosen.set)
+            if not active_tray.start():
+                active_tray = None  # No notification area to put it in: the window is the app, as before.
+        if active_tray:
+            # With an icon to open it again and to quit from, closing the window doesn't end the app. It carries on in the
+            # background, delivering queued messages, until Quit is chosen.
+            quit_chosen.wait()
+            close_app_windows()
+            stop_tray()
+            server.shutdown()
+            server.server_close()
+            return 0
         code = wait_for_window()
         wait_while_page_open()
         server.shutdown()
