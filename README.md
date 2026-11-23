@@ -46,6 +46,12 @@ Windows has no tmux, so sessions started from the app run in a small background 
 It exits on its own once it has no sessions left. On Windows, **Open in terminal** ends the copy in
 the app and resumes the session by id in a console window. Desktop notifications aren't built yet.
 
+**Notification area icon:** on Windows the app keeps an icon beside the clock. Click it to open the window (or
+bring the open one forward); right-click for **Open** and **Quit**. Its tooltip says how many sessions are live
+and how many need you. Closing the window doesn't end the app: it carries on in the background, delivering
+queued messages, until you choose **Quit**. That is also the way to be sure an update has taken effect: Quit,
+then open it again. If there is no notification area, the window is the app, as before.
+
 **Terminal to app:** `--setup` adds a `/to-app` skill. Typed in a terminal session, it runs
 `claude-monitor --adopt`, which waits for the turn to end, closes the terminal copy and resumes the
 same session inside the app.

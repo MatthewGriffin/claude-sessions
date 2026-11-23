@@ -7,6 +7,7 @@ On Windows, CLAUDE_SESSIONS_TEST_PROGRAM can name a built claude-sessions-window
 session host is then the one tested.
 """
 import contextlib
+import ctypes
 import hashlib
 import http.client
 import http.server
@@ -4388,3 +4389,202 @@ class CopilotFailureTests(unittest.TestCase):
         failure = {"message": "x", "kind": "quota_exceeded", "at": 5.0, "resets": None}
         app.hosted_session = lambda monitor, request: {"id": "c1", "tmux": "t", "provider": "copilot", "failure": failure}
         self.assertEqual(app.retry_failed(None, {"id": "c1", "action": "reset"})[0], False)
+
+
+FAKE_BROWSER = os.path.join(tempfile.mkdtemp(prefix="fake-browser-"), "fake_browser.py")
+with open(FAKE_BROWSER, "w", encoding="utf-8") as _handle:
+    # Stands in for Edge: records how it was asked to open the app, then exits at once, as a window that is closed does.
+    _handle.write("import sys, os\nopen(os.environ['FAKE_BROWSER_LOG'], 'a').write([a for a in sys.argv if a.startswith('--app=')][0] + '\\n')\n")
+
+
+@unittest.skipUnless(WINDOWS, "the notification-area icon is Windows only")
+class TrayTests(unittest.TestCase):
+    """The icon in the notification area: open from it, quit from it, and it stays while the window is closed."""
+
+    def tray(self, **handlers):
+        self.calls = []
+        tray = app.Tray(handlers.get("status", lambda: "2 live · 1 need you"), handlers.get("offer", lambda: None),
+                        lambda: self.calls.append("open"), lambda: self.calls.append("quit"))
+        self.addCleanup(tray.stop)
+        if not tray.start():
+            self.skipTest("this session has no notification area to put an icon in")
+        return tray
+
+    def test_choosing_from_its_menu_reaches_the_app(self):
+        tray = self.tray()
+        tray.command(tray.OPEN)
+        tray.command(tray.UPDATE)
+        tray.command(tray.QUIT)
+        wait_for(lambda: len(self.calls) == 3)
+        self.assertEqual(sorted(self.calls), ["open", "open", "quit"])
+
+    def test_the_tooltip_says_how_many_sessions_need_you(self):
+        self.assertEqual(self.tray().tip(), "Claude Sessions\n2 live · 1 need you")
+        self.assertLessEqual(len(self.tray(status=lambda: "x" * 500).tip()), 127)  # All the notification area will show.
+
+    def test_stopping_takes_the_icon_away(self):
+        tray = self.tray()
+        user32 = ctypes.windll.user32
+        self.assertTrue(user32.IsWindow(tray.hwnd))
+        tray.stop()
+        self.assertFalse(user32.IsWindow(tray.hwnd))
+        self.assertFalse(tray.thread.is_alive())
+        tray.stop()  # Again is harmless.
+
+    def test_two_icons_in_one_process_each_answer_for_themselves(self):
+        first, second_calls = self.tray(), []
+        first_calls, self.calls = self.calls, []
+        second = app.Tray(lambda: "", lambda: None, lambda: second_calls.append("open"), lambda: None)
+        self.addCleanup(second.stop)
+        if not second.start():
+            self.skipTest("no second icon")
+        second.command(second.OPEN)
+        wait_for(lambda: second_calls)
+        self.assertEqual((second_calls, first_calls), (["open"], []))
+
+    def test_an_update_on_offer_is_in_its_menu_text(self):
+        tray = self.tray(offer=lambda: {"version": "9.9.9"})
+        self.assertEqual(tray.offer()["version"], "9.9.9")  # The menu itself is shown by the system, and can't be read here.
+
+
+@unittest.skipUnless(WINDOWS, "windows are found by their title on Windows")
+class AppWindowTests(unittest.TestCase):
+    """Finding the app's open window, so the icon brings it forward instead of opening a second."""
+
+    def make_window(self, title):
+        """A visible window with the default behaviour, on a thread with a message loop, as a browser's is: it closes when it is asked to."""
+        from ctypes import wintypes
+        user32, made = app._user32(), {}
+
+        def run():
+            window_class = app._WindowClass()
+            window_class.lpfnWndProc = ctypes.cast(user32.DefWindowProcW, ctypes.c_void_p)
+            window_class.lpszClassName = "ClaudeSessionsTestWindow"
+            user32.RegisterClassW(ctypes.byref(window_class))  # Already registered by an earlier test is fine.
+            made["handle"] = user32.CreateWindowExW(0, "ClaudeSessionsTestWindow", title, 0x10CF0000, 0, 0, 200, 100, None, None, None, None)
+            made["thread"] = ctypes.windll.kernel32.GetCurrentThreadId()
+            made["ready"].set()
+            message = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(message))
+                user32.DispatchMessageW(ctypes.byref(message))
+
+        made["ready"] = threading.Event()
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        made["ready"].wait(5)
+        self.assertTrue(made["handle"])
+        self.addCleanup(lambda: ctypes.windll.user32.PostThreadMessageW(made["thread"], 0x0012, 0, 0))  # WM_QUIT
+        self.addCleanup(lambda: user32.IsWindow(made["handle"]) and user32.PostMessageW(made["handle"], 0x0010, 0, 0))
+        return made["handle"]
+
+    def test_the_window_is_found_by_the_pages_title(self):
+        handle = self.make_window(app.TRAY_TITLE)
+        self.make_window("Some other program")
+        self.assertIn(handle, app.app_windows())
+        self.assertEqual(len([h for h in app.app_windows() if h == handle]), 1)
+
+    def test_it_is_brought_forward_and_otherwise_there_is_none_to_bring(self):
+        self.assertFalse(any(self.make_window("Not it") == h for h in app.app_windows()))
+        self.make_window(app.TRAY_TITLE)
+        self.assertTrue(app.focus_app_window())
+
+    def test_quitting_closes_it(self):
+        handle = self.make_window(app.TRAY_TITLE)
+        app.close_app_windows()
+        self.assertTrue(wait_for(lambda: not app._user32().IsWindow(handle)))
+
+
+class TrayWithoutWindowsTests(unittest.TestCase):
+    @unittest.skipIf(WINDOWS, "this is for the other systems")
+    def test_there_is_no_icon_elsewhere_and_nothing_breaks(self):
+        self.assertIsNone(app.Tray)
+        self.assertFalse(app.focus_app_window())
+        self.assertIsNone(app.close_app_windows())
+
+    def test_taking_away_an_icon_that_was_never_made_is_harmless(self):
+        saved = app.active_tray
+        self.addCleanup(lambda: setattr(app, "active_tray", saved))
+        app.active_tray = None
+        app.stop_tray()
+
+
+class HandOverTests(unittest.TestCase):
+    """Handing over to a new copy of the app takes the old copy's icon away first."""
+
+    def setUp(self):
+        self.saved = {n: getattr(app, n) for n in ("stop_tray", "stop_share", "restart_arguments")}
+        self.saved_popen, self.saved_exit = app.subprocess.Popen, app.os._exit
+        self.events = []
+        app.stop_tray = lambda: self.events.append("tray")
+        app.stop_share = lambda host=None: None
+        app.subprocess.Popen = lambda *a, **k: self.events.append("started the new copy")
+
+        def leave(code):
+            self.events.append("left")
+            raise SystemExit(code)
+
+        app.os._exit = leave
+        self.addCleanup(lambda: ([setattr(app, n, v) for n, v in self.saved.items()], setattr(app.subprocess, "Popen", self.saved_popen), setattr(app.os, "_exit", self.saved_exit)))
+
+    def test_handing_over_removes_the_icon_before_leaving(self):
+        with self.assertRaises(SystemExit):
+            app.hand_over()
+        self.assertEqual(self.events, ["tray", "left"])
+
+    @unittest.skipUnless(WINDOWS, "Windows starts the new copy and leaves")
+    def test_a_restart_starts_the_new_copy_then_removes_the_icon_and_leaves(self):
+        with self.assertRaises(SystemExit):
+            app.restart_server()
+        self.assertEqual(self.events, ["started the new copy", "tray", "left"])
+
+
+@unittest.skipUnless(WINDOWS, "the icon decides how long the app lives, on Windows")
+class AppLifetimeTests(unittest.TestCase):
+    """With an icon to open it again and quit from, closing the window doesn't end the app."""
+
+    def run_app(self, no_tray=False):
+        self.PORT = 18800 + secrets.randbelow(1000)  # Each run its own, as a stopped server's port is held back for a while.
+        self.log = os.path.join(tempfile.mkdtemp(prefix="tray-log-"), "opened.txt")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.log), True)
+        patches = [mock.patch.dict(os.environ, {"FAKE_BROWSER_LOG": self.log, **({"CLAUDE_SESSIONS_NO_TRAY": "1"} if no_tray else {})}),
+                   mock.patch.object(app, "app_browser", lambda: ([sys.executable, FAKE_BROWSER], tempfile.mkdtemp())),
+                   # The app's background workers run for as long as the process does, which a test must not leave behind.
+                   mock.patch.object(app, "run_queue_delivery", lambda monitor: None), mock.patch.object(app, "installed_commands", lambda: None),
+                   mock.patch.object(app, "run_skill_trimming", lambda: None), mock.patch.object(app.releases, "watch", lambda: None)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.result = {}
+        self.runner = threading.Thread(target=lambda: self.result.update(code=app.run_app(app.Monitor(), self.PORT, fixed_port=True)), daemon=True)
+        self.runner.start()
+
+    def opened(self):
+        return open(self.log, encoding="utf-8").read().splitlines() if os.path.exists(self.log) else []
+
+    def test_the_app_outlives_its_window_until_quit_is_chosen(self):
+        self.run_app()
+        if not wait_for(lambda: app.active_tray and app.active_tray.added, 20):
+            self.skipTest("this session has no notification area to put an icon in")
+        tray = app.active_tray
+        self.addCleanup(tray.stop)
+        self.assertTrue(wait_for(lambda: len(self.opened()) == 1))  # The window it started with, which then closes.
+        time.sleep(3)
+        self.assertTrue(self.runner.is_alive(), "closing the window ended the app")
+        tray.command(tray.OPEN)  # From the icon: a window of its own, with its own single-use code.
+        self.assertTrue(wait_for(lambda: len(self.opened()) == 2))
+        self.assertNotEqual(*self.opened()[:2])
+        tray.command(tray.QUIT)
+        self.runner.join(20)
+        self.assertFalse(self.runner.is_alive(), "Quit didn't end the app")
+        self.assertEqual(self.result["code"], 0)
+        self.assertFalse(ctypes.windll.user32.IsWindow(tray.hwnd))
+        with self.assertRaises(OSError):
+            socket.create_connection(("127.0.0.1", self.PORT), timeout=2)
+
+    def test_without_an_icon_the_window_is_the_app_as_it_was(self):
+        with mock.patch.object(app, "wait_for_window", lambda: 0), mock.patch.object(app, "wait_while_page_open", lambda: None):
+            self.run_app(no_tray=True)
+            self.runner.join(20)
+        self.assertFalse(self.runner.is_alive(), "the app should end with its window when there is no icon")
+        self.assertIsNone(app.active_tray)
