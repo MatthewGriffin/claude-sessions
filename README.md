@@ -55,25 +55,30 @@ same session inside the app.
 Running `copilot` sessions are listed beside Claude's, each marked with a **Claude** or **Copilot** badge
 (and a coloured edge on its card) so you can tell them apart at a glance, in the list and in the session
 view. They are read from the files Copilot keeps in `~/.copilot` (or `$COPILOT_HOME`), so nothing needs
-installing: you see what each one is doing, when it is waiting for a permission or a question, its model and
-context, the conversation and the files it changed. `copilot` must be on your PATH to start or resume
-sessions from the app. Copilot's log format and screen are internal, so fields may go blank after an update.
+installing: you see what each one is doing, when it is waiting for a permission, a question or a plan review,
+its model, context and mode, the conversation, the files it changed, its subagents, and any command it left
+running in the background. `copilot` must be on your PATH to start or resume sessions from the app. Copilot's
+log format and screen are internal, so fields may go blank after an update.
 
-**Started from the app** (**New session**, then **GitHub Copilot CLI**: ask first, allow everything, or
-autopilot), a Copilot session can be driven like Claude's:
+**Usage** is shown in the session you have open, not in the bar at the top: a Claude session shows the
+account's 5-hour and 7-day limits, and a Copilot session shows what it has used itself (AI credits, requests,
+tokens and lines changed), since Copilot doesn't report account limits to other programs.
 
-- Reply, queue messages, interrupt, and end it. The first message is checked against Copilot's own log and
-  typed again if it didn't arrive.
-- Approve or deny a permission, answer its questions (including with text of your own), and switch on
-  **Allow all** or **Autopilot**. The reply box offers Copilot's own slash commands.
-- `/ask` works as `/btw` does for Claude: it's answered while the session carries on, the whole answer is
-  read from the panel (the terminal is made big for a moment, so a long one isn't cut off), kept under
-  Commands, and the panel is closed again.
-- The panels other commands open (`/model`, `/permissions`, `/session`, `/tasks`, `/rewind`, `/limits`, `/help`)
+**Started from the app** (**New session**, then **GitHub Copilot CLI**: ask first, plan first, allow everything,
+or autopilot, with a model of your choice), a Copilot session can be driven like Claude's:
+
+- Reply (with pictures, which Copilot attaches), queue messages, interrupt, **Send now**, rename, and end it.
+  The first message is checked against Copilot's own log and typed again if it didn't arrive.
+- Approve or deny a permission, review a plan, and answer its questions (including with text of your own).
+  Switch on **Allow all** or **Autopilot**.
+- The reply box offers Copilot's own commands and the skills it can run. `/ask` works as `/btw` does for Claude.
+  The panels other commands open (`/model`, `/permissions`, `/session`, `/tasks`, `/rewind`, `/limits`, `/help`)
   are shown live with a button for each key their hint line offers, and what one showed is kept under Commands
-  once it closes. Nothing is typed into the session while a panel is open; messages wait instead. What a
-  command such as `/context` or `/usage` prints into the chat isn't kept, because Copilot doesn't record it.
-- The **Context** tab shows how full its window is. Copilot reports the total, not what fills it.
+  once it closes. Nothing is typed into the session while a panel is open; messages wait instead.
+- **Fresh start** saves progress to the project's notes, clears the chat with `/clear`, and carries on from the
+  notes. The session keeps its name and its queue across the new id.
+- The **Context** tab shows how full its window is, and **Check now** types `/context` into the session to show
+  what fills it.
 
 **Earlier sessions** appear under Previous sessions and can be resumed (Copilot brings back the conversation,
 model and permissions). Forgetting one only hides it from the list.
@@ -81,6 +86,10 @@ model and permissions). Forgetting one only hides it from the list.
 **Started in your own terminal**, a session is shown read-only. If it was started by the Copilot CLI and is
 idle, **Move into app** ends the copy in its terminal and carries on with the same session in the app, as
 `/to-app` does for Claude Code. Sessions of the Copilot app or an editor are never ended from here.
+
+Not done for Copilot: the **started by** links between sessions (Claude's don't work on Windows either, and
+Copilot sets nothing for them to read), and the guard that stops a session launching an emulator without
+`-no-window`, which is a Claude Code hook.
 
 ## 3D printer cameras
 

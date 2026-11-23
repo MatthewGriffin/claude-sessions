@@ -1,0 +1,40 @@
+  Current   Sessions   Issues   Pull requests   Gists
+
+  ❯ Reply with exactly the word hi.                                                                            12:47   ┃
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀ ┃
+ ● Copilot Fusion selected GPT-6 Luna since the task has low complexity.                                               ┃
+                                                                                                                       ┃
+ ● hi                                                                                                                  ┃
+                                                                                                                       ┃
+ ● Context Usage                                                                                                       ┃
+                                                                                                                       ┃
+   ○ ○ ○ ◌ ◌ ◌ ◉ · · ·   Copilot Fusion · Standard → gpt-6-luna · 22k/272k tokens (8%)                                 ┃
+   · · · · · · · · · ·   ○ System Prompt          10.1k   (4%)                                                         ┃
+   · · · · · · · · · ·   ◌ System Tools           11.2k   (4%)                                                         ┃
+   · · · · · · · · · ·   ● MCP Tools                  0   (0%)                                                         ┃
+   · · · · · · · · · ·   ◉ Messages                 866  (<1%)                                                         ┃
+   · · · · · · · · · ·   · Free Space            236.3k  (87%)                                                         ┃
+   · · · · · · ◎ ◎ ◎ ◎   ◎ Buffer                 13.6k   (5%)                                                         ┃
+                                                                                                                       ┃
+   breakdown                     tokens  % of used context                                                             ┃
+   System prompt                  10.1k   ■■■■■■■■■■  46%                                                              ┃
+   Tool definitions               11.2k   ■■■■■■■■■■  51%                                                              ┃
+     session_store_sql             1.7k   ■■■■■■■■■■  7%                                                               ┃
+     task                          1.3k   ■■■■■■■■■■  6%                                                               ┃
+     ask_user                      1.3k   ■■■■■■■■■■  6%                                                               ┃
+     dynamic_workflows_manage       779   ■■■■■■■■■■  4%                                                               ┃
+     run_dynamic_workflow           770   ■■■■■■■■■■  3%                                                               ┃
+                                                                                                                       ┃
+   Heaviest messages                     tokens  % of used context                                                     ┃
+   user: <system_reminder> IMPORTANT: …     747   ■■■■■■■■■■  3%                                                       ┃
+   user: <system_reminder> <environmen…      62   ■■■■■■■■■■  <1%                                                      ┃
+   user: <current_datetime>2026-11-23T…      37   ■■■■■■■■■■  <1%                                                      ┃
+   asst: hi                                  20   ■■■■■■■■■■  <1%                                                      ┃
+                                                                                                                       ┃
+ ~\AppData\Local\Temp\claude\3053af3812d75a8b\45882fc8-e84f-4cd6-a2ed-33f379317eb9\app Session: 0.09 AIC used
+╻▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+┃
+╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+ ◎ Loading: 43 skills, 2 MCP servers — still waiting on extensions               Copilot Fusion · Standard → GPT-6 Luna
+app | Copilot Fusion · Standard → GPT-6 Luna | Session: 0h 00m | Ctx: 8% | Today: 1347 credits | Month: 3471 credits |
+Unlimited
