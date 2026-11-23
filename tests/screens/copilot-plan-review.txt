@@ -1,0 +1,40 @@
+Current   Sessions   Issues   Pull requests   Gists
+
+│  █ ▘▝ █  Check for mistakes.        │  /model — Switch models across providers, or use Copilot Fusion              │ ┃
+│   ▔▔▔▔   /experimental              │                                                                              │ ┃
+│                                                                                                                    │ ┃
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ ┃
+                                                                                                                       ┃
+ ● Copilot Fusion routing profile changed to Standard.                                                                 ┃
+                                                                                                                       ┃
+ ! Connected Connectors could not be loaded; existing local and self-hosted MCP servers remain available.              ┃
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄ ┃
+  ❯ Reply with exactly the word hi.                                                                            13:04   ┃
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀ ┃
+ / Search "**/*" No matches found                                                                                      ┃
+                                                                                                                       ┃
+ MD Read plan.md Path does not exist                                                                                   ┃
+                                                                                                                       ┃
+ ● Edit  Create ~\.copilot\session-state\00000000-0000-0000-0000-000000000000\plan.md (+14)                            ┃
+                                                                                                                       ┃
+ ● Todo added Returning exact hi response                                                                              ┃
+                                                                                                                       ┃
+ ○ Plan ready for review - Analyzed the empty working directory; no code... · summary: "- Analyzed the empty wo… 5m 1s ┃
+                                                                                                                       ┃
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Plan Ready for Review                                                                                                │
+│ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────── │
+│  - Analyzed the empty working directory; no code changes are needed.                                                 │
+│  - Saved the plan to the session plan file.                                                                          │
+│  - Tracked one todo: return exactly  hi .                                                                            │
+│                                                                                                                      │
+│ ❯ 1. Accept plan and continue in Autopilot execution mode (recommended)                                              │
+│   2. Accept plan and continue in Interactive execution mode (Manual Approval for this session; future defaults       │
+│   unchanged)                                                                                                         │
+│   3. Exit to Interactive execution mode without running the plan (Manual Approval for this session; future defaults  │
+│   unchanged)                                                                                                         │
+│   4. Suggest changes                                                                                                 │
+│                                                                                                                      │
+│ ↑/↓ to navigate · enter to select · ctrl+e to show full plan · esc to cancel                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+app | gpt-5.6-luna · medium | Session: 0h 00m | Ctx: 13% | Today: 1742 credits | Month: 3611 credits | Unlimited
