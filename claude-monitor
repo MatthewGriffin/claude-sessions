@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live terminal monitor for all running Claude Code sessions on this machine.
+"""Bullpen: a live monitor for every Claude Code and GitHub Copilot CLI session running on this machine.
 
 Session list and status come from `claude agents --json`. Model, context size,
 branch and current activity come from each session's transcript, whose format
@@ -229,6 +229,8 @@ URGENT_PING_MS = 30000
 PING_MS = 10000
 WEB_PORT = 8765
 APP_PORT = 8766
+APP_NAME = "Bullpen"
+OLD_APP_NAME = "Claude Sessions"  # What it was called, which an old Start menu shortcut or notification still says.
 APP_CLASS = "claude-sessions"
 TMUX_SOCKET = os.environ.get("CLAUDE_SESSIONS_TMUX_SOCKET") or "claude-sessions"
 PHONE_PORT = int(os.environ.get("CLAUDE_SESSIONS_PHONE_PORT") or 8768)  # Phone access, on the local network when turned on.
@@ -7549,7 +7551,7 @@ def desktop_notify(title, body, urgent, replaces=None):
     """Show a self-expiring notification, returning its id so it can be closed or replaced."""
     if WINDOWS:
         return None  # Not built yet on Windows. The app still shows what needs you.
-    command = ["notify-send", "--app-name=Claude Sessions", "--print-id",
+    command = ["notify-send", "--app-name=Bullpen", "--print-id",
                f"--expire-time={URGENT_PING_MS if urgent else PING_MS}"]
     if replaces:
         command.append(f"--replace-id={replaces}")
@@ -7621,7 +7623,7 @@ def session_previews(monitor, query):
     session = next((s for s in snapshot["sessions"] if s["id"] == session_id), None) \
         or next((s for s in snapshot["sessions"] if pid.isdigit() and s["pid"] == int(pid)), None)
     if not session:
-        return 404, {"error": "Claude Sessions doesn't know this session. It only sees sessions running on this computer."}
+        return 404, {"error": "Bullpen doesn't know this session. It only sees sessions running on this computer."}
     linked = [d for d in snapshot["devices"] if any(link["id"] == session["id"] for link in d["sessions"])]
     found = []
     for device in linked:
@@ -7657,7 +7659,7 @@ def session_previews(monitor, query):
 
 
 def ask_running_app(path, timeout):
-    """GET from this user's running Claude Sessions app, as (status, reply), or None if it isn't running."""
+    """GET from this user's running Bullpen app, as (status, reply), or None if it isn't running."""
     try:
         with open(os.path.join(MONITOR_DIR, "token")) as handle:
             token = handle.read().strip()
@@ -7708,16 +7710,16 @@ def run_preview():
     session_id, pid = this_session()
     answer = ask_running_app("/api/previews?" + urllib.parse.urlencode({"session": session_id, "pid": pid}), PREVIEW_WAIT_SECONDS * 3)
     if answer is None:
-        print("Claude Sessions isn't running, so there are no previews to see.")
+        print("Bullpen isn't running, so there are no previews to see.")
         return 1
     status, reply = answer
     if status != 200:
-        print(reply.get("error", "Claude Sessions couldn't find this session."))
+        print(reply.get("error", "Bullpen couldn't find this session."))
         return 1
     if not reply["devices"]:
-        print(f"No previews are attached to this session ({reply['session']}) in Claude Sessions right now.")
+        print(f"No previews are attached to this session ({reply['session']}) in Bullpen right now.")
         return 0
-    print(f"Previews beside this session ({reply['session']}) in Claude Sessions:")
+    print(f"Previews beside this session ({reply['session']}) in Bullpen:")
     for device in reply["devices"]:
         print(f"- {device['label']} ({device['serial']}, {device['kind']})")
         if device.get("print"):
@@ -7748,7 +7750,7 @@ def run_context_hook():
         with open(record, "w") as handle:
             json.dump(sorted(d["serial"] for d in devices), handle)
         names = ", ".join(f"{d['label']} ({d['kind']})" for d in devices)
-        context = (f"The Claude Sessions app shows live previews beside this chat: {names}. To see what they show "
+        context = (f"The Bullpen app shows live previews beside this chat: {names}. To see what they show "
                    f"right now, run `{own_command_line('--preview')}`. It saves a current picture of each and prints "
                    "the file paths (and a 3D printer's progress and temperatures); then open the pictures with the Read tool.")
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}}))
@@ -8305,7 +8307,7 @@ class Screen:
         self.window.erase()
         height, width = self.window.getmaxyx()
         monitor = self.monitor
-        self.put(0, 0, "Claude sessions", self.colors.get("head", 0) | curses.A_BOLD)
+        self.put(0, 0, "Bullpen", self.colors.get("head", 0) | curses.A_BOLD)
         if monitor.error:
             self.put(0, 17, monitor.error, self.colors.get("error", 0) | curses.A_BOLD)
         else:
@@ -8422,7 +8424,7 @@ footer{color:var(--dim);font-size:12px;margin-top:16px}
 <h1 id="name">3D printer</h1><p id="file"></p>
 <div id="view"><img id="cam" alt="Live view of the 3D printer"><div id="wait">Starting the camera&hellip; this takes a few seconds.</div></div>
 <div id="bar" hidden><div></div></div><div id="summary"></div>
-<footer>Live view, shared from Claude Sessions. It stops when sharing is turned off.</footer>
+<footer>Live view, shared from Bullpen. It stops when sharing is turned off.</footer>
 </main><script>
 ''' + PRINT_TEXT_JS + r'''
 const $=id=>document.getElementById(id);
@@ -8461,7 +8463,7 @@ nextFrame();status();
 PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Claude Sessions</title>
+<title>Bullpen</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' shape-rendering='crispEdges'%3E%3Crect width='16' height='16' rx='2' fill='%232c3148'/%3E%3Crect x='4' y='1' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='7' y='1' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='8' y='1' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='11' y='1' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='4' y='2' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='5' y='2' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='6' y='2' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='7' y='2' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='8' y='2' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='9' y='2' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='10' y='2' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='11' y='2' width='1' height='1' fill='%23f4d35e'/%3E%3Crect x='3' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='4' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='5' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='6' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='7' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='8' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='9' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='10' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='11' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='12' y='3' width='1' height='1' fill='%236b4226'/%3E%3Crect x='3' y='4' width='1' height='1' fill='%236b4226'/%3E%3Crect x='4' y='4' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='5' y='4' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='6' y='4' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='7' y='4' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='8' y='4' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='9' y='4' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='10' y='4' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='11' y='4' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='12' y='4' width='1' height='1' fill='%236b4226'/%3E%3Crect x='3' y='5' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='4' y='5' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='5' y='5' width='1' height='1' fill='%2320222e'/%3E%3Crect x='6' y='5' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='7' y='5' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='8' y='5' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='9' y='5' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='10' y='5' width='1' height='1' fill='%2320222e'/%3E%3Crect x='11' y='5' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='12' y='5' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='3' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='4' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='5' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='6' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='7' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='8' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='9' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='10' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='11' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='12' y='6' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='4' y='7' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='5' y='7' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='6' y='7' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='7' y='7' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='8' y='7' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='9' y='7' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='10' y='7' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='11' y='7' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='2' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='3' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='4' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='5' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='6' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='7' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='8' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='9' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='10' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='11' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='12' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='13' y='8' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='2' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='3' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='4' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='5' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='6' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='7' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='8' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='9' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='10' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='11' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='12' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='13' y='9' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='2' y='10' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='3' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='4' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='5' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='6' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='7' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='8' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='9' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='10' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='11' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='12' y='10' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='13' y='10' width='1' height='1' fill='%23f2c9a0'/%3E%3Crect x='4' y='11' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='5' y='11' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='6' y='11' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='7' y='11' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='8' y='11' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='9' y='11' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='10' y='11' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='11' y='11' width='1' height='1' fill='%23f0a23c'/%3E%3Crect x='2' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='3' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='4' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='5' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='6' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='7' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='8' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='9' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='10' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='11' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='12' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='13' y='12' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='2' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='3' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='4' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='5' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='6' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='7' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='8' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='9' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='10' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='11' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='12' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='13' y='13' width='1' height='1' fill='%238a6a4b'/%3E%3Crect x='3' y='14' width='1' height='1' fill='%236a4f38'/%3E%3Crect x='12' y='14' width='1' height='1' fill='%236a4f38'/%3E%3Crect x='3' y='15' width='1' height='1' fill='%236a4f38'/%3E%3Crect x='12' y='15' width='1' height='1' fill='%236a4f38'/%3E%3C/svg%3E">
 <style>
 :root{color-scheme:dark;--bg:#14161f;--card:#1e2130;--line:#32364a;--text:#e8e9f0;--dim:#9a9eb5;--busy:#5fd38d;--warn:#f2b84b;--bad:#ef6f6c}
@@ -8808,7 +8810,7 @@ textarea{min-height:110px;resize:vertical}
 .row{display:flex;gap:8px;justify-content:flex-end}
 .note{color:var(--dim);font-size:12px;margin:0}
 </style></head><body>
-<header><h1>Claude Sessions</h1><span id="summary">connecting…</span><span id="error"></span><button id="updateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="restartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><button id="devices">Devices</button><button id="phoneBtn" title="Use this app from your phone, on the same Wi-Fi" aria-label="Phone access"><svg viewBox="0 0 16 16" width="14" height="16" aria-hidden="true"><rect x="4" y="1.5" width="8" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 12h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="new" class="primary">New session</button></header>
+<header><h1>Bullpen</h1><span id="summary">connecting…</span><span id="error"></span><button id="updateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="restartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><button id="devices">Devices</button><button id="phoneBtn" title="Use this app from your phone, on the same Wi-Fi" aria-label="Phone access"><svg viewBox="0 0 16 16" width="14" height="16" aria-hidden="true"><rect x="4" y="1.5" width="8" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 12h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="new" class="primary">New session</button></header>
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div><div id="prevPager" hidden></div></section>
 <dialog id="askDlg" aria-labelledby="askText"><form method="dialog" id="askForm"><p id="askText"></p><div class="askbtns"><button value="no" id="askNo">Cancel</button><button value="yes" id="askYes" class="primary">OK</button></div></form></dialog><dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><span id="histProv" class="prov"></span><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histAdopt" hidden title="Ends the copy in its own terminal and carries on with the same session here">Move into app</button><button id="histEnd">End session</button><button id="histAllow" hidden title="Same as typing /allow-all: stop asking for permission in this session">Allow all</button><button id="histAuto" hidden title="Same as typing /autopilot: let it keep going without you">Autopilot</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
@@ -9689,7 +9691,7 @@ async function offerUpdate(d){
  let seen='';try{seen=localStorage.getItem('updateOffered')||''}catch(e){}
  if(seen===d.release.version)return;
  try{localStorage.setItem('updateOffered',d.release.version)}catch(e){}
- if(await ask('Version '+d.release.version+' of Claude Sessions is out (you have '+d.appVersion+'). Update now? Your sessions keep running.',{yes:'Update',no:'Later'}))updateApp();
+ if(await ask('Version '+d.release.version+' of Bullpen is out (you have '+d.appVersion+'). Update now? Your sessions keep running.',{yes:'Update',no:'Later'}))updateApp();
 }
 async function updateApp(){
  if(!releaseOffered&&releaseProblem){
@@ -9748,10 +9750,10 @@ async function refresh(){
   const blocked=d.sessions.filter(s=>s.attention&&s.attention.kind!=='done').length;
   const tasks=d.sessions.reduce((n,s)=>n+(s.background||[]).length,0);
   $('summary').textContent=d.sessions.length+' live · '+busy+' busy · '+(blocked?blocked+' need you · ':'')+subs+' subagents working'+(tasks?' · '+tasks+' background task'+(tasks>1?'s':''):'');
-  document.title=(blocked?'('+blocked+' need you) ':busy?'('+busy+' busy) ':'')+'Claude Sessions';
+  document.title=(blocked?'('+blocked+' need you) ':busy?'('+busy+' busy) ':'')+'Bullpen';
   sessionFolders=d.sessions.map(s=>s.cwd);renderFolders();
   document.getElementById('empty').hidden=d.sessions.length>0;
- }catch(e){err.textContent=e.signedOut?'This window isn\u2019t signed in to Claude Sessions. Close it and open the app again.':'lost connection to claude-monitor; retrying…'}
+ }catch(e){err.textContent=e.signedOut?'This window isn\u2019t signed in to Bullpen. Close it and open the app again.':'lost connection to claude-monitor; retrying…'}
 }
 let urlChecked=false;
 async function poll(){await refresh();if(!urlChecked&&cards.size){urlChecked=true;openFromUrl()}setTimeout(poll,2000)}
@@ -11047,8 +11049,9 @@ def open_app_window(browser, url):
     return start_app_window(browser, url).wait()
 
 
-TRAY_TITLE = "Claude Sessions"
+TRAY_TITLE = APP_NAME
 TRAY_CALLBACK = 0x8001  # WM_APP + 1: what the notification area sends for a click on the icon.
+APP_WINDOW_TITLE = re.compile(r"(?:\(\d+ [\w ]+\) )?" + re.escape(TRAY_TITLE))  # "Bullpen", or "(2 need you) Bullpen" while sessions need attention.
 WINDOW_RECENT_SECONDS = 30  # A page that asked for the session list this recently is an open window.
 active_tray = None  # The notification-area icon of this copy, so a restart can take it away first.
 
@@ -11109,7 +11112,7 @@ if WINDOWS:
             if user32.IsWindowVisible(handle):
                 text = ctypes.create_unicode_buffer(256)
                 user32.GetWindowTextW(handle, text, 256)
-                if text.value == TRAY_TITLE:
+                if APP_WINDOW_TITLE.fullmatch(text.value):
                     found.append(handle)
             return True
 
@@ -11338,9 +11341,9 @@ def wait_while_page_open(handover=None, idle=None):
 def run_app(monitor, port, browser_pid=None, fixed_port=False):
     browser = app_browser()
     if not browser:
-        desktop_notify("Claude Sessions can't open", "It needs Chromium, Chrome or Brave installed.", True)
+        desktop_notify("Bullpen can't open", "It needs Chromium, Chrome or Brave installed.", True)
         if WINDOWS:
-            message_box("Claude Sessions", "It needs Microsoft Edge, Chrome or Brave installed.")
+            message_box("Bullpen", "It needs Microsoft Edge, Chrome or Brave installed.")
         return 1
     return run_web(monitor, port, False, browser, browser_pid, fixed_port)
 
@@ -11451,7 +11454,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                 cookie = f"{name}={expected}; HttpOnly; SameSite={same_site}; Path=/" + ("; Max-Age=31536000" if self.on_phone else "")
                 self.respond(302, "text/plain", b"", [("Location", "/"), ("Set-Cookie", cookie)])
             elif not self.authorized():
-                message = b"Scan the phone code in Claude Sessions on your computer again.\n" if self.on_phone else b"Open the link printed by: claude-monitor --web\n"
+                message = b"Scan the phone code in Bullpen on your computer again.\n" if self.on_phone else b"Open the link printed by: claude-monitor --web\n"
                 self.respond(403, "text/plain; charset=utf-8", message)
             elif parts.path == "/api/phone":
                 if self.on_phone:
@@ -11623,7 +11626,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
         sys.exit(f"claude-monitor is already running. Open: {url}")
     if not server:
         if app_browser_command and WINDOWS:
-            message_box("Claude Sessions", f"Claude Sessions couldn't start, because other programs are using its ports ({failure}).")
+            message_box("Bullpen", f"Bullpen couldn't start, because other programs are using its ports ({failure}).")
         sys.exit(f"claude-monitor: cannot use port {port} ({failure}); try --port N")
     serving_port = port
     threading.Thread(target=releases.watch, daemon=True).start()
@@ -11671,7 +11674,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
         wait_while_page_open()
         server.shutdown()
         return code
-    print(f"Claude sessions monitor: {url}   (Ctrl+C to stop)", flush=True)
+    print(f"Bullpen: {url}   (Ctrl+C to stop)", flush=True)
     if open_browser:
         webbrowser.open(url)
     try:
@@ -11690,14 +11693,17 @@ WINDOWS_FOLDER_NAME = re.compile(r"^claude-sessions-windows-(\d+\.\d+\.\d+)(?:-[
 
 
 def start_menu_shortcut():
-    """Point the Start menu's Claude Sessions at this copy, which changes name with each version."""
-    script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut("
-              "[Environment]::GetFolderPath('Programs')+'\\Claude Sessions.lnk');"
+    """Point the Start menu's Bullpen at this copy, which changes name with each version. The shortcut this app had
+    under its old name, Bullpen, is taken away."""
+    script = ("$p=$env:CS_PROGRAMS; if(-not $p){$p=[Environment]::GetFolderPath('Programs')};"
+              "$old=Join-Path $p ($env:CS_OLD+'.lnk'); if(Test-Path $old){Remove-Item $old -Force};"
+              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $p ($env:CS_NAME+'.lnk')));"
               "if($s.TargetPath -ne $env:CS_TARGET){$s.TargetPath=$env:CS_TARGET;$s.Arguments='--app';"
-              "$s.WorkingDirectory=$env:CS_DIR;$s.Description='Watch and start your Claude Code sessions';$s.Save()}")
+              "$s.WorkingDirectory=$env:CS_DIR;$s.Description=$env:CS_DESCRIPTION;$s.Save()}")
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], timeout=30, capture_output=True,
-                       env={**os.environ, "CS_TARGET": PROGRAM_PATH, "CS_DIR": os.path.dirname(PROGRAM_PATH)},
+                       env={**os.environ, "CS_TARGET": PROGRAM_PATH, "CS_DIR": os.path.dirname(PROGRAM_PATH), "CS_NAME": APP_NAME,
+                            "CS_OLD": OLD_APP_NAME, "CS_DESCRIPTION": "Watch and start your Claude Code and GitHub Copilot CLI sessions"},
                        creationflags=0x08000000)  # CREATE_NO_WINDOW
 
 
@@ -11872,13 +11878,13 @@ def run_setup(verbose=True):
                 handle.write(icon_svg())
             with open(launcher, "w") as handle:
                 handle.write(
-                    "[Desktop Entry]\nType=Application\nName=Claude Sessions\nGenericName=Session Monitor\n"
-                    "Comment=Watch and start your Claude Code sessions\n"
+                    "[Desktop Entry]\nType=Application\nName=Bullpen\nGenericName=Session Monitor\n"
+                    "Comment=Watch and start your Claude Code and GitHub Copilot CLI sessions\n"
                     f"Exec={command_line([SCRIPT_PATH])} --app\nIcon=claude-sessions\nTerminal=false\n"
-                    "Categories=Development;\nKeywords=claude;sessions;agents;monitor;\n"
+                    "Categories=Development;\nKeywords=claude;copilot;sessions;agents;monitor;\n"
                     f"StartupWMClass={APP_CLASS}\nStartupNotify=true\n"
                 )
-            say(f"Added Claude Sessions to the applications menu ({launcher}).")
+            say(f"Added Bullpen to the applications menu ({launcher}).")
     return 0
 
 
@@ -11890,7 +11896,7 @@ ADOPT_SKILL_MARK = "<!-- written by claude-sessions --setup -->"
 def adopt_skill_text():
     return f"""---
 name: to-app
-description: Move this session into the Claude Sessions app, so it can be read and answered there. Use when the user asks to move, hand over or continue this session in the app.
+description: Move this session into the Bullpen app, so it can be read and answered there. Use when the user asks to move, hand over or continue this session in the app.
 disable-model-invocation: true
 ---
 {ADOPT_SKILL_MARK}
@@ -11898,7 +11904,7 @@ Run this command with the Bash tool, exactly as written:
 
     {own_command_line("--adopt")}
 
-It closes this terminal session once this turn is over, and brings the same session back inside Claude Sessions (same conversation, folder, permission mode and model).
+It closes this terminal session once this turn is over, and brings the same session back inside Bullpen (same conversation, folder, permission mode and model).
 After it prints its message, tell the user in one short sentence that the session is moving to the app, then end your turn. Do not run anything else.
 If the command prints an error, show the user that error.
 """
@@ -11931,9 +11937,9 @@ def write_json_file_text(path, text):
 def adopt_notify(message, failed=True):
     with contextlib.suppress(Exception):
         if WINDOWS:
-            message_box("Claude Sessions", message)
+            message_box("Bullpen", message)
         else:
-            desktop_notify("Claude Sessions", message, failed)
+            desktop_notify("Bullpen", message, failed)
 
 
 def run_adopt(requested):
@@ -11959,7 +11965,7 @@ def run_adopt(requested):
             subprocess.Popen(command, creationflags=detached, **flags)  # The job doesn't allow leaving it.
     else:
         subprocess.Popen(command, start_new_session=True, **flags)
-    print("Moving this session to the app. This terminal closes when the current turn ends, and the session reopens in Claude Sessions.")
+    print("Moving this session to the app. This terminal closes when the current turn ends, and the session reopens in Bullpen.")
     return 0
 
 
@@ -12331,7 +12337,7 @@ def main():
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
-    parser = argparse.ArgumentParser(description="Live monitor for running Claude Code sessions.")
+    parser = argparse.ArgumentParser(description="Live monitor for running Claude Code and GitHub Copilot CLI sessions.")
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between refreshes (default 2)")
     parser.add_argument("--once", action="store_true", help="print one snapshot and exit")
     parser.add_argument("--web", action="store_true", help="serve the browser view on this machine only")
@@ -12351,7 +12357,7 @@ def main():
     parser.add_argument("--adopt-worker", help=argparse.SUPPRESS)
     parser.add_argument("--setup", action="store_true", help="add this app's hooks (and a status line, if none) to Claude Code")
     parser.add_argument("--session-host", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--version", action="version", version=f"claude-sessions {APP_VERSION}")
+    parser.add_argument("--version", action="version", version=f"bullpen {APP_VERSION}")
     args = parser.parse_args()
     if args.hook:
         return run_hook()
@@ -12384,9 +12390,9 @@ def main():
         os.environ["PATH"] += os.pathsep + os.path.expanduser(r"~\.local\bin")
     if not shutil.which("claude"):
         if args.app:
-            desktop_notify("Claude Sessions can't open", "Claude Code (claude) wasn't found.", True)
+            desktop_notify("Bullpen can't open", "Claude Code (claude) wasn't found.", True)
             if WINDOWS:
-                message_box("Claude Sessions", "Claude Code (claude) wasn't found. Install it, then open this app again.")
+                message_box("Bullpen", "Claude Code (claude) wasn't found. Install it, then open this app again.")
         sys.exit("claude-monitor: `claude` was not found on PATH")
     if args.app:
         run_setup(verbose=False)
