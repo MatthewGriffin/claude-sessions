@@ -51,6 +51,7 @@ os.environ["COPILOT_HOME"] = tempfile.mkdtemp(prefix="copilot-sessions-test-")  
 os.environ["CLAUDE_SESSIONS_TMUX_SOCKET"] = "claude-sessions-test-" + secrets.token_hex(4)
 os.environ["CLAUDE_SESSIONS_HOST_PORT"] = str(18000 + secrets.randbelow(2000))
 app = load(SOURCE, "claude_monitor")
+app._copilot_commands["at"] = time.monotonic()  # No test should run the real copilot to read its command list.
 
 
 def wait_for(check, timeout=20):
@@ -3187,4 +3188,407 @@ class CopilotPanelTests(unittest.TestCase):
         self.screen = screen_of("copilot-idle.txt")
         self.assertEqual(app.panel_action(self.session, "panelkey", {"key": "Escape"}), (False, "That panel has closed."))
         self.assertEqual(self.keys, [])
+
+
+
+class CopilotProcessTests(unittest.TestCase):
+    """Telling that a lock file's process is a live program of the right kind, on this computer's own terms."""
+
+    def test_a_running_process_is_known_by_name_and_start(self):
+        name, started = app.copilot_process(os.getpid())
+        self.assertIn("python", name.lower())
+        self.assertLessEqual(started, time.time() + app.COPILOT_START_SLACK)  # A virtual machine's clock can be a little off.
+        self.assertGreater(started, time.time() - 30 * 24 * 3600)
+
+    def test_a_process_that_has_exited_is_not(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        self.assertIsNone(app.copilot_process(child.pid))
+
+    def test_a_process_started_later_than_its_lock_is_told_apart(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(child.kill)
+        wait_for(lambda: app.copilot_process(child.pid))
+        lock = os.path.join(tempfile.mkdtemp(prefix="copilot-lock-"), f"inuse.{child.pid}.lock")
+        self.addCleanup(shutil.rmtree, os.path.dirname(lock), True)
+        open(lock, "w").close()
+        os.utime(lock, (time.time() - 3600, time.time() - 3600))  # Written an hour before this process began.
+        with mock.patch.object(app, "COPILOT_PROCESS_WORDS", ("python",)):
+            self.assertIsNone(app.copilot_lock_pid(lock))
+            os.utime(lock, None)
+            self.assertEqual(app.copilot_lock_pid(lock), child.pid)
+
+    def test_sessions_that_started_together_are_listed_in_the_same_order_every_time(self):
+        state = tempfile.mkdtemp(prefix="copilot-state-")
+        self.addCleanup(shutil.rmtree, state, True)
+        saved = app.COPILOT_STATE_DIR, app.copilot_process
+        self.addCleanup(lambda: (setattr(app, "COPILOT_STATE_DIR", saved[0]), setattr(app, "copilot_process", saved[1]), app._copilot_scan.update(at=0)))
+        app.COPILOT_STATE_DIR, app.copilot_process = state, lambda pid: ("copilot", 0)
+        for name in ("b-session", "c-session", "a-session"):
+            os.makedirs(os.path.join(state, name))
+            with open(os.path.join(state, name, "workspace.yaml"), "w") as handle:
+                handle.write("cwd: /w\ncreated_at: 2026-11-20T15:08:34.448Z\n")
+            open(os.path.join(state, name, "inuse.7.lock"), "w").close()
+        app._copilot_scan["at"] = 0
+        self.assertEqual([s["sessionId"] for s in app.copilot_live_sessions()], ["a-session", "b-session", "c-session"])
+
+
+@unittest.skipUnless(not WINDOWS and shutil.which("tmux"), "tmux hosts sessions on Linux")
+class HostedChildTests(unittest.TestCase):
+    """A session can run below the program a terminal started, as Copilot's loader starts the real program."""
+
+    def test_a_program_its_terminal_started_is_hosted_too(self):
+        name = "test-" + secrets.token_hex(4)
+        started, error = app.new_terminal(name, ROOT, ["sh", "-c", "sleep 60 & wait"])
+        self.assertTrue(started, error)
+        self.addCleanup(app.kill_terminal, name)
+        panes = wait_for(lambda: (p := app.hosted_panes()) and sum(1 for n in p.values() if n == name) >= 2 and p)
+        self.assertTrue(panes, "the terminal's child wasn't found")
+        self.assertEqual({n for n in panes.values() if n == name}, {name})
+
+
+class CopilotTypedAnswerTests(unittest.TestCase):
+    """Answering one of Copilot's own questions with text of your own ("Other (type your answer)")."""
+
+    def setUp(self):
+        self.saved = {n: getattr(app, n) for n in ("session_screen", "send_keys", "send_text", "hosted_session")}
+        self.at, self.sent = 0, []
+        base = screen_of("copilot-question.txt")
+
+        def screen(target):
+            lines = base.split("\n")
+            for n, name in enumerate(("red", "blue", "Other (type your answer)")):
+                row = next(i for i, line in enumerate(lines) if line.strip().lstrip("❯").strip() == name)
+                shown = name.replace("answer)", "answer below)") if n == self.at == 2 else name
+                lines[row] = (" ❯ " if n == self.at else "   ") + shown
+            return "\n".join(lines)
+
+        def keys(target, *pressed):
+            for key in pressed:
+                self.sent.append(key)
+                self.at = min(2, self.at + 1) if key == "Down" else max(0, self.at - 1) if key == "Up" else self.at
+            return True
+
+        app.session_screen = screen
+        app.send_keys = keys
+        app.send_text = lambda target, text: self.sent.append(("text", text)) or True
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+
+    def other(self):
+        return next(o for o in app.menu_options(app.session_screen("t")) if o["label"].startswith("Other"))
+
+    def test_the_typed_answer_is_told_from_the_others(self):
+        options = app.menu_options(app.session_screen("t"))
+        self.assertEqual([bool(app.TYPE_SOMETHING.match(o["label"])) for o in options], [False, False, True])
+
+    def test_the_highlight_is_moved_to_it_before_typing(self):
+        self.assertTrue(app.choose_answer("t", self.other(), "purple", by_number=False))
+        self.assertEqual(self.sent, ["Down", "Down", ("text", "purple"), "Enter"])
+
+    def test_it_is_found_though_its_label_changes_once_highlighted(self):
+        asked = self.other()  # Read while "red" was highlighted: "Other (type your answer)".
+        self.at = 2  # Now "Other (type your answer below)".
+        self.assertNotEqual(self.other()["label"], asked["label"])
+        self.assertTrue(app.same_label(self.other()["label"], asked["label"]))
+        self.assertFalse(app.same_label("blue", asked["label"]))
+
+    def test_the_page_sends_it_as_a_typed_answer(self):
+        waiting = {"id": "c1", "tmux": "t", "provider": "copilot", "status": "waiting", "attention": {"kind": "question", "at": 5}}
+        app.hosted_session = lambda monitor, request: waiting
+        asked = self.other()
+        result = app.press_key(None, {"id": "c1", "action": "type", "prompt": 5, "key": asked["key"], "label": asked["label"], "text": "purple"})
+        self.assertEqual(result, (True, "Sent."))
+        self.assertIn(("text", "purple"), self.sent)
+        self.assertEqual(self.sent[-1], "Enter")
+
+    def test_a_pick_that_isnt_a_typed_answer_takes_no_text(self):
+        waiting = {"id": "c1", "tmux": "t", "provider": "copilot", "status": "waiting", "attention": {"kind": "question", "at": 5}}
+        app.hosted_session = lambda monitor, request: waiting
+        result = app.press_key(None, {"id": "c1", "action": "type", "prompt": 5, "key": "", "label": "red", "text": "purple"})
+        self.assertEqual(result, (False, "That answer can't take typed text here."))
+        self.assertEqual(self.sent, [])
+
+    def test_the_page_offers_the_box_for_copilot_too(self):
+        self.assertEqual(app.PAGE.count(r"Other \(type your answer)"), 2)
+
+
+class CopilotPreviousSessionTests(unittest.TestCase):
+    """Earlier Copilot sessions, offered for resuming as Claude's are."""
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp(prefix="copilot-state-")
+        self.work = tempfile.mkdtemp(prefix="copilot-work-")
+        self.saved = {n: getattr(app, n) for n in ("COPILOT_STATE_DIR", "new_terminal", "await_copilot_input")}
+        app.COPILOT_STATE_DIR = self.state
+        app._copilot_previous["at"] = 0
+        self.addCleanup(lambda: [setattr(app, n, v) for n, v in self.saved.items()] + [app._copilot_previous.update(at=0)])
+        self.addCleanup(shutil.rmtree, self.state, True)
+        self.addCleanup(shutil.rmtree, self.work, True)
+        self.addCleanup(lambda: os.path.exists(app.KNOWN_FILE) and os.remove(app.KNOWN_FILE))
+        self.addCleanup(lambda: os.path.exists(app.NAMES_FILE) and os.remove(app.NAMES_FILE))
+
+    def session(self, session_id, name="a conversation", ago=3600, cwd=None):
+        folder = os.path.join(self.state, session_id)
+        os.makedirs(folder)
+        stamp = datetime.datetime.fromtimestamp(time.time() - ago, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        with open(os.path.join(folder, "workspace.yaml"), "w") as handle:
+            handle.write(f"id: {session_id}\ncwd: {cwd or self.work}\nname: {name}\nupdated_at: {stamp}\n")
+        return folder
+
+    def previous(self, live=()):
+        monitor = app.Monitor()
+        app._copilot_previous["at"] = 0
+        monitor._update_known([{"id": sid, "name": "x", "cwd": "/", "title": "", "provider": "copilot"} for sid in live])
+        return monitor.previous
+
+    def test_named_recent_sessions_are_offered_newest_first(self):
+        self.session("11111111-1111-1111-1111-111111111111", "older", ago=7200)
+        self.session("22222222-2222-2222-2222-222222222222", "newer", ago=60)
+        previous = self.previous()
+        self.assertEqual([(p["name"], p["provider"]) for p in previous], [("newer", "copilot"), ("older", "copilot")])
+        self.assertEqual(previous[0]["cwd"], self.work)
+
+    def test_empty_old_and_homeless_sessions_are_not(self):
+        self.session("11111111-1111-1111-1111-111111111111", name="")  # Never had a conversation.
+        self.session("22222222-2222-2222-2222-222222222222", ago=40 * 86400)  # Too long ago.
+        self.session("33333333-3333-3333-3333-333333333333", cwd=os.path.join(self.work, "gone"))  # Its folder is gone.
+        self.assertEqual(self.previous(), [])
+
+    def test_one_that_is_running_is_not(self):
+        self.session("11111111-1111-1111-1111-111111111111")
+        self.assertEqual(self.previous(live=["11111111-1111-1111-1111-111111111111"]), [])
+
+    def test_a_name_given_in_the_app_is_shown(self):
+        self.session("11111111-1111-1111-1111-111111111111", "Copilots own name")
+        app.write_names({"11111111-1111-1111-1111-111111111111": "My name for it"})
+        self.assertEqual(self.previous()[0]["name"], "My name for it")
+
+    def test_forgetting_hides_it_and_leaves_copilots_record_alone(self):
+        sid = "11111111-1111-1111-1111-111111111111"
+        folder = self.session(sid)
+        self.assertEqual(app.forget_session(app.Monitor(), {"id": sid}), (True, "Forgotten."))
+        self.assertEqual(self.previous(), [])
+        self.assertTrue(os.path.isfile(os.path.join(folder, "workspace.yaml")))
+
+    def test_nothing_is_offered_when_remembering_is_off(self):
+        self.session("11111111-1111-1111-1111-111111111111")
+        app.set_remember(app.Monitor(), {"on": False})
+        self.assertEqual(self.previous(), [])
+        app.set_remember(app.Monitor(), {"on": True})
+        self.assertEqual(len(self.previous()), 1)
+
+    def test_resuming_starts_copilot_with_the_session_in_its_folder(self):
+        sid = "11111111-1111-1111-1111-111111111111"
+        self.session(sid)
+        started = []
+        app.new_terminal = lambda session_id, cwd, command: started.append((session_id, cwd, command)) or (True, "")
+        app.await_copilot_input = lambda session_id, cwd, trusted: True
+        monitor = types.SimpleNamespace(current=lambda session_id: None, lock=threading.Lock())
+        with mock.patch.object(app.shutil, "which", return_value="copilot"):
+            self.assertEqual(app.resume_session(monitor, {"id": sid}), (True, "Started."))
+        self.assertEqual(started, [(sid, self.work, ["copilot", f"--resume={sid}"])])
+
+    def test_resuming_refuses_what_cannot_be_resumed(self):
+        sid = "11111111-1111-1111-1111-111111111111"
+        self.session(sid)
+        app.new_terminal = lambda *a: self.fail("nothing should be started")
+        running = types.SimpleNamespace(current=lambda session_id: {"id": session_id}, lock=threading.Lock())
+        self.assertEqual(app.resume_session(running, {"id": sid}), (False, "That session is already running."))
+        shutil.rmtree(self.work)
+        idle = types.SimpleNamespace(current=lambda session_id: None, lock=threading.Lock())
+        self.assertIn("folder no longer exists", app.resume_session(idle, {"id": sid})[1])
+
+    def test_an_untrusted_folder_is_asked_about(self):
+        sid = "11111111-1111-1111-1111-111111111111"
+        self.session(sid)
+        app.new_terminal = lambda *a: (True, "")
+        seen = []
+        app.await_copilot_input = lambda session_id, cwd, trusted: seen.append(trusted) or {"error": "This folder isn't trusted yet.", "needsTrust": True, "cwd": cwd}
+        monitor = types.SimpleNamespace(current=lambda session_id: None, lock=threading.Lock())
+        with mock.patch.object(app.shutil, "which", return_value="copilot"):
+            ok, answer = app.resume_session(monitor, {"id": sid})
+            self.assertEqual((ok, answer["needsTrust"]), (False, True))
+            app.resume_session(monitor, {"id": sid, "trust": self.work})
+        self.assertEqual(seen, [False, True])
+
+    def test_ended_on_purpose_then_running_again(self):
+        sid = "11111111-1111-1111-1111-111111111111"
+        self.session(sid)
+        app.forget_session(app.Monitor(), {"id": sid})  # What ending a session does.
+        self.assertEqual(self.previous(), [])
+        self.assertEqual(self.previous(live=[sid]), [])  # While it runs it isn't listed either...
+        self.assertEqual(len(self.previous()), 1)  # ...but if it is lost after that, it is offered.
+
+    def test_sessions_are_found_just_after_the_computer_started(self):
+        # The clock the caches use reads a few seconds then, which must not make a look that never happened seem recent.
+        sid = "11111111-1111-1111-1111-111111111111"
+        self.session(sid)
+        open(os.path.join(self.state, sid, "inuse.7.lock"), "w").close()
+        app._copilot_scan["at"] = 0
+        with mock.patch.object(app, "copilot_process", lambda pid: ("copilot", 0)), mock.patch.object(app.time, "monotonic", return_value=2.0):
+            self.assertEqual([s["sessionId"] for s in app.copilot_live_sessions()], [sid])
+            app._copilot_previous["at"] = 0
+            self.assertEqual([p["id"] for p in app.copilot_previous_sessions()], [sid])
+
+    def test_the_page_marks_each_previous_session_with_its_program(self):
+        self.assertIn("provBadge(el('span','prov',who),p)", app.PAGE)
+
+
+
+class CopilotCommandAndContextTests(unittest.TestCase):
+    """The slash commands the reply box offers for Copilot, and what its context tab shows."""
+
+    def setUp(self):
+        self.saved = app.shutil.which, app.subprocess.run, dict(app._copilot_commands)
+        self.state = tempfile.mkdtemp(prefix="copilot-state-")
+        self.addCleanup(shutil.rmtree, self.state, True)
+        self.addCleanup(lambda: (setattr(app.shutil, "which", self.saved[0]), setattr(app.subprocess, "run", self.saved[1]),
+                                 app._copilot_commands.update(at=self.saved[2]["at"], items=self.saved[2]["items"])))
+        app._copilot_commands.update(at=0.0, items=[])
+        self.runs = []
+        with open(os.path.join(SCREENS, "copilot-help-commands.txt"), encoding="utf-8") as handle:
+            self.help = handle.read()
+
+        def run(command, *a, **k):
+            self.runs.append(command)
+            return subprocess.CompletedProcess(command, 0, self.help, "")
+
+        app.shutil.which = lambda name: "copilot" if name == "copilot" else None
+        app.subprocess.run = run
+
+    def test_commands_are_read_from_copilot_itself(self):
+        commands = {c["name"]: c for c in app.copilot_commands()}
+        self.assertEqual(sorted(commands), ["allow-all", "ask", "autopilot", "compact", "context", "model", "session"])
+        self.assertTrue(commands["ask"]["description"].startswith("Ask a side question"))
+        self.assertEqual((commands["ask"]["source"], commands["ask"]["hint"]), ("built-in", ""))
+        self.assertEqual(self.runs, [["copilot", "help", "commands"]])
+
+    def test_they_are_kept_instead_of_asked_for_again(self):
+        app.copilot_commands()
+        app.copilot_commands()
+        self.assertEqual(len(self.runs), 1)
+
+    def test_none_read_is_tried_again_soon_and_not_every_time(self):
+        app.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "boom")
+        self.assertEqual(app.copilot_commands(), [])
+        app.subprocess.run = lambda *a, **k: self.fail("asked again straight away")
+        self.assertEqual(app.copilot_commands(), [])
+        app._copilot_commands["at"] -= 61
+        app.subprocess.run = lambda command, *a, **k: subprocess.CompletedProcess(command, 0, self.help, "")
+        self.assertEqual(len(app.copilot_commands()), 7)
+
+    def test_without_copilot_there_are_none(self):
+        app.shutil.which = lambda name: None
+        self.assertEqual(app.copilot_commands(), [])
+
+    def monitor_with(self, **log):
+        monitor = app.Monitor()
+        monitor.sessions = [{"sessionId": "cop", "provider": "copilot", "cwd": "/w"}]
+        transcript = app.CopilotTranscript("cop")
+        transcript.__dict__.update(log)
+        monitor.transcripts["cop"] = transcript
+        return monitor
+
+    def test_a_copilot_session_is_offered_copilots_commands(self):
+        names = [c["name"] for c in self.monitor_with().commands("cop")]
+        self.assertEqual(names, sorted(names))
+        self.assertIn("ask", names)
+        self.assertNotIn("clear-the-cache", names)
+
+    def test_the_context_tab_shows_how_full_the_window_is(self):
+        context = self.monitor_with(context=27200, context_limit=272000, model="gpt-6-luna").context_usage("cop")
+        self.assertEqual((context["used"], context["window"], context["percent"], context["model"]), ("27k", "272k", 10.0, "gpt-6-luna"))
+        self.assertEqual([(c["name"], c["percent"]) for c in context["categories"]], [("In use", 10.0), ("Free space", 90.0)])
+        self.assertIn("/context", context["details"])
+        self.assertFalse(context["running"])
+
+    def test_before_its_first_reply_the_context_tab_says_why_it_is_empty(self):
+        context = self.monitor_with().context_usage("cop")
+        self.assertNotIn("used", context)
+        self.assertIn("first reply", context["error"])
+
+    def test_asking_to_check_again_does_nothing_for_copilot(self):
+        monitor = self.monitor_with(context=1000, context_limit=10000)
+        monitor.current = lambda session_id: {"id": session_id}
+        self.assertEqual(app.recheck_context(monitor, {"id": "cop"}), (True, "Checking."))
+        self.assertEqual(monitor.contexts, {})  # No headless Claude Code is started.
+
+
+class CopilotMoveIntoAppTests(unittest.TestCase):
+    """Moving a Copilot session from the terminal it was started in into the app, as /to-app does for Claude Code."""
+
+    def setUp(self):
+        self.saved = {n: getattr(app, n) for n in ("end_process_tree", "resume_copilot_session", "copilot_process")}
+        self.addCleanup(lambda: [setattr(app, n, v) for n, v in self.saved.items()])
+        self.work = tempfile.mkdtemp(prefix="copilot-work-")
+        self.addCleanup(shutil.rmtree, self.work, True)
+        self.calls = []
+        self.session = {"id": "c1", "provider": "copilot", "hosted": False, "status": "idle", "client": "github/cli", "pid": 4321, "cwd": self.work}
+        self.alive = True
+        app.copilot_process = lambda pid: ("copilot.exe", 1) if self.alive else None
+        app.end_process_tree = lambda pid: self.calls.append(("end", pid)) or setattr(self, "alive", False) or True
+        app.resume_copilot_session = lambda monitor, request: self.calls.append(("resume", request["id"])) or (True, "Started.")
+        self.monitor = types.SimpleNamespace(current=lambda session_id: self.session if self.alive else None)
+
+    def move(self, **changes):
+        self.session = {**self.session, **changes}
+        return app.adopt_copilot_session(self.monitor, {"id": "c1"})
+
+    def test_an_idle_session_of_the_cli_is_moved(self):
+        self.assertEqual(self.move(), (True, "Started."))
+        self.assertEqual(self.calls, [("end", 4321), ("resume", "c1")])  # Its terminal copy is ended before it is resumed.
+
+    def test_what_it_will_not_move(self):
+        cases = {"hosted": ({"hosted": True}, "already in the app"), "busy": ({"status": "busy"}, "idle"), "waiting": ({"status": "waiting"}, "idle"),
+                 "another program's": ({"client": "vscode"}, "another program"), "a claude session": ({"provider": "claude"}, "no longer running"),
+                 "no folder": ({"cwd": os.path.join(self.work, "gone")}, "no longer exists")}
+        base = dict(self.session)
+        for label, (changes, said) in cases.items():
+            self.calls.clear()
+            self.session = dict(base)
+            ok, message = self.move(**changes)
+            self.assertFalse(ok, label)
+            self.assertIn(said, message, label)
+            self.assertEqual(self.calls, [], label + ": nothing may be ended")
+
+    def test_a_process_that_has_gone_or_isnt_copilot_is_left_alone(self):
+        self.alive = False
+        self.session = {**self.session}
+        self.monitor.current = lambda session_id: self.session
+        self.assertEqual(app.adopt_copilot_session(self.monitor, {"id": "c1"}), (False, "Its process is no longer running."))
+        app.copilot_process = lambda pid: ("chrome.exe", 1)  # Its process id now belongs to another program.
+        self.assertFalse(app.adopt_copilot_session(self.monitor, {"id": "c1"})[0])
+        self.assertEqual(self.calls, [])
+
+    def test_if_the_terminal_copy_will_not_end_nothing_is_moved(self):
+        app.end_process_tree = lambda pid: self.calls.append(("end", pid)) or False
+        self.assertEqual(self.move(), (False, "Could not end the copy in its terminal, so nothing was moved."))
+        self.assertEqual(self.calls, [("end", 4321)])
+
+    def test_if_resuming_fails_it_says_how_to_do_it_by_hand(self):
+        app.resume_copilot_session = lambda monitor, request: (False, "Could not start the session: boom")
+        ok, message = self.move()
+        self.assertFalse(ok)
+        self.assertIn("copilot --resume=c1", message)
+
+    def test_a_process_and_what_it_started_are_ended(self):
+        code = "import subprocess, sys, time; g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); print(g.pid, flush=True); time.sleep(60)"
+        child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.kill)
+        grandchild = int(child.stdout.readline())
+        app.copilot_process = self.saved["copilot_process"]
+        self.assertTrue(wait_for(lambda: app.copilot_process(grandchild)))
+        self.assertTrue(self.saved["end_process_tree"](child.pid))
+        self.assertIsNone(app.copilot_process(child.pid))
+        self.assertTrue(wait_for(lambda: app.copilot_process(grandchild) is None, 10), "what it started was left running")
+        child.wait(timeout=10)
+
+    def test_the_page_offers_it_only_where_it_applies(self):
+        self.assertIn("$('histAdopt').hidden=!(s.provider==='copilot'&&!s.hosted&&s.client==='github/cli'&&s.status==='idle')", app.PAGE)
+        self.assertIn("act('adopt',{id:histSession})", app.PAGE)
+        with open(SOURCE, encoding="utf-8") as handle:
+            self.assertIn('"/api/sessions/adopt"', handle.read())
 

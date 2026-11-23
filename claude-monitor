@@ -215,7 +215,13 @@ SKILL_LINE = re.compile(r"^- ([\w.:-]+): (.*)$")
 MENU_NUMBERED = re.compile(r"^\s*(?:❯\s*)?(\d{1,2})\.\s+(?:\[(.)\]\s+)?(\S.*?)\s*$")
 MENU_HIGHLIGHT = re.compile(r"^(\s*)❯\s+(\S.*?)\s*$")
 MENU_DIVIDER = re.compile(r"^[\s─╌━-]*$")
-TYPE_SOMETHING = re.compile(r"^Type something\b")
+TYPE_SOMETHING = re.compile(r"^(?:Type something\b|Other \(type your answer)")  # Claude Code's wording, then Copilot's.
+TYPE_SUFFIX = re.compile(r"\s*\(type your answer[^)]*\)\s*$")  # Copilot adds "below" to it once it is highlighted.
+
+
+def same_label(shown, asked):
+    """Whether two readings of an answer's label are the same answer, though Copilot's typed-answer one changes as it is highlighted."""
+    return shown == asked or TYPE_SUFFIX.sub("", str(shown)) == TYPE_SUFFIX.sub("", str(asked))
 MENU_STEPS = 15
 MENU_BELOW = 3  # Lines a menu can have below it: a hint, a divider, a footer.
 REPEAT_PING_SECONDS = 30
@@ -375,9 +381,11 @@ def read_known():
     try:
         with open(KNOWN_FILE) as handle:
             known = json.load(handle)
-        return {"remember": bool(known["remember"]), "sessions": dict(known["sessions"])}
+        hidden = known.get("hidden", [])
+        return {"remember": bool(known["remember"]), "sessions": dict(known["sessions"]),
+                "hidden": [h for h in hidden if isinstance(h, str)] if isinstance(hidden, list) else []}
     except (OSError, ValueError, KeyError, TypeError):
-        return {"remember": True, "sessions": {}}
+        return {"remember": True, "sessions": {}, "hidden": []}
 
 
 def write_known(known):
@@ -939,6 +947,8 @@ class Monitor:
             # Keep showing the last good list, with the failure in the header.
             self.error = f"could not list sessions: {clean(exc)}"
         copilot = copilot_live_sessions()
+        if copilot and not _copilot_commands["at"]:  # Read them now, so the first "/" typed doesn't wait for it.
+            threading.Thread(target=copilot_commands, daemon=True).start()
         names = read_names()
         for session in copilot:
             session["name"] = clean(names.get(session["sessionId"], "")) or session.get("name")
@@ -1026,6 +1036,9 @@ class Monitor:
         self.retired_ids = set()
         for session in sessions:
             if session.get("provider") == "copilot":
+                if session["id"] in known["hidden"]:  # Running again, so it's offered again if it is interrupted.
+                    known["hidden"] = [h for h in known["hidden"] if h != session["id"]]
+                    changed = True
                 continue
             if session.get("startedBy"):
                 # Started by another session to be thrown away once it reports back: never offered again.
@@ -1052,11 +1065,10 @@ class Monitor:
             write_known(known)
         self.chosen_models = {sid: e["model"] for sid, e in entries.items() if isinstance(e.get("model"), str)}
         live = {s["id"] for s in sessions}
-        self.previous = sorted(
-            ({k: e.get(k) for k in ("id", "name", "cwd", "title", "seen")}
-             for sid, e in entries.items() if sid not in live and os.path.exists(e.get("path", ""))),
-            key=lambda e: e["seen"], reverse=True,
-        )
+        previous = [{k: e.get(k) for k in ("id", "name", "cwd", "title", "seen")}
+                    for sid, e in entries.items() if sid not in live and os.path.exists(e.get("path", ""))]
+        copilot = [p for p in copilot_previous_sessions() if p["id"] not in live and p["id"] not in known["hidden"]][:COPILOT_PREVIOUS_MAX]
+        self.previous = sorted(previous + copilot, key=lambda e: e["seen"], reverse=True)
 
     def transcript(self, session):
         return self.transcripts.get(session["sessionId"]) or self.new_transcript(session)
@@ -1179,6 +1191,7 @@ class Monitor:
             "waitingFor": "",
             "draft": self.drafts.get(session["sessionId"], "")[:MAX_REPLY_BYTES],
             "mode": self.copilot_mode_label(session["sessionId"], target, transcript),
+            "client": session.get("client", ""),
         }
 
     def copilot_mode_label(self, session_id, target, transcript):
@@ -1315,7 +1328,7 @@ class Monitor:
         if not session:
             return None
         if session.get("provider") == "copilot":
-            return []  # Claude Code's commands and skills mean nothing to Copilot, which can't be sent them from here yet.
+            return sorted(copilot_commands(), key=lambda c: c["name"])  # Claude Code's commands and skills mean nothing to it.
         skills = transcript_skills(path) if path else {}
         found = {name: {"name": name, "hint": hint, "description": text, "source": "built-in"} for name, hint, text in builtin_commands()}
         for name, text in skills.items():
@@ -1379,7 +1392,7 @@ class Monitor:
         """
         session = next((s for s in self.sessions if s.get("sessionId") == session_id), None)
         if session and session.get("provider") == "copilot":
-            return None  # /context is Claude Code's; its headless check can't read a Copilot session.
+            return self.copilot_context(session_id)  # /context is Claude Code's; its headless check can't read a Copilot session.
         with self.lock:
             known = self.contexts.get(session_id)
             transcript = self.transcripts.get(session_id)
@@ -1392,6 +1405,18 @@ class Monitor:
         if due:
             threading.Thread(target=self._check_context, args=(session_id, session.get("cwd") or ".", known), daemon=True).start()
         return {k: v for k, v in known.items() if k not in ("size", "started")} if known else None
+
+    def copilot_context(self, session_id):
+        """How much of its window a Copilot session is using, as the context tab shows it. Copilot reports the total and
+        not what fills it, so there is one band for what is in use."""
+        transcript = self.transcripts.get(session_id)
+        if not transcript or not transcript.context or not transcript.context_limit:
+            return {"error": "Copilot hasn't reported how big its context is yet. It does after its first reply."}
+        percent = round(100 * transcript.context / transcript.context_limit, 1)
+        return {"used": format_tokens(transcript.context), "window": format_tokens(transcript.context_limit), "percent": percent, "model": transcript.model,
+                "categories": [{"name": "In use", "tokens": format_tokens(transcript.context), "percent": percent},
+                               {"name": "Free space", "tokens": format_tokens(max(0, transcript.context_limit - transcript.context)), "percent": round(100 - percent, 1)}],
+                "details": "Copilot reports how much of its window is in use, not what fills it. Type /context in the session for that.", "running": False}
 
     def _check_context(self, session_id, cwd, known):
         result = check_context(session_id, cwd)
@@ -3747,6 +3772,7 @@ class HistoryReader:
 COPILOT_HOME = os.environ.get("COPILOT_HOME") or os.path.expanduser("~/.copilot")
 COPILOT_STATE_DIR = os.path.join(COPILOT_HOME, "session-state")
 COPILOT_MODE_SECONDS = 3  # How often a hosted session's screen is read for its mode.
+COPILOT_START_SLACK = 60  # Seconds. A process id reused after a crash starts hours later; a clock that jumped is off by seconds.
 COPILOT_SCAN_SECONDS = 3  # Looking at every session folder is cheap, but not worth doing for every page poll.
 COPILOT_PROCESS_WORDS = ("copilot", "node", "bun")  # Copilot is a native program or runs under one of these.
 COPILOT_STATUS = {"working": "busy", "waiting": "waiting", "idle": "idle"}  # Copilot's word -> this app's.
@@ -3775,9 +3801,16 @@ def copilot_process(pid):
     can be reused, so both are needed to know the process is the one that wrote the lock."""
     if not WINDOWS:
         try:
-            with open(f"/proc/{pid}/comm") as handle:
-                return handle.read().strip(), os.stat(f"/proc/{pid}").st_ctime
-        except OSError:
+            with open(f"/proc/{pid}/stat") as handle:
+                stat = handle.read()
+            name = stat[stat.index("(") + 1:stat.rindex(")")]  # The name can hold spaces and brackets, so the rest is counted from its end.
+            fields = stat[stat.rindex(")") + 2:].split()
+            if fields[0] in ("Z", "X"):  # Gone, though not yet collected.
+                return None
+            with open("/proc/stat") as handle:
+                boot = next(int(line.split()[1]) for line in handle if line.startswith("btime "))
+            return name, boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")  # starttime is the 22nd field of stat.
+        except (OSError, ValueError, IndexError, StopIteration):
             return None
     import ctypes
     kernel32 = ctypes.windll.kernel32
@@ -3809,7 +3842,7 @@ def copilot_lock_pid(lock):
         name, started = info
         if name and not any(word in name.lower() for word in COPILOT_PROCESS_WORDS):
             return None
-        return pid if started <= os.path.getmtime(lock) + 5 else None
+        return pid if started <= os.path.getmtime(lock) + COPILOT_START_SLACK else None
     except (ValueError, IndexError, OSError):
         return None
 
@@ -3831,7 +3864,7 @@ _copilot_scan = {"at": 0.0, "sessions": []}
 
 def copilot_live_sessions():
     """Copilot CLI sessions with a running process, in the shape `claude agents --json` lists Claude's."""
-    if time.monotonic() - _copilot_scan["at"] < COPILOT_SCAN_SECONDS:
+    if _copilot_scan["at"] and time.monotonic() - _copilot_scan["at"] < COPILOT_SCAN_SECONDS:  # Zero is never looked: the clock itself can be small just after boot.
         return [dict(s) for s in _copilot_scan["sessions"]]
     found = []
     try:
@@ -3850,9 +3883,31 @@ def copilot_live_sessions():
             "startedAt": int(started * 1000) if started else 0, "status": "idle", "kind": "", "provider": "copilot",
             "client": meta.get("client_name", ""),
         })
-    found.sort(key=lambda s: s["startedAt"])
+    found.sort(key=lambda s: (s["startedAt"], s["sessionId"]))
     _copilot_scan.update(at=time.monotonic(), sessions=found)
     return [dict(s) for s in found]
+
+
+COPILOT_COMMAND_LINE = re.compile(r"^\s{4}/([\w:-]+)\s{2,}(\S.*)$", re.M)
+_copilot_commands = {"at": 0.0, "items": [], "lock": threading.Lock()}
+
+
+def copilot_commands():
+    """[{name, hint, description, source}] for Copilot's slash commands, from `copilot help commands`. Reading them
+    takes a couple of seconds, so they're kept for an hour (a minute when none could be read)."""
+    with _copilot_commands["lock"]:
+        age = time.monotonic() - _copilot_commands["at"]
+        if _copilot_commands["at"] and age < (3600 if _copilot_commands["items"] else 60):
+            return list(_copilot_commands["items"])
+        items = []
+        program = shutil.which("copilot")
+        if program:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                result = subprocess.run([program, "help", "commands"], capture_output=True, text=True, timeout=20, encoding="utf-8", errors="replace")
+                items = [{"name": name, "hint": "", "description": clean(text)[:200], "source": "built-in"}
+                         for name, text in COPILOT_COMMAND_LINE.findall(result.stdout or "")]
+        _copilot_commands.update(at=time.monotonic(), items=items)
+        return list(items)
 
 
 def copilot_describe_tool(name, arguments):
@@ -4231,11 +4286,33 @@ def hosted_panes():
                 panes[int(pid)] = item["name"]
         return panes
     result = tmux("list-panes", "-a", "-F", "#{pane_pid} #{session_name}")
+    roots = {}
     for line in result.stdout.splitlines() if result.returncode == 0 else []:
         pid, _, name = line.partition(" ")
         if pid.isdigit():
-            panes[int(pid)] = name
+            roots[int(pid)] = name
+    children = process_children() if roots else {}
+    for root, name in roots.items():
+        todo = [root]
+        while todo:  # The pane's program and everything it started, so a session that is a child of it is found too.
+            pid = todo.pop()
+            if panes.setdefault(pid, name) == name:
+                todo.extend(children.get(pid, ()))
     return panes
+
+
+def process_children():
+    """{process id: [its children]} for every process, from ps. Empty if ps can't be run."""
+    try:
+        result = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    children = {}
+    for line in result.stdout.splitlines():
+        columns = line.split()  # ps right-aligns its columns, so a line starts with spaces.
+        if len(columns) == 2 and all(c.isdigit() for c in columns):
+            children.setdefault(int(columns[1]), []).append(int(columns[0]))
+    return children
 
 
 def hosted_sessions():
@@ -4877,7 +4954,7 @@ def choose_answer(target, answer, text=None, by_number=True, press=True):
     On a tick-box question Enter would only tick or untick, and typing ticks "Type something" by itself,
     so after the text the highlight moves on to the Next or Submit line and Enter is pressed there."""
     send = lambda *keys: send_keys(target, *keys)
-    same = lambda option: option["key"] == answer["key"] and option["label"] == answer["label"]
+    same = lambda option: option["key"] == answer["key"] and same_label(option["label"], answer["label"])
     if answer["key"] and text is None and by_number:
         return send(answer["key"])
     if answer["key"] and answer["checked"] is None and text is not None:
@@ -5064,6 +5141,134 @@ def wait_for_screen(check, session_id, seconds):
     return False
 
 
+def await_copilot_input(session_id, cwd, trust_approved):
+    """Wait for a Copilot just started in a terminal to show an input box that has stopped changing, answering its
+    folder-trust question if the user approved that folder. Returns True, or why it didn't (the terminal is ended)."""
+    trust_answered, steady, last = False, 0, None
+    deadline = time.time() + START_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if session_id not in hosted_sessions():
+            return "The session exited right after starting."
+        screen = session_screen(session_id)
+        if COPILOT_TRUST.search(screen):
+            if not trust_approved:
+                kill_terminal(session_id)
+                return {"error": "This folder isn't trusted yet.", "needsTrust": True, "cwd": cwd}
+            if not trust_answered and not accept_copilot_trust(session_id):
+                shown = clean(session_screen(session_id))[-300:]
+                kill_terminal(session_id)
+                return f"Could not answer the trust prompt. Run copilot in {cwd} once and accept it, then retry. Its screen showed: {shown}"
+            trust_answered = True
+            continue
+        steady = steady + 1 if screen == last and input_box(screen) == "" else 0
+        last = screen
+        if steady >= COPILOT_SETTLE_STEPS:
+            return True
+        time.sleep(0.5)
+    shown = clean(session_screen(session_id))[-300:]
+    kill_terminal(session_id)
+    return "The session didn't start in time. Its screen showed: " + shown
+
+
+def resume_copilot_session(monitor, request):
+    """Bring an earlier Copilot session back in a hosted terminal. Copilot keeps its conversation, model and permissions."""
+    session_id = str(request.get("id", ""))
+    cwd = read_flat_yaml(os.path.join(COPILOT_STATE_DIR, session_id, "workspace.yaml")).get("cwd", "")
+    if monitor.current(session_id):
+        return False, "That session is already running."
+    if not os.path.isdir(cwd):
+        return False, f"Its folder no longer exists: {cwd or '(unknown)'}"
+    if not shutil.which("copilot"):
+        return False, "GitHub Copilot CLI (copilot) isn't installed, or isn't on your PATH."
+    started, error = new_terminal(session_id, cwd, ["copilot", f"--resume={session_id}"])
+    if not started:
+        return False, f"Could not start the session: {error}"
+    ready = await_copilot_input(session_id, cwd, same_folder(request.get("trust"), cwd))
+    return (True, "Started.") if ready is True else (False, ready)
+
+
+COPILOT_ENDING_SECONDS = 15
+COPILOT_OWN_CLIENT = "github/cli"  # The Copilot CLI. The desktop app and editors keep sessions here too, and are not ours to end.
+
+
+def end_process_tree(pid):
+    """Ask a process and everything it started to stop. Returns whether it has."""
+    if WINDOWS:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=15)
+    else:
+        children, todo, tree = process_children(), [pid], []
+        while todo:
+            current = todo.pop()
+            tree.append(current)
+            todo.extend(children.get(current, ()))
+        for victim in reversed(tree):  # Its children first.
+            with contextlib.suppress(OSError):
+                os.kill(victim, signal.SIGTERM)
+    deadline = time.time() + COPILOT_ENDING_SECONDS
+    while time.time() < deadline:
+        if not copilot_process(pid):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def adopt_copilot_session(monitor, request):
+    """Move a Copilot session from the terminal it was started in into the app, as /to-app does for Claude Code: the copy in
+    its terminal is ended and the same session is resumed here, with its conversation, model and permissions."""
+    session = monitor.current(str(request.get("id", "")))
+    if not session or session.get("provider") != "copilot":
+        return False, "That session is no longer running."
+    if session["hosted"]:
+        return False, "That session is already in the app."
+    if session["status"] != "idle":
+        return False, "It's working or waiting for you. Wait until it's idle, because moving it ends the copy in its terminal."
+    if session.get("client") != COPILOT_OWN_CLIENT:
+        return False, "That session belongs to another program, such as the Copilot app or an editor, which this can't end safely. Close it there, then resume it from Previous sessions."
+    pid = session.get("pid")
+    info = copilot_process(pid) if isinstance(pid, int) else None
+    if not info or not any(word in info[0].lower() for word in COPILOT_PROCESS_WORDS):
+        return False, "Its process is no longer running."
+    if not os.path.isdir(session.get("cwd") or ""):
+        return False, f"Its folder no longer exists: {session.get('cwd') or '(unknown)'}"
+    if not end_process_tree(pid):
+        return False, "Could not end the copy in its terminal, so nothing was moved."
+    _copilot_scan["at"] = 0  # Its lock file is still there; the process is what says it is gone.
+    wait_for_gone = time.time() + COPILOT_ENDING_SECONDS
+    while monitor.current(session["id"]) and time.time() < wait_for_gone:
+        time.sleep(0.3)
+    started, message = resume_copilot_session(monitor, {"id": session["id"], "trust": request.get("trust")})
+    if not started and isinstance(message, str):
+        message += f" The copy in its terminal was ended. Run: copilot --resume={session['id']}"
+    return started, message
+
+
+COPILOT_PREVIOUS_MAX = 15
+COPILOT_PREVIOUS_SECONDS = 20  # How often the sessions on disk are looked through.
+_copilot_previous = {"at": 0.0, "items": []}
+
+
+def copilot_previous_sessions():
+    """Earlier Copilot sessions that can be resumed, newest first, as the page lists Claude's: those Copilot has named
+    (it does once there is a conversation), used within KNOWN_KEEP_SECONDS, whose folder still exists."""
+    if _copilot_previous["at"] and time.monotonic() - _copilot_previous["at"] < COPILOT_PREVIOUS_SECONDS:
+        return list(_copilot_previous["items"])
+    items, names, now = [], read_names(), time.time()
+    try:
+        folders = [e.path for e in os.scandir(COPILOT_STATE_DIR) if e.is_dir()]
+    except OSError:
+        folders = []
+    for folder in folders:
+        meta = read_flat_yaml(os.path.join(folder, "workspace.yaml"))
+        session_id, updated = os.path.basename(folder), copilot_time(meta.get("updated_at"))
+        name = clean(names.get(session_id, "")) or clean(meta.get("name", ""))
+        if name and updated and now - updated <= KNOWN_KEEP_SECONDS and os.path.isdir(meta.get("cwd", "")):
+            items.append({"id": session_id, "name": name, "cwd": meta["cwd"], "title": "", "seen": updated, "provider": "copilot"})
+    items.sort(key=lambda item: item["seen"], reverse=True)
+    _copilot_previous.update(at=time.monotonic(), items=items[:MAX_KNOWN_SESSIONS])
+    return list(_copilot_previous["items"])
+
+
 def start_copilot_session(monitor, request):
     """Start a GitHub Copilot CLI session in a hosted terminal and give it its first message. Returns (succeeded, message).
 
@@ -5092,31 +5297,9 @@ def start_copilot_session(monitor, request):
     started, error = new_terminal(session_id, cwd, command)
     if not started:
         return False, f"Could not start the session: {error}"
-    trust_approved, trust_answered, steady, last = same_folder(request.get("trust"), cwd), False, 0, None
-    deadline = time.time() + START_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        if session_id not in hosted_sessions():
-            return False, "The session exited right after starting."
-        screen = session_screen(session_id)
-        if COPILOT_TRUST.search(screen):
-            if not trust_approved:
-                kill_terminal(session_id)
-                return False, {"error": "This folder isn't trusted yet.", "needsTrust": True, "cwd": cwd}
-            if not trust_answered and not accept_copilot_trust(session_id):
-                shown = clean(session_screen(session_id))[-300:]
-                kill_terminal(session_id)
-                return False, f"Could not answer the trust prompt. Run copilot in {cwd} once and accept it, then retry. Its screen showed: {shown}"
-            trust_answered = True
-            continue
-        steady = steady + 1 if screen == last and input_box(screen) == "" else 0
-        last = screen
-        if steady >= COPILOT_SETTLE_STEPS:
-            break
-        time.sleep(0.5)
-    else:
-        shown = clean(session_screen(session_id))[-300:]
-        kill_terminal(session_id)
-        return False, "The session didn't start in time. Its screen showed: " + shown
+    ready = await_copilot_input(session_id, cwd, same_folder(request.get("trust"), cwd))
+    if ready is not True:
+        return False, ready
     target = {"tmux": session_id}
     for _ in range(3):
         if not type_into(target, prompt, in_box="") or not send_keys(session_id, "Enter"):
@@ -5192,6 +5375,8 @@ def resume_session(monitor, request):
     session_id = str(request.get("id", ""))
     with monitor.lock:
         entry = read_known()["sessions"].get(session_id)
+    if not entry and SESSION_ID.match(session_id) and os.path.isfile(os.path.join(COPILOT_STATE_DIR, session_id, "workspace.yaml")):
+        return resume_copilot_session(monitor, request)
     if not entry or not SESSION_ID.match(session_id):
         return False, "That session is no longer remembered."
     if monitor.current(session_id):
@@ -5208,6 +5393,8 @@ def forget_session(monitor, request):
     with monitor.lock:
         known = read_known()
         known["sessions"].pop(session_id, None)
+        if SESSION_ID.match(session_id) and os.path.isdir(os.path.join(COPILOT_STATE_DIR, session_id)) and session_id not in known["hidden"]:
+            known["hidden"] = [*known["hidden"], session_id][-500:]
         write_known(known)
     return True, "Forgotten."
 
@@ -5218,7 +5405,7 @@ def set_remember(monitor, request):
         known = read_known()
         known["remember"] = bool(request.get("on"))
         if not known["remember"]:
-            known["sessions"] = {}
+            known["sessions"], known["hidden"] = {}, []
         write_known(known)
     return True, "Saved."
 
@@ -6446,7 +6633,7 @@ def press_key(monitor, request):
         # Checked against the menu as it is now, so an answer is only picked where it means the same thing.
         key, label = str(request.get("key", "")), request.get("label")
         options = menu_options(session_screen(session["tmux"]))
-        answer = next((o for o in options if o["key"] == key and o["label"] == label), None)
+        answer = next((o for o in options if o["key"] == key and same_label(o["label"], label)), None)
         if not answer:
             return False, "Those answers are no longer showing. Check the screen and try again."
         text = None
@@ -6923,6 +7110,7 @@ POST_ROUTES = {
     "/api/sessions/resend": resend_queued,
     "/api/sessions/refresh": save_and_refresh,
     "/api/sessions/resume": resume_session,
+    "/api/sessions/adopt": adopt_copilot_session,
     "/api/sessions/forget": forget_session,
     "/api/sessions/remember": set_remember,
     "/api/sessions/key": press_key,
@@ -8213,7 +8401,7 @@ textarea{min-height:110px;resize:vertical}
 <header><h1>Claude Sessions</h1><span id="summary">connecting…</span><span id="error"></span><button id="updateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="restartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><span id="usage" class="usage"></span><button id="devices">Devices</button><button id="phoneBtn" title="Use this app from your phone, on the same Wi-Fi" aria-label="Phone access"><svg viewBox="0 0 16 16" width="14" height="16" aria-hidden="true"><rect x="4" y="1.5" width="8" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 12h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="new" class="primary">New session</button></header>
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
-<dialog id="askDlg" aria-labelledby="askText"><form method="dialog" id="askForm"><p id="askText"></p><div class="askbtns"><button value="no" id="askNo">Cancel</button><button value="yes" id="askYes" class="primary">OK</button></div></form></dialog><dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><span id="histProv" class="prov"></span><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button><button id="histAllow" hidden title="Same as typing /allow-all: stop asking for permission in this session">Allow all</button><button id="histAuto" hidden title="Same as typing /autopilot: let it keep going without you">Autopilot</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
+<dialog id="askDlg" aria-labelledby="askText"><form method="dialog" id="askForm"><p id="askText"></p><div class="askbtns"><button value="no" id="askNo">Cancel</button><button value="yes" id="askYes" class="primary">OK</button></div></form></dialog><dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><span id="histProv" class="prov"></span><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histAdopt" hidden title="Ends the copy in its own terminal and carries on with the same session here">Move into app</button><button id="histEnd">End session</button><button id="histAllow" hidden title="Same as typing /allow-all: stop asking for permission in this session">Allow all</button><button id="histAuto" hidden title="Same as typing /autopilot: let it keep going without you">Autopilot</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="replyDraft" hidden><span id="replyDraftText"></span> <button id="replyDraftClear" type="button">Empty its input box</button></div><div id="queue" hidden></div>
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Slash commands: what they showed, side questions (/btw), and any panel open now" hidden>Commands</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabContext" type="button" role="tab" title="What fills this session's context window">Context</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Commands" hidden><section id="panelLive" aria-label="Panel open on its screen" hidden><h3 id="panelTitle"></h3><div class="reqnote">A command has this panel open on the session’s screen. Use the buttons as you would the keys. Messages wait in the queue until it closes.</div><pre id="panelText"></pre><div id="panelOpts" class="panelbtns"></div><div id="panelKeys" class="panelbtns"></div><form id="panelType"><input id="panelTypeText" aria-label="Type into the panel" placeholder="Type into it, such as to search or filter" maxlength="200" autocomplete="off"><button type="submit">Type</button></form><div id="panelErr" class="err"></div></section><div id="cmdHist"></div></div><div id="ctxBox" aria-label="Context" hidden></div><div id="startedBox" aria-label="Sessions it started" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
@@ -8437,7 +8625,7 @@ function ageText(at){return age(Math.max(0,Math.round(Date.now()/1000-at)))+' ag
 async function resumeSession(id,trust){
  const r=await fetch('/api/sessions/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,trust})});
  const d=await r.json().catch(()=>({error:'Unexpected response (HTTP '+r.status+').'}));
- if(d.needsTrust&&!trust&&await ask('Trust this folder? Claude Code will be able to read, edit and run files in '+d.cwd,{yes:'Trust it'}))return resumeSession(id,d.cwd);
+ if(d.needsTrust&&!trust&&await ask('Trust this folder? The session will be able to read, edit and run files in '+d.cwd,{yes:'Trust it'}))return resumeSession(id,d.cwd);
  return r.ok?'':d.error||'Could not resume that session.';
 }
 async function runPrevious(work){
@@ -8457,7 +8645,7 @@ function renderPrevious(list,remember){
  $('prevAll').hidden=list.length<2;$('prevAll').disabled=false;
  const rows=list.map(p=>{
   const row=el('div','prev'),text=el('div','prevtext',row);
-  el('b','',text,p.name||p.id.slice(0,8));
+  const who=el('b','',text);provBadge(el('span','prov',who),p);who.append(' '+(p.name||p.id.slice(0,8)));
   el('small','',text,p.cwd+' · last seen '+ageText(p.seen));
   if(p.title)el('small','',text,p.title);
   const go=el('button','primary',row,'Resume');go.type='button';
@@ -9250,6 +9438,7 @@ function updateFoot(s){
  $('histName').textContent=s.name;provBadge($('histProv'),s);
  const a=s.attention||{},permission=s.status==='waiting'&&a.kind==='permission',waiting=s.status==='waiting'&&!s.panel;
  $('histTerm').hidden=!(s.hosted||s.job);
+ $('histAdopt').hidden=!(s.provider==='copilot'&&!s.hosted&&s.client==='github/cli'&&s.status==='idle');
  $('histEnd').hidden=!s.hosted;
  const cop=s.provider==='copilot'&&s.hosted;
  $('histAllow').hidden=$('histAuto').hidden=!cop;
@@ -9262,14 +9451,14 @@ function updateFoot(s){
  $('screen').hidden=!(s.hosted&&waiting);
  const options=waiting&&menuOptions.at===String(a.at)?menuOptions.list:[];
  // A question that takes its own answer is answered from the reply box, not a box of its own.
- const own=s.hosted&&options.find(o=>/^Type something\b/.test(o.label));
+ const own=s.hosted&&options.find(o=>/^(?:Type something\b|Other \(type your answer)/.test(o.label));
  answerFor=own?{prompt:a.at,key:own.key,label:own.label}:null;
  const sendsNow=s.status==='idle'&&!(s.queue&&s.queue.length)&&!s.panel;
  $('replySend').textContent=answerFor?'Answer':sendsNow?'Send':'Queue';
  $('replyText').placeholder=s.panel&&!waiting&&!answerFor?'A command’s panel is open on its screen (see Commands). Messages wait until it closes.':answerFor?'Type your own answer, or pick one above (Enter to answer, Shift+Enter for a new line)':
   (sendsNow?'Reply…':waiting?'Queue a message for after you answer the prompt…':'Queue a message for when it finishes…')+' (Enter to '+(sendsNow?'send':'queue')+', Shift+Enter for a new line)';
  syncDraft(s);
- $('replyNote').textContent=s.hosted?'':s.job?'Started outside this app. To reply, use Open in terminal.':s.provider==='copilot'?'A GitHub Copilot session, shown read-only for now. Reply in its own terminal.':'Started in its own terminal. Reply there.';
+ $('replyNote').textContent=s.hosted?'':s.job?'Started outside this app. To reply, use Open in terminal.':s.provider==='copilot'?'A GitHub Copilot session started in its own terminal, so it is read-only here. Reply there, or use Move into app.':'Started in its own terminal. Reply there.';
  const want=!s.hosted?'':waiting&&options.length?'menu:'+a.at+':'+JSON.stringify(options):permission?'perm:'+a.at:waiting?'wait':s.status==='busy'?'busy':'';
  if(want===keysFor)return;
  keysFor=want;$('keys').replaceChildren();
@@ -9281,7 +9470,7 @@ function updateFoot(s){
    const [label,...more]=o.label.split(' · '),no=/^No\b/.test(label);
    const body={prompt:a.at,key:o.key,label:o.label};
    // Typed in the reply box instead. A tick on its own adds an empty answer, so it only shows to take one off.
-   if(/^Type something\b/.test(o.label)&&!o.checked)continue;
+   if(/^(?:Type something\b|Other \(type your answer)/.test(o.label)&&!o.checked)continue;
    const tick=o.checked===null?'':o.checked?'☑ ':'☐ ';
    const strong=permission?o.key==='1':/^Submit/.test(label);
    const b=keyButton(tick+label,strong?'primary':no||/^Cancel$/.test(label)?'deny':'',{action:'choose',...body});
@@ -9663,7 +9852,7 @@ $('panelType').addEventListener('submit',async e=>{
  else $('panelErr').textContent=$('replyErr').textContent;
 });
 // What fills the context window, from Claude Code's own /context, run separately on this conversation.
-const CTX_COLORS={'System prompt':'#3987e5','System tools':'#d95926','MCP tools':'#199e70','MCP server instructions':'#c98500','Skills':'#d55181','Memory files':'#0ca30c','Custom agents':'#9085e9','Messages':'#e66767'};
+const CTX_COLORS={'In use':'#a596ff','System prompt':'#3987e5','System tools':'#d95926','MCP tools':'#199e70','MCP server instructions':'#c98500','Skills':'#d55181','Memory files':'#0ca30c','Custom agents':'#9085e9','Messages':'#e66767'};
 function renderContext(c){
  const sig=JSON.stringify(c);
  if(sig===lastContext)return;
@@ -9975,6 +10164,9 @@ $('histRefresh').addEventListener('click',async()=>{
  if(s&&s.status!=='idle'&&!await ask('It\u2019s still working. Make a fresh start once it finishes? (Writes notes, clears the chat, then reads the notes and carries on.)',{yes:'Fresh start after'}))return;
  if(s&&s.status==='idle'&&!await ask('Save progress to the project\u2019s notes, clear this chat, then read the notes and carry on? The old conversation stays on disk but can\u2019t be resumed from this app.',{yes:'Fresh start'}))return;
  act('refresh',{id:histSession});
+});
+$('histAdopt').addEventListener('click',async()=>{
+ if(await ask('Move this session into the app? The copy running in its own terminal is ended, and anything typed there but not sent is lost. The same session carries on here, with its conversation.',{yes:'Move into app'})&&await act('adopt',{id:histSession}))await loadHistory();
 });
 $('histEnd').addEventListener('click',async()=>{
  if(await ask('End this session? Anything it is doing stops. The conversation is kept.',{yes:'End session',danger:true})&&await act('end',{id:histSession}))$('hist').close();

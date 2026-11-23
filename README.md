@@ -56,22 +56,31 @@ Running `copilot` sessions are listed beside Claude's, each marked with a **Clau
 (and a coloured edge on its card) so you can tell them apart at a glance, in the list and in the session
 view. They are read from the files Copilot keeps in `~/.copilot` (or `$COPILOT_HOME`), so nothing needs
 installing: you see what each one is doing, when it is waiting for a permission or a question, its model and
-context, the conversation and the files it changed.
+context, the conversation and the files it changed. `copilot` must be on your PATH to start or resume
+sessions from the app. Copilot's log format and screen are internal, so fields may go blank after an update.
 
-Copilot's log format and screen are internal, so fields may go blank after an update.
+**Started from the app** (**New session**, then **GitHub Copilot CLI**: ask first, allow everything, or
+autopilot), a Copilot session can be driven like Claude's:
 
-Sessions you start from the app (**New session**, then choose **GitHub Copilot CLI**: ask first, allow
-everything, or autopilot) can be driven from it like Claude's: reply, queue messages, approve or deny a
-permission, answer its questions, interrupt, switch on **Allow all** or **Autopilot**, and end it. The
-first message is checked against Copilot's own log and typed again if it didn't arrive. `/ask` works as
-`/btw` does for Claude: it's answered while the session carries on, the whole answer is read from the panel
-(the terminal is made big for a moment, so a long one isn't cut off) and kept under Commands, and the panel
-is closed again. Nothing is typed into the session while its panel is open; messages wait instead.
-Panels that Copilot's other commands open (`/model`, `/permissions`, `/session`, `/tasks`, `/rewind`, `/limits`,
-`/help`) are shown live as Claude's are, with a button for each key the panel's hint line offers, and what
-one showed is kept under Commands once it closes. What a command such as `/context` or `/usage` prints
-into the chat isn't, because Copilot doesn't record it. Copilot sessions
-you started in your own terminal are shown read-only; reply to those there. `copilot` must be on your PATH.
+- Reply, queue messages, interrupt, and end it. The first message is checked against Copilot's own log and
+  typed again if it didn't arrive.
+- Approve or deny a permission, answer its questions (including with text of your own), and switch on
+  **Allow all** or **Autopilot**. The reply box offers Copilot's own slash commands.
+- `/ask` works as `/btw` does for Claude: it's answered while the session carries on, the whole answer is
+  read from the panel (the terminal is made big for a moment, so a long one isn't cut off), kept under
+  Commands, and the panel is closed again.
+- The panels other commands open (`/model`, `/permissions`, `/session`, `/tasks`, `/rewind`, `/limits`, `/help`)
+  are shown live with a button for each key their hint line offers, and what one showed is kept under Commands
+  once it closes. Nothing is typed into the session while a panel is open; messages wait instead. What a
+  command such as `/context` or `/usage` prints into the chat isn't kept, because Copilot doesn't record it.
+- The **Context** tab shows how full its window is. Copilot reports the total, not what fills it.
+
+**Earlier sessions** appear under Previous sessions and can be resumed (Copilot brings back the conversation,
+model and permissions). Forgetting one only hides it from the list.
+
+**Started in your own terminal**, a session is shown read-only. If it was started by the Copilot CLI and is
+idle, **Move into app** ends the copy in its terminal and carries on with the same session in the app, as
+`/to-app` does for Claude Code. Sessions of the Copilot app or an editor are never ended from here.
 
 ## 3D printer cameras
 
