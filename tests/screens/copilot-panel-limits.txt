@@ -1,0 +1,14 @@
+ Session Limits
+ Session limits are opt-in. They apply across the current conversation; /clear and /new reset used AI credits but keep
+ the configured limit until you unset it.
+ The AI credit limit is a soft cap: usage is checked after model calls return, so one call may exceed the limit before
+ the next one is blocked.
+ Used in this session: 0.2 AI credits.
+
+ ❯ Max AI credits        not set
+
+ ↑/↓ to navigate · enter to select/change · esc to cancel
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+app | Copilot Fusion · Standard → GPT-6 Luna | Session: 0h 00m | Ctx: 8% | Today: 97 credits | Month: 3266 credits |
+Unlimited

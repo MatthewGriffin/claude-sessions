@@ -1175,9 +1175,9 @@ class Monitor:
             "tmux": target,
             "attention": self.copilot_attention(transcript),
             "heldBusy": False,
-            "panel": False,
+            "panel": bool(self.panels.get(session["sessionId"])),
             "waitingFor": "",
-            "draft": "",
+            "draft": self.drafts.get(session["sessionId"], "")[:MAX_REPLY_BYTES],
             "mode": self.copilot_mode_label(session["sessionId"], target, transcript),
         }
 
@@ -4817,6 +4817,9 @@ def claude_menu_options(screen):
 COPILOT_SCREEN = re.compile(
     r"^[╻╹][▄▀]{3,}|^ ?Copilot needs information\.?\s*$|^│ Do you (?:want to run this command|trust the files in this folder)\?"
     r"|^│ ↑/↓ to navigate · enter to select|^ ?↑/↓ select · enter accept", re.M)
+# A prompt Copilot raises itself, as against a panel a command opens. Its input box is only an earlier row
+# of the screen then, so the box's own glyphs say nothing.
+COPILOT_PROMPT = re.compile(r"^ ?Copilot needs information|^│ Do you (?:want to run this command|trust the files in this folder)\?", re.M)
 COPILOT_PANEL_HIGHLIGHT = re.compile(r"^│\s*❯\s+\d")
 COPILOT_MODE = re.compile(r"\b(Interactive|Autopilot|Plan)\s+·\s+(Manual Approval|Allow All)\b")
 COPILOT_WORKING = re.compile(r"^\s*○ Working\b[^\n]*?(?=\s{3,}|$)", re.M)
@@ -5950,8 +5953,86 @@ def hint_keys(hint):
     return found
 
 
-def command_panel(screen):
+# Copilot's panels (/model, /permissions, /session, /tasks, /rewind, /help, /limits, /settings) replace its input
+# box and end in a hint line of keys just above its two status lines. The hints are written several ways
+# ("enter to select", "↑/↓ navigate", "Esc Cancel", "a levels:all", "1-3 to select"), and Esc closes them all.
+COPILOT_FOOTER = re.compile(r"\|\s*Session:\s*\d+h\s*\d+m\s*\|")
+COPILOT_RULE = re.compile(r"^[│ ]*─{10,}")
+COPILOT_PANEL_LINES = 70  # How far above its hint a panel's text can start.
+
+
+def copilot_hint_keys(hint):
+    """[{label, keys: [tmux key...]}] for each part of a Copilot hint line: "KEY to ACTION", "KEY action" or "1-3 to select"."""
+    found = []
+    for part in hint.split("·"):
+        match = re.match(r"^\s*(\S+)\s*(?:to\s+)?(.*?)\s*$", part)
+        if not match:
+            continue
+        spec, action = match.groups()
+        digits = re.fullmatch(r"(\d)-(\d)", spec)
+        if digits:
+            keys = [str(n) for n in range(int(digits.group(1)), int(digits.group(2)) + 1)]
+        else:
+            pieces = spec.split("/") if spec != "/" else ["/"]
+            if len(pieces) == 2 and pieces[0].startswith("⇧") and not pieces[1].startswith("⇧"):
+                pieces[1] = "⇧" + pieces[1]
+            keys = [panel_key(piece) for piece in pieces]
+        if keys and all(keys):
+            found.append({"label": f"{spec}: {action}" if action else spec, "keys": keys})
+    return found
+
+
+def copilot_command_panel(screen):
+    """The panel a Copilot command has open: {title, text, hint, keys, options}, or None. A question or prompt
+    of its own (permission, folder trust, ask_user) and the /ask panel are other things and have their own handling."""
+    if COPILOT_PROMPT.search(screen) or copilot_input_box(screen) is not None or copilot_ask_panel(screen):
+        return None
+    lines = [re.sub(r"[\s┃]+$", "", line) for line in screen.split("\n")]
+    # Its two status lines are under a panel, except one that takes the whole screen (/help, /settings).
+    footer = next((i for i in range(len(lines) - 1, -1, -1) if COPILOT_FOOTER.search(lines[i])), None)
+    unframe = lambda line: re.sub(r"\s*│$", "", re.sub(r"^│ ?", "", line)).strip()
+    end = len(lines) if footer is None else footer
+    # Under the hint can be blank lines, the bottom of a bordered panel, or a closing rule.
+    while end > 0 and (not lines[end - 1].strip() or lines[end - 1].startswith("╰") or COPILOT_RULE.match(lines[end - 1])):
+        end -= 1
+    first = end
+    while first > 0 and end - first < 2 and ("·" in lines[first - 1] or re.search(r"\besc\b", lines[first - 1], re.I)) and lines[first - 1].strip():
+        first -= 1
+    hint = " ".join(unframe(line) for line in lines[first:end])
+    if not re.search(r"\besc\b", unframe(lines[end - 1]) if end else "", re.I):
+        return None
+    framed = lines[first].startswith("│")
+    floor = max(0, first - COPILOT_PANEL_LINES)
+    if framed:
+        start = next((i for i in range(first - 1, floor - 1, -1) if lines[i].startswith("╭")), None)
+        start = start + 1 if start is not None else first
+    else:
+        start = next((i for i in range(first - 1, floor - 1, -1) if COPILOT_RULE.match(lines[i])), None)
+        if start is None and footer is None:  # It takes the whole screen.
+            start = 0
+        elif start is None:  # No rule above it: the lines it ends, and the paragraph before if a blank line comes between.
+            start = first
+            for _ in range(3):
+                while start > floor and not lines[start - 1].strip():
+                    start -= 1
+                while start > floor and lines[start - 1].strip() and not lines[start - 1].startswith(("╹", "╻")):  # Not into an old input box.
+                    start -= 1
+    body = [unframe(line) if framed else line for line in lines[start:first]]
+    body = [line for line in body if not COPILOT_RULE.match(line) or not framed]
+    while body and not body[0].strip():
+        body.pop(0)
+    if not body:
+        return None
+    indent = min(len(line) - len(line.lstrip()) for line in body if line.strip())
+    text = "\n".join(line[indent:] for line in body)
+    title = next((line.strip() for line in body if line.strip() and not COPILOT_RULE.match(line)), "")
+    return {"title": title[:120], "text": text + "\n" + hint, "hint": hint, "keys": copilot_hint_keys(hint), "options": []}
+
+
+def command_panel(screen, copilot=False):
     """The panel a command has open at the bottom of the screen: {title, text, hint, keys, options}, or None."""
+    if copilot:
+        return copilot_command_panel(screen)
     if input_box(screen) is not None:
         return None
     lines = [line.rstrip() for line in screen.split("\n")]
@@ -5989,7 +6070,7 @@ def panel_open(session):
     if not session.get("tmux"):
         return False
     screen = session_screen(session["tmux"])
-    return command_panel(screen) is not None or copilot_ask_panel(screen) is not None
+    return command_panel(screen, session.get("provider") == "copilot") is not None or copilot_ask_panel(screen) is not None
 
 
 def watch_panels(monitor):
@@ -6002,7 +6083,7 @@ def watch_panels(monitor):
         if not session["hosted"] or not panel_allowed(session):
             continue
         screen = session_screen(session["tmux"])
-        panel = command_panel(screen)
+        panel = command_panel(screen, session.get("provider") == "copilot")
         if copilot_ask_panel(screen):  # A side question: it has its own entry, and nothing is kept when it closes.
             seen[session["id"]] = {"title": "/ask", "text": "", "keys": [], "options": [], "side": True}
         elif panel and not btw_panel(screen):  # Side questions have their own entries.
@@ -6318,7 +6399,7 @@ def panel_action(session, action, request):
     if not panel_allowed(session):
         return False, "It's waiting for an answer, so no panel is showing."
     target = session["tmux"]
-    panel = command_panel(session_screen(target))
+    panel = command_panel(session_screen(target), session.get("provider") == "copilot")
     if not panel:
         return False, "That panel has closed."
     if action == "panelkey":
@@ -10584,7 +10665,7 @@ def run_web(monitor, port, open_browser, app_browser_command=None, browser_pid=N
                 if session and session["hosted"]:
                     screen = session_screen(session["tmux"])
                     self.send_json(200, {"screen": screen, "live": live_activity(screen), "options": menu_options(screen),
-                                         "panel": command_panel(screen)})
+                                         "panel": command_panel(screen, session.get("provider") == "copilot")})
                 else:
                     self.send_json(404, {"error": "Not available for this session."})
             else:

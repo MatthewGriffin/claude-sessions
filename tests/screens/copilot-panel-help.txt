@@ -1,0 +1,40 @@
+  GLOBAL                                                                                                               ┃
+                                                                                                                       ┃
+    /help                 show full help                                                                               ┃
+    ?                     show quick help                                                                              ┃
+    /                     commands                                                                                     ┃
+    @                     mention files and opted-in sessions                                                          ┃
+    #                     mention issues and pull requests                                                             ┃
+    !                     execute shell command                                                                        ┃
+    shift+tab             switch modes                                                                                 ┃
+    ctrl+s                stash/pop current prompt                                                                     ┃
+    ctrl+q                enqueue prompt                                                                               ┃
+    ctrl+r                reverse search history                                                                       ┃
+    ctrl+o                toggle all timeline                                                                          ┃
+    ctrl+c                cancel                                                                                       ┃
+    ctrl+c×2              exit                                                                                         ┃
+    esc esc               clear input, interrupt, stop agents, or rewind                                               ┃
+    ctrl+d                exit on an empty prompt, else delete next character                                          ┃
+    ctrl+z                suspend (on Windows: exit on an empty prompt)                                                ┃
+    ctrl+l                clear screen                                                                                 ┃
+    ctrl+t                toggle reasoning display                                                                     ┃
+    ctrl+y                open plan or research report in your editor; accept completion in a picker                   ┃
+    space                 hold to record voice input while voice mode is on (/voice)                                   ┃
+    ctrl+space            start or stop voice dictation (also ctrl+x → v)                                              ┃
+    ctrl+x → b            move current task to background                                                              ┃
+    ctrl+x → g            collapse or expand the autopilot goal panel                                                  ┃
+    ctrl+x → o            open most recent link                                                                        ┃
+                                                                                                                       ┃
+  INPUT                                                                                                                ┃
+                                                                                                                       ┃
+    ctrl+a                go to line start                                                                             ┃
+    ctrl+e                go to line end                                                                               ┃
+    ctrl+h                delete previous character (previous word in local Windows terminals)                         ┃
+    ctrl+w                delete previous word                                                                         ┃
+    ctrl+u                delete from cursor to beginning of line                                                      ┃
+    ctrl+k                delete from cursor to end of line                                                            ┃
+    meta+←/→              move cursor by word                                                                          ┃
+    shift+enter           insert newline (see /terminal-setup)                                                         ┃
+    ctrl+j                insert newline in any terminal (so does \ then enter)                                        ┃
+    ctrl+g                edit prompt in $EDITOR                                                                       ┃
+↑/↓ scroll · esc close

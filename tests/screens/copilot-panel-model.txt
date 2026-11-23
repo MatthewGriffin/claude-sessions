@@ -1,0 +1,32 @@
+
+   Optimize for
+     Standard — Prioritizes versatile models for efficient everyday coding.
+     High — Prioritizes capable models for challenging tasks and deeper reasoning.
+     Max — Prioritizes the most capable models for the most demanding tasks and complex reasoning.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Session only. Copilot Fusion chooses a model; it does not change Autopilot or Assisted Permissions. Use `/config
+ model` for future sessions.
+
+                                                   Tier                                                               ┃
+ ❯ Copilot Fusion ✓                                ← Standard →                                                       ┃
+                                                                                                                      ┃
+                                                   Context    Reasoning   Status                                      ┃
+   Recent models                                                                                                      ┃
+   GPT-5.6 Luna                                    200K       Medium                                                  ┃
+                                                                                                                      ┃
+   Local and self-hosted                                                                                              ┃
+   hf.co/mmnga/Qwen3-4B-Thinking-2507-gguf:Q4_K_M  262K       —           Discovered                                  ┃
+   llama3.2:1b                                     131K       —           Discovered                                  ┃
+                                                                                                                      ┃
+   Recommended models                                                                                                 ┃
+   MAI Code 2 Flash *                              922K       Medium                                                  ┃
+
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  ❯  Search models…
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+ ↑/↓ to navigate · ←/→ routing profile · tab context window · shift+tab group: recommended · ctrl+r rescan providers ·
+ enter to select · esc to cancel
+app | Copilot Fusion · Standard → GPT-6 Luna | Session: 0h 00m | Ctx: 8% | Today: 97 credits | Month: 3266 credits |
+Unlimited

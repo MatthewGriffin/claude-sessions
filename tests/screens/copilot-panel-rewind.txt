@@ -1,0 +1,12 @@
+          /memory on    - Enable memory                                                                                ┃
+          /memory off   - Disable memory                                                                               ┃
+                                                                                                                       ┃
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Rewind to a previous point                                                                                           │
+│                                                                                                                      │
+│ ❯  1. Reply with exactly the word hi. (1m ago)                                                                       │
+│                                                                                                                      │
+│ ↑↓ Navigate · Enter Select · Esc Cancel                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+app | Copilot Fusion · Standard → GPT-6 Luna | Session: 0h 00m | Ctx: 8% | Today: 97 credits | Month: 3266 credits |
+Unlimited
