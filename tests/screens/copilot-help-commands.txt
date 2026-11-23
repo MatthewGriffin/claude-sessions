@@ -1,0 +1,10 @@
+Interactive Mode Commands:
+
+  Session:
+    /model      Select the AI model for this session (use 'auto' to let Copilot pick automatically). Use /config model to set the user default, '--repo'/'--local' to set the repo default, or 'plan'/'--plan' to set the plan-mode model.
+    /autopilot  Toggle autopilot mode, or set an autopilot objective with an optional AI-credit limit (--max-ai-credits)
+    /allow-all            Enable all permissions (tools, paths, and URLs)
+    /context   Show context window token usage for the current model, split into System Prompt, Custom Instructions, System Tools, MCP Tools, Messages, Free Space and Buffer (room reserved for the reply and compaction). Experimental mode adds usage per skill, subagent, MCP server, tool and plugin, and the largest messages.
+    /session   View and manage sessions. Use subcommands for details.
+    /compact   Summarize conversation history to reduce context window usage. Optionally provide focus instructions.
+    /ask                 Ask a side question or reopen a recently cached answer without adding to history
