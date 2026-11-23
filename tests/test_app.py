@@ -47,6 +47,7 @@ def load(path, name):
 
 CONFIG = tempfile.mkdtemp(prefix="claude-sessions-test-")
 os.environ["CLAUDE_CONFIG_DIR"] = CONFIG
+os.environ["COPILOT_HOME"] = tempfile.mkdtemp(prefix="copilot-sessions-test-")  # So no test sees the real Copilot sessions.
 os.environ["CLAUDE_SESSIONS_TMUX_SOCKET"] = "claude-sessions-test-" + secrets.token_hex(4)
 os.environ["CLAUDE_SESSIONS_HOST_PORT"] = str(18000 + secrets.randbelow(2000))
 app = load(SOURCE, "claude_monitor")
@@ -2495,3 +2496,578 @@ class TaskNotificationTextTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in messages], ["system", "you"])
         self.assertEqual(messages[0]["text"], "Done")
         self.assertEqual(messages[1]["text"], "and then stop")
+
+
+class CopilotSessionTests(unittest.TestCase):
+    """GitHub Copilot CLI sessions, read from the files Copilot keeps under ~/.copilot/session-state."""
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp(prefix="copilot-state-")
+        self.saved = app.COPILOT_STATE_DIR, app.copilot_process, app.subprocess.run, app.SESSIONS_DIR, app.hosted_panes
+        app.COPILOT_STATE_DIR = self.state
+        app.SESSIONS_DIR = tempfile.mkdtemp(prefix="claude-sessions-files-")
+        app.hosted_panes = lambda: {}
+        app.subprocess.run = lambda command, *a, **k: subprocess.CompletedProcess(command, 0, "[]", "")
+        self.processes = {}  # pid -> (program, start time); a pid that isn't here isn't running.
+        app.copilot_process = lambda pid: self.processes.get(pid)
+        app._copilot_scan["at"] = 0
+        self.clock = 0
+
+    def tearDown(self):
+        app.COPILOT_STATE_DIR, app.copilot_process, app.subprocess.run, app.SESSIONS_DIR, app.hosted_panes = self.saved
+        app._copilot_scan["at"] = 0
+        shutil.rmtree(self.state, ignore_errors=True)
+
+    def session(self, session_id, pid=None, program="copilot.exe", events=(), name="", cwd="C:\\work\\app"):
+        folder = os.path.join(self.state, session_id)
+        os.makedirs(folder)
+        with open(os.path.join(folder, "workspace.yaml"), "w") as handle:
+            handle.write(f"id: {session_id}\ncwd: {cwd}\nname: {name}\ncreated_at: 2026-11-20T15:08:34.448Z\n")
+        if pid:
+            lock = os.path.join(folder, f"inuse.{pid}.lock")
+            with open(lock, "w") as handle:
+                handle.write(str(pid))
+            self.processes[pid] = (program, os.path.getmtime(lock) - 30)
+        if events:
+            self.log(session_id, *events)
+        return folder
+
+    def log(self, session_id, *events):
+        with open(os.path.join(self.state, session_id, "events.jsonl"), "a", encoding="utf-8") as handle:
+            for kind, data in events:
+                self.clock += 1
+                stamp = f"2026-11-20T15:{self.clock // 60:02d}:{self.clock % 60:02d}.000Z"
+                handle.write(json.dumps({"type": kind, "data": data, "id": str(self.clock), "timestamp": stamp}) + "\n")
+
+    def transcript(self, session_id):
+        transcript = app.CopilotTranscript(session_id)
+        transcript.poll()
+        return transcript
+
+    def test_lists_only_sessions_with_a_running_copilot(self):
+        self.session("live", pid=101)
+        self.session("crashed", pid=102)
+        del self.processes[102]  # Its lock file stayed behind.
+        self.session("reused", pid=103, program="chrome.exe")  # Its process id now belongs to something else.
+        self.session("node-hosted", pid=104, program="node.exe")
+        self.session("ended")
+        self.assertEqual([s["sessionId"] for s in app.copilot_live_sessions()], ["live", "node-hosted"])
+
+    def test_a_process_that_started_after_the_lock_is_not_its_owner(self):
+        folder = self.session("later", pid=105)
+        self.processes[105] = ("copilot.exe", os.path.getmtime(os.path.join(folder, "inuse.105.lock")) + 600)
+        self.assertEqual(app.copilot_live_sessions(), [])
+
+    def test_listing_says_what_a_session_is(self):
+        self.session("abc", pid=101, name="Fix the build", cwd="C:\\repos\\api")
+        (listed,) = app.copilot_live_sessions()
+        self.assertEqual((listed["provider"], listed["name"], listed["cwd"], listed["pid"]), ("copilot", "Fix the build", "C:\\repos\\api", 101))
+        self.assertGreater(listed["startedAt"], 0)
+
+    def test_state_follows_the_log(self):
+        self.session("s", pid=101, events=[("session.start", {"selectedModel": "gpt-6-luna"}), ("user.message", {"content": "do it"})])
+        self.assertEqual(self.transcript("s").state, "idle")
+        self.log("s", ("assistant.turn_start", {}), ("tool.execution_start", {"toolCallId": "t1", "toolName": "powershell", "arguments": {"command": "git status"}}))
+        working = self.transcript("s")
+        self.assertEqual((working.state, list(working.pending.values())), ("working", ["powershell: git status"]))
+        self.log("s", ("permission.requested", {"requestId": "r1", "permissionRequest": {"kind": "shell", "intention": "Check the repo"}}))
+        waiting = self.transcript("s")
+        self.assertEqual((waiting.state, {k: v for k, v in waiting.attention().items() if k != "at"}), ("waiting", {"kind": "permission", "message": "Check the repo"}))
+        self.assertGreater(waiting.attention()["at"], 0)
+        self.log("s", ("permission.completed", {"requestId": "r1", "result": {"kind": "approved"}}),
+                 ("tool.execution_complete", {"toolCallId": "t1", "success": True, "result": {"content": "clean"}}),
+                 ("assistant.turn_end", {}))
+        done = self.transcript("s")
+        self.assertEqual((done.state, done.attention(), done.pending), ("idle", None, {}))
+
+    def test_a_question_is_waiting_too(self):
+        self.session("s", pid=101, events=[("assistant.turn_start", {}), ("tool.execution_start", {"toolCallId": "q1", "toolName": "ask_user", "arguments": {"message": "Which folder?"}})])
+        transcript = self.transcript("s")
+        wanted = transcript.attention()
+        self.assertEqual((transcript.state, wanted["kind"], wanted["message"]), ("waiting", "question", "Which folder?"))
+        self.assertGreater(wanted["at"], 0)  # When it was raised, so an answer can be tied to it.
+
+    def test_a_session_that_shut_down_is_not_left_waiting(self):
+        self.session("s", events=[("assistant.turn_start", {}), ("permission.requested", {"requestId": "r", "permissionRequest": {"kind": "shell"}}), ("session.shutdown", {})])
+        self.assertEqual(self.transcript("s").state, "idle")
+
+    def test_model_and_context_come_from_the_log(self):
+        self.session("s", events=[
+            ("assistant.message", {"model": "gpt-6-luna", "content": "Hello"}),
+            ("session.usage_record", {"usage": {"inputTokens": 20000, "cacheReadTokens": 5000, "maxPromptTokens": 250000}}),
+        ])
+        transcript = self.transcript("s")
+        self.assertEqual((transcript.model, transcript.text, transcript.context, transcript.context_percent), ("gpt-6-luna", "Hello", 25000, 10))
+
+    def test_logs_are_read_as_they_grow(self):
+        self.session("s", events=[("user.message", {"content": "one"})])
+        transcript = self.transcript("s")
+        self.log("s", ("user.message", {"content": "two"}))
+        transcript.poll()
+        self.assertEqual((transcript.human_messages, transcript.prompt), (2, "two"))
+
+    def test_sessions_say_which_program_they_are(self):
+        self.session("cop", pid=101, name="copilot work", events=[("user.message", {"content": "hi"})])
+        app.subprocess.run = lambda command, *a, **k: subprocess.CompletedProcess(
+            command, 0, json.dumps([{"pid": 7, "sessionId": "cla", "status": "idle", "name": "claude work", "startedAt": 1, "cwd": "/"}]), "")
+        monitor = app.Monitor()
+        monitor.refresh()
+        states = {s["id"]: s for s in map(monitor.session_state, monitor.sessions)}
+        self.assertEqual({k: v["provider"] for k, v in states.items()}, {"cla": "claude", "cop": "copilot"})
+        self.assertFalse(states["cop"]["hosted"])
+        self.assertEqual(states["cop"]["status"], "idle")
+
+    def test_waiting_shows_as_needing_you(self):
+        self.session("cop", pid=101, events=[("assistant.turn_start", {}), ("permission.requested", {"requestId": "r", "permissionRequest": {"kind": "shell", "intention": "Write a file"}})])
+        monitor = app.Monitor()
+        monitor.refresh()
+        (state,) = map(monitor.session_state, monitor.sessions)
+        self.assertEqual(state["status"], "waiting")
+        self.assertEqual((state["attention"]["kind"], state["attention"]["message"]), ("permission", "Write a file"))
+
+    def test_copilot_sessions_are_never_offered_for_claude_to_resume(self):
+        self.session("cop", pid=101, events=[("user.message", {"content": "hi"})])
+        monitor = app.Monitor()
+        monitor.refresh()
+        monitor._update_known([monitor.session_state(s) for s in monitor.sessions])
+        self.assertEqual(app.read_known()["sessions"], {})
+        self.assertEqual(monitor.previous, [])
+
+    def test_actions_are_refused_for_a_session_the_app_does_not_host(self):
+        self.session("cop", pid=101)
+        monitor = app.Monitor()
+        monitor.refresh()
+        self.assertEqual(app.end_session(monitor, {"id": "cop"}), (False, app.NOT_HOSTED))
+
+    def read_history(self, *events):
+        self.session("h", events=list(events))
+        reader = app.CopilotHistoryReader(os.path.join(self.state, "h", "events.jsonl"))
+        reader.poll()
+        return reader
+
+    def test_history_reads_the_conversation(self):
+        reader = self.read_history(
+            ("session.start", {"selectedModel": "gpt-6-luna", "context": {"cwd": "C:\\work"}}),
+            ("user.message", {"content": "list files"}),
+            ("assistant.message", {"content": "Looking.", "model": "gpt-6-luna"}),
+            ("tool.execution_start", {"toolCallId": "t1", "toolName": "powershell", "arguments": {"command": "ls", "description": "List"}}),
+            ("tool.execution_complete", {"toolCallId": "t1", "success": True, "result": {"content": "a.txt\nb.txt"}}),
+            ("assistant.message", {"content": "Two files."}),
+        )
+        self.assertEqual([m["role"] for m in reader.messages], ["you", "claude", "tool", "claude"])
+        tool = reader.messages[2]
+        self.assertEqual((tool["text"], tool["pending"], tool["error"], tool["result"]), ("powershell: List", False, False, "a.txt\nb.txt"))
+        self.assertEqual(reader.tool_details("t1")["result"], "a.txt\nb.txt")
+
+    def test_a_failed_tool_is_marked_failed(self):
+        reader = self.read_history(
+            ("tool.execution_start", {"toolCallId": "t1", "toolName": "powershell", "arguments": "exit 3"}),
+            ("tool.execution_complete", {"toolCallId": "t1", "success": False, "error": {"message": "exit code 3"}}),
+        )
+        self.assertEqual((reader.messages[0]["error"], reader.messages[0]["result"]), (True, "exit code 3"))
+
+    def test_changed_files_come_from_the_diff_copilot_reports(self):
+        diff = ("\ndiff --git a/C:/work/app.py b/C:/work/app.py\nindex 1..2 100644\n--- a/C:/work/app.py\n+++ b/C:/work/app.py\n"
+                "@@ -10,3 +10,4 @@ def run():\n     keep\n-    old\n+    new\n+    more\n     tail\n")
+        reader = self.read_history(
+            ("user.message", {"content": "change it"}),
+            ("tool.execution_start", {"toolCallId": "e1", "toolName": "edit", "arguments": {"path": "C:\\work\\app.py", "old_str": "old", "new_str": "new"}}),
+            ("tool.execution_complete", {"toolCallId": "e1", "success": True, "fileEdits": [{"path": "C:\\work\\app.py", "kind": "edit"}],
+                                         "result": {"content": "Modified 1 file(s)", "detailedContent": diff}}),
+        )
+        (change,) = reader.changes()["files"]
+        self.assertEqual((change["path"], change["added"], change["removed"], change["created"]), ("C:/work/app.py", 2, 1, False))
+        self.assertEqual(change["hunks"][0]["newStart"], 10)
+
+    def test_a_patch_given_as_text_still_counts_when_no_diff_is_reported(self):
+        patch = "*** Begin Patch\n*** Add File: notes.md\n+hello\n+world\n*** End Patch"
+        reader = self.read_history(
+            ("session.start", {"context": {"cwd": self.state}}),
+            ("tool.execution_start", {"toolCallId": "p1", "toolName": "apply_patch", "arguments": patch}),
+            ("tool.execution_complete", {"toolCallId": "p1", "success": True, "result": {"content": "ok"}}),
+        )
+        (change,) = reader.changes()["files"]
+        self.assertEqual((change["path"], change["created"], change["added"]), (os.path.join(self.state, "notes.md"), True, 2))
+
+    def test_failed_edits_change_nothing(self):
+        reader = self.read_history(
+            ("tool.execution_start", {"toolCallId": "e1", "toolName": "create", "arguments": {"path": "x.txt", "file_text": "hi"}}),
+            ("tool.execution_complete", {"toolCallId": "e1", "success": False, "error": {"message": "denied"}}),
+        )
+        self.assertEqual(reader.changes()["files"], [])
+
+    def test_the_page_marks_every_session_with_its_program(self):
+        for expected in ("const PROVIDERS=", "function provBadge(", "provBadge(c.prov,s)", 'id="histProv"', "provBadge($('histProv'),s)"):
+            self.assertIn(expected, app.PAGE)
+        self.assertIn("'GitHub Copilot CLI session'", app.PAGE)
+        self.assertIn("'Claude Code session'", app.PAGE)
+
+
+SCREENS = os.path.join(ROOT, "tests", "screens")
+
+
+def screen_of(name):
+    """A screen captured from the real program, as the app reads it."""
+    with open(os.path.join(SCREENS, name), encoding="utf-8") as handle:
+        return app.HISTORY_CONTROL_CHARS.sub(" ", handle.read()).strip()
+
+
+class CopilotScreenTests(unittest.TestCase):
+    """Reading GitHub Copilot CLI's terminal, from screens captured from the real program."""
+
+    def test_its_screens_are_told_from_claudes(self):
+        for name in ("copilot-idle.txt", "copilot-permission.txt", "copilot-question.txt", "copilot-trust.txt", "copilot-working.txt"):
+            self.assertTrue(app.is_copilot_screen(screen_of(name)), name)
+        claude = "● Done.\n\n────────────\n❯ \n────────────\n  ? for shortcuts"
+        self.assertFalse(app.is_copilot_screen(claude))
+        self.assertEqual(app.input_box(claude), "")  # Still read as Claude Code's.
+
+    def test_a_conversation_that_quotes_a_question_is_not_taken_for_copilot(self):
+        quoted = "● It asks: Do you trust the files in this folder?\n  and shows Copilot needs information.\n\n────────────\n❯ \n────────────"
+        self.assertFalse(app.is_copilot_screen(quoted))
+
+    def test_the_input_box(self):
+        self.assertEqual(app.input_box(screen_of("copilot-idle.txt")), "")
+        self.assertEqual(app.input_box(screen_of("copilot-working.txt")), "")
+        typed = screen_of("copilot-idle.txt").replace("┃\n", "┃ half a thought\n", 1)
+        self.assertEqual(app.input_box(typed), "half a thought")
+        for name in ("copilot-permission.txt", "copilot-question.txt", "copilot-trust.txt"):
+            self.assertIsNone(app.input_box(screen_of(name)), name)  # A question replaces the box.
+
+    def test_a_permission_menu(self):
+        options = app.menu_options(screen_of("copilot-permission.txt"))
+        self.assertEqual([(o["key"], o["label"][:3], o["highlighted"]) for o in options], [("1", "Yes", True), ("2", "Yes", False), ("3", "No,", False)])
+
+    def test_the_folder_trust_menu(self):
+        options = app.menu_options(screen_of("copilot-trust.txt"))
+        self.assertEqual([o["label"] for o in options], ["Yes", "Yes, and remember this folder for future sessions", "No (Esc)"])
+        self.assertTrue(app.COPILOT_TRUST.search(screen_of("copilot-trust.txt")))
+        self.assertFalse(app.COPILOT_TRUST.search(screen_of("copilot-idle.txt")))
+
+    def test_a_question_it_asks(self):
+        options = app.menu_options(screen_of("copilot-question.txt"))
+        self.assertEqual([(o["key"], o["label"], o["highlighted"]) for o in options],
+                         [("", "red", True), ("", "blue", False), ("", "Other (type your answer)", False)])
+
+    def test_no_menu_on_screens_without_one(self):
+        for name in ("copilot-idle.txt", "copilot-working.txt", "copilot-allowall.txt"):
+            self.assertEqual(app.menu_options(screen_of(name)), [], name)
+
+    def test_its_mode_comes_from_the_footer(self):
+        self.assertEqual(app.copilot_mode(screen_of("copilot-idle.txt")), {"run": "interactive", "approval": "manual"})
+        self.assertEqual(app.copilot_mode(screen_of("copilot-allowall.txt")), {"run": "interactive", "approval": "allow-all"})
+        self.assertEqual(app.copilot_mode(screen_of("copilot-autopilot.txt")), {"run": "autopilot", "approval": "allow-all"})
+        self.assertIsNone(app.copilot_mode(screen_of("copilot-working.txt")))  # The footer is the working line then.
+
+    def test_working_shows_as_activity(self):
+        self.assertIn("Working", app.live_activity(screen_of("copilot-working.txt"))["head"])
+        self.assertEqual(app.live_activity(screen_of("copilot-idle.txt"))["head"], "")
+
+    def test_the_host_answers_the_questions_it_waits_on(self):
+        asked = "\x1b]11;?\x1b\\\x1b]4;3;?\x07\x1b[14t\x1b[?996n\x1b[?2026$p\x1b[?u\x1b[>q"
+        answers = "".join(app.terminal_answers(asked))
+        for expected in ("\x1b]11;rgb:", "\x1b]4;3;rgb:", "\x1b[4;800;1200t", "\x1b[?997;1n", "\x1b[?2026;2$y", "\x1b[?0u"):
+            self.assertIn(expected, answers)
+        self.assertEqual(app.terminal_answers("plain output"), [])
+
+    def test_the_host_can_press_the_keys_copilot_uses(self):
+        self.assertEqual((app.TERMINAL_KEYS["C-c"], app.TERMINAL_KEYS["C-u"]), ("\x03", "\x15"))
+
+
+class CopilotHostedTests(unittest.TestCase):
+    """Copilot sessions the app started: shown as hosted, started, approved and interrupted."""
+
+    def setUp(self):
+        self.state = tempfile.mkdtemp(prefix="copilot-state-")
+        self.saved = {n: getattr(app, n) for n in ("COPILOT_STATE_DIR", "copilot_process", "subprocess", "SESSIONS_DIR", "hosted_panes", "session_screen",
+                                                   "new_terminal", "kill_terminal", "hosted_sessions", "type_into", "send_keys", "choose_answer", "hosted_session")}
+        app.COPILOT_STATE_DIR = self.state
+        app.SESSIONS_DIR = tempfile.mkdtemp(prefix="claude-sessions-files-")
+        app.subprocess = types.SimpleNamespace(**{k: getattr(subprocess, k) for k in dir(subprocess) if not k.startswith("_")})
+        app.subprocess.run = lambda command, *a, **k: subprocess.CompletedProcess(command, 0, "[]", "")
+        app.copilot_process = lambda pid: ("copilot.exe", 0)
+        app._copilot_scan["at"] = 0
+        self.screen = screen_of("copilot-idle.txt")
+        app.session_screen = lambda target: self.screen
+        folder = os.path.join(self.state, "cop")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "workspace.yaml"), "w") as handle:
+            handle.write("id: cop\ncwd: C:\\work\nname: hosted one\ncreated_at: 2026-11-20T15:08:34.448Z\n")
+        with open(os.path.join(folder, "inuse.101.lock"), "w") as handle:
+            handle.write("101")
+        self.keys = []
+        app.send_keys = lambda target, *keys: self.keys.append((target, keys)) or True
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+        app._copilot_scan["at"] = 0
+        shutil.rmtree(self.state, ignore_errors=True)
+
+    def state_of(self, panes):
+        app.hosted_panes = lambda: panes
+        monitor = app.Monitor()
+        monitor.refresh()
+        return monitor, [monitor.session_state(s) for s in monitor.sessions][0]
+
+    def test_a_session_in_the_hosts_terminal_is_hosted(self):
+        _, state = self.state_of({101: "term-1"})
+        self.assertEqual((state["hosted"], state["tmux"], state["provider"]), (True, "term-1", "copilot"))
+        _, state = self.state_of({})
+        self.assertEqual((state["hosted"], state["tmux"]), (False, None))
+
+    def test_the_mode_is_read_from_the_screen(self):
+        self.screen = screen_of("copilot-autopilot.txt")
+        _, state = self.state_of({101: "term-1"})
+        self.assertEqual(state["mode"], "Autopilot · allow all")
+        monitor, _ = self.state_of({101: "term-1"})
+        self.screen = screen_of("copilot-working.txt")  # No footer while it works: what was read stays.
+        monitor.copilot_modes["cop"] = (0, monitor.copilot_modes["cop"][1])
+        self.assertEqual(monitor.session_state(monitor.sessions[0])["mode"], "Autopilot · allow all")
+
+    def test_a_plain_session_shows_no_mode(self):
+        _, state = self.state_of({101: "term-1"})
+        self.assertEqual(state["mode"], "")
+
+    def waiting(self):
+        folder = os.path.join(self.state, "cop")
+        with open(os.path.join(folder, "events.jsonl"), "w") as handle:
+            for n, (kind, data) in enumerate([("assistant.turn_start", {}),
+                                              ("permission.requested", {"requestId": "r", "permissionRequest": {"kind": "shell", "intention": "Write a file"}})]):
+                handle.write(json.dumps({"type": kind, "data": data, "timestamp": f"2026-11-20T15:10:0{n}.000Z"}) + "\n")
+        self.screen = screen_of("copilot-permission.txt")
+
+    def test_a_prompt_is_tied_to_when_it_was_raised(self):
+        self.waiting()
+        monitor, state = self.state_of({101: "term-1"})
+        first = state["attention"]["at"]
+        monitor.cached = None
+        self.assertEqual(monitor.session_state(monitor.sessions[0])["attention"]["at"], first)  # Stable while it waits.
+
+    def test_approving_picks_yes_by_moving_to_it(self):
+        self.waiting()
+        picked = []
+        monitor, state = self.state_of({101: "term-1"})
+        app.hosted_session = lambda m, request: state
+        app.choose_answer = lambda target, answer, text=None, by_number=True, press=True: picked.append((target, answer["label"], by_number)) or True
+        result = app.press_key(monitor, {"id": "cop", "action": "approve", "prompt": state["attention"]["at"]})
+        self.assertEqual(result, (True, "Sent."))
+        self.assertEqual(picked, [("term-1", "Yes", False)])
+
+    def test_denying_and_interrupting(self):
+        self.waiting()
+        monitor, state = self.state_of({101: "term-1"})
+        app.hosted_session = lambda m, request: state
+        self.assertEqual(app.press_key(monitor, {"id": "cop", "action": "deny", "prompt": state["attention"]["at"]}), (True, "Sent."))
+        self.assertEqual(self.keys[-1], ("term-1", ("Escape",)))
+        busy = {**state, "status": "busy", "attention": None}
+        app.hosted_session = lambda m, request: busy
+        self.assertEqual(app.press_key(monitor, {"id": "cop", "action": "interrupt"}), (True, "Sent."))
+        self.assertEqual(self.keys[-1], ("term-1", ("C-c",)))
+
+    def start(self, **request):
+        sent = {}
+        app.new_terminal = lambda session_id, cwd, command: sent.update(id=session_id, cwd=cwd, command=command) or (False, "stop here")
+        result = app.start_session(app.Monitor(), {"provider": "copilot", "cwd": self.state, "prompt": "do it", **request})
+        return result, sent
+
+    def test_start_checks_its_request(self):
+        self.assertFalse(app.start_session(app.Monitor(), {"provider": "copilot", "cwd": "nowhere", "prompt": "x"})[0])
+        self.assertEqual(app.start_session(app.Monitor(), {"provider": "copilot", "cwd": self.state, "prompt": " "}), (False, "Enter what the session should do."))
+        self.assertIn("Permission mode", app.start_session(app.Monitor(), {"provider": "copilot", "cwd": self.state, "prompt": "x", "mode": "acceptEdits"})[1])
+
+    @unittest.skipUnless(shutil.which("copilot"), "needs copilot on the PATH")
+    def test_start_builds_copilots_command_line(self):
+        (ok, message), sent = self.start(name="My & <work>|^%", mode="autopilot")
+        self.assertFalse(ok)
+        self.assertEqual(sent["command"][0], "copilot")
+        self.assertEqual(sent["command"][1:3], ["--session-id", sent["id"]])
+        self.assertIn("--allow-all", sent["command"])
+        self.assertIn("--autopilot", sent["command"])
+        name = sent["command"][sent["command"].index("--name") + 1]
+        self.assertEqual(name, "My  work")  # Nothing a command line could read as more.
+        (_, _), plain = self.start()
+        self.assertEqual(plain["command"][3:], [])  # Ask first: no flags at all, and the message is typed, not passed.
+
+    @unittest.skipUnless(shutil.which("copilot"), "needs copilot on the PATH")
+    def test_an_untrusted_folder_asks_before_anything_is_accepted(self):
+        killed, started = [], []
+
+        def new_terminal(session_id, cwd, command):
+            started.append(session_id)
+            return True, ""
+
+        app.new_terminal = new_terminal
+        app.hosted_sessions = lambda: started  # It is running, and showing the trust question.
+        app.kill_terminal = lambda name: killed.append(name) or True
+        self.screen = screen_of("copilot-trust.txt")
+        ok, answer = app.start_session(app.Monitor(), {"provider": "copilot", "cwd": self.state, "prompt": "x"})
+        self.assertFalse(ok)
+        self.assertEqual((answer["needsTrust"], answer["cwd"]), (True, self.state))
+        self.assertEqual(killed, started)  # Nothing was accepted, and nothing is left waiting.
+
+    def test_a_window_of_its_own_resumes_with_copilot_not_claude(self):
+        opened = []
+        folder = tempfile.mkdtemp(prefix="copilot-folder-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        saved = app.kill_terminal, app.subprocess.Popen
+        app.kill_terminal = lambda name: True
+        app.subprocess.Popen = lambda command, *a, **k: opened.append(command)
+        self.addCleanup(lambda: (setattr(app, "kill_terminal", saved[0]), setattr(app.subprocess, "Popen", saved[1])))
+        session = {"id": "abc-123", "tmux": "term", "cwd": folder, "status": "idle", "provider": "copilot"}
+        self.assertTrue(app.hand_to_console(app.Monitor(), session)[0])
+        self.assertEqual(opened, [["cmd.exe", "/k", "copilot", "--resume=abc-123"]])
+
+    def test_the_page_offers_both_programs(self):
+        self.assertIn("$('histRefresh').hidden=!s.hosted||s.provider==='copilot'", app.PAGE)  # Fresh start is Claude Code's.
+        for expected in ('id="newProg"', "const NEW_MODES=", "provider:$('newProg').value", 'id="histAllow"', "'/allow-all'", "'/autopilot'"):
+            self.assertIn(expected, app.PAGE)
+
+
+class CopilotAskTests(unittest.TestCase):
+    """Copilot's /ask, which answers a side question in a panel, as Claude Code's /btw does."""
+
+    def setUp(self):
+        self.saved = {n: getattr(app, n) for n in ("session_screen", "send_keys", "resize_terminal", "restore_terminal", "hosted_sessions", "hosted_session", "send_btw_now", "BTW_FILE")}
+        app.BTW_FILE = os.path.join(tempfile.mkdtemp(prefix="ask-"), "commands.json")
+        self.addCleanup(shutil.rmtree, os.path.dirname(app.BTW_FILE), True)
+        self.keys, self.screen = [], screen_of("copilot-idle.txt")
+        app.session_screen = lambda target: self.screen
+        app.send_keys = lambda target, *keys: self.keys.append(keys) or True
+        app.hosted_sessions = lambda: ["term"]
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(app, name, value)
+
+    def test_each_state_of_the_panel(self):
+        thinking = app.copilot_ask_panel(screen_of("copilot-ask-thinking.txt"))
+        self.assertEqual((thinking["question"], thinking["done"], thinking["answer"]), ("what is 3 plus 3? answer in one word", False, ""))
+        streaming = app.copilot_ask_panel(screen_of("copilot-ask-streaming.txt"))
+        self.assertFalse(streaming["done"])  # Lines are arriving, but it isn't finished.
+        done = app.copilot_ask_panel(screen_of("copilot-ask-done.txt"))
+        self.assertEqual((done["done"], done["failed"], done["answer"]), (True, False, "Six"))
+
+    def test_an_error_is_told_from_an_answer(self):
+        failed = app.copilot_ask_panel(screen_of("copilot-ask-failed.txt"))
+        self.assertEqual((failed["done"], failed["failed"]), (True, True))
+        self.assertTrue(failed["answer"].startswith("Auto routing is unavailable"))
+
+    def test_a_long_answer_is_cut_until_expanded(self):
+        collapsed = app.copilot_ask_panel(screen_of("copilot-ask-collapsed.txt"))["answer"].splitlines()
+        self.assertEqual((len(collapsed), collapsed[0].strip(), collapsed[-1].strip()), (10, "31. Passion fruit", "40. Kumquat"))  # The scrollbar isn't text.
+        expanded = app.copilot_ask_panel(screen_of("copilot-ask-expanded.txt"))["answer"].splitlines()
+        self.assertEqual((len(expanded), expanded[-1].strip()), (34, "40. Watermelon"))
+
+    def test_other_screens_have_no_panel(self):
+        for name in ("copilot-idle.txt", "copilot-working.txt", "copilot-permission.txt", "copilot-question.txt"):
+            self.assertIsNone(app.copilot_ask_panel(screen_of(name)), name)
+        self.assertIsNone(app.command_panel(screen_of("copilot-ask-done.txt")))  # Not one of Claude Code's panels.
+
+    def test_the_side_question_command_depends_on_the_program(self):
+        copilot, claude = {"provider": "copilot"}, {"provider": "claude"}
+        self.assertEqual(app.side_question(copilot, "/ask  what   is this?"), "what is this?")
+        self.assertIsNone(app.side_question(copilot, "/btw what is this?"))
+        self.assertEqual(app.side_question(claude, "/btw what is this?"), "what is this?")
+        self.assertIsNone(app.side_question(claude, "/ask what is this?"))
+        self.assertIsNone(app.side_question(copilot, "/ask"))
+
+    def test_a_question_is_noted_with_the_command_it_used(self):
+        app.note_btw({"id": "c1", "tmux": "term", "provider": "copilot"}, "/ask why?")
+        app.note_btw({"id": "c2", "tmux": "term2", "provider": "claude"}, "/btw why?")
+        app.note_btw({"id": "c3", "tmux": "term3", "provider": "claude"}, "/ask nothing")  # Not a command for Claude Code.
+        self.assertEqual(app.btw_for("c1")[0]["verb"], "/ask")
+        self.assertEqual(app.btw_for("c2")[0]["verb"], "/btw")
+        self.assertEqual(app.btw_for("c3"), [])
+
+    def test_a_busy_session_answers_it_without_being_interrupted(self):
+        sent = []
+        app.send_btw_now = lambda session, text: sent.append(text) or (True, "Sent.")
+        busy = {"id": "c1", "tmux": "term", "provider": "copilot", "status": "busy"}
+        app.hosted_session = lambda monitor, request: busy
+        self.assertEqual(app.send_reply(None, {"id": "c1", "text": "/ask how is it going?"}), (True, "Sent."))
+        self.assertEqual(sent, ["/ask how is it going?"])
+        # For Claude Code that isn't a side question, so it waits its turn.
+        app.hosted_session = lambda monitor, request: {**busy, "provider": "claude"}
+        self.assertEqual(app.send_reply(None, {"id": "c1", "text": "/ask how is it going?"}), (True, "Queued."))
+        self.assertEqual(sent, ["/ask how is it going?"])
+
+    def watch(self, screens):
+        """Run the watcher once with the screen showing each of `screens` in turn."""
+        shown = iter(screens)
+        last = [None]
+
+        def session_screen(target):
+            last[0] = next(shown, last[0])
+            return last[0]
+
+        app.session_screen = session_screen
+        app.watch_btw(None)
+
+    def test_the_answer_is_read_and_the_panel_closed(self):
+        app.note_btw({"id": "c1", "tmux": "term", "provider": "copilot"}, "/ask what is 3 plus 3? answer in one word")
+        sizes = []
+        app.resize_terminal = lambda session_id, columns, rows: sizes.append((columns, rows)) or (120, 40)
+        app.restore_terminal = lambda session_id, size: sizes.append(size)
+        done = screen_of("copilot-ask-done.txt")
+        self.watch([done, done, done, done, done])
+        (entry,) = app.btw_for("c1")
+        self.assertEqual((entry["state"], entry["answer"]), ("answered", "Six"))
+        self.assertIn(("C-e",), self.keys)  # Expanded, to read all of it.
+        self.assertIn(("Escape",), self.keys)  # And closed, so the input box shows again.
+        self.assertEqual(sizes[-1], (120, 40))  # The terminal was put back as it was.
+
+    def test_a_long_answer_is_read_whole(self):
+        app.note_btw({"id": "c1", "tmux": "term", "provider": "copilot"}, "/ask list 40 different fruits, one per line, numbered, no other text")
+        app.resize_terminal = lambda session_id, columns, rows: (120, 40)
+        app.restore_terminal = lambda session_id, size: None
+        self.watch([screen_of("copilot-ask-collapsed.txt"), screen_of("copilot-ask-expanded.txt"), screen_of("copilot-ask-expanded.txt"),
+                    screen_of("copilot-ask-expanded.txt"), screen_of("copilot-ask-expanded.txt")])
+        (entry,) = app.btw_for("c1")
+        self.assertEqual(entry["state"], "answered")
+        self.assertEqual(len(entry["answer"].splitlines()), 34)
+
+    def test_an_answer_still_coming_is_waited_for(self):
+        app.note_btw({"id": "c1", "tmux": "term", "provider": "copilot"}, "/ask what is 3 plus 3? answer in one word")
+        self.watch([screen_of("copilot-ask-thinking.txt")])
+        self.assertEqual(app.btw_for("c1")[0]["state"], "answering")
+        self.assertNotIn(("Escape",), self.keys)  # Esc now would cancel it.
+
+    def test_a_question_that_isnt_the_one_sent_is_left_alone(self):
+        app.note_btw({"id": "c1", "tmux": "term", "provider": "copilot"}, "/ask something else entirely, so different")
+        self.watch([screen_of("copilot-ask-done.txt")])
+        self.assertEqual(app.btw_for("c1")[0]["state"], "answering")
+        self.assertEqual(self.keys, [])
+
+    def test_a_failed_question_shows_why(self):
+        app.note_btw({"id": "c1", "tmux": "term", "provider": "copilot"}, "/ask what is 2 plus 2? answer in one word")
+        app.resize_terminal = lambda *a: None  # Not resizable: what is showing is used.
+        failed = screen_of("copilot-ask-failed.txt")
+        self.watch([failed, failed, failed])
+        (entry,) = app.btw_for("c1")
+        self.assertEqual(entry["state"], "answered")
+        self.assertIn("Auto routing is unavailable", entry["answer"])
+
+    def test_nothing_is_typed_while_the_panel_is_open(self):
+        self.screen = screen_of("copilot-ask-thinking.txt")
+        self.assertTrue(app.panel_open({"tmux": "term"}))
+        self.screen = screen_of("copilot-idle.txt")
+        self.assertFalse(app.panel_open({"tmux": "term"}))
+
+    def test_the_session_counts_as_having_a_panel_open_and_nothing_is_kept_of_it(self):
+        monitor = types.SimpleNamespace(lock=threading.Lock(), panels={}, drafts={}, snapshot=lambda: {"error": "", "sessions": [
+            {"id": "c1", "hosted": True, "status": "idle", "tmux": "term", "waitingFor": "", "provider": "copilot"}]})
+        self.screen = screen_of("copilot-ask-thinking.txt")
+        app.watch_panels(monitor)
+        self.assertTrue(monitor.panels.get("c1"))
+        self.screen = screen_of("copilot-idle.txt")
+        app.watch_panels(monitor)
+        self.assertEqual(monitor.panels, {})
+        self.assertEqual(app.btw_for("c1"), [])  # A side question has its own entry, so it isn't saved as a panel too.
+
+    def test_the_host_can_expand_and_resize(self):
+        self.assertEqual(app.TERMINAL_KEYS["C-e"], "\x05")
+
+    def test_the_page_names_the_command_it_was_asked_with(self):
+        self.assertIn("(q.verb||'/btw')+' '+q.question", app.PAGE)
+        self.assertIn("Side questions (/ask)", app.PAGE)

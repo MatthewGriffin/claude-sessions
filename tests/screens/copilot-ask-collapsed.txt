@@ -1,0 +1,40 @@
+  Current   Sessions   Issues   Pull requests   Gists
+
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                    │
+│  ╭─╮╭─╮                             │  Getting started                                                             │
+│  ╰─╯╰─╯  Copilot v1.0.114 uses AI.  │  Use the tabs above to explore your sessions and pull requests               │
+│  █ ▘▝ █  Check for mistakes.        │  /model — Switch models across providers, or use Copilot Fusion              │
+│   ▔▔▔▔   /experimental              │                                                                              │
+│                                                                                                                    │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ! Connected Connectors could not be loaded; existing local and self-hosted MCP servers remain available.
+ ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+  ❯ Reply with exactly the word hi.                                                                            10:57
+ ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+ ● Copilot Fusion selected GPT-6 Luna since the task has low complexity.
+
+ ● hi
+
+
+
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ /ask list 40 different fruits, one per line, numbered, no other text                                                 │
+│                                                                                                                      │
+│  31. Passion fruit                                                                                                 ┃ │
+│  32. Dragon fruit                                                                                                  ┃ │
+│  33. Lychee                                                                                                        ┃ │
+│  34. Persimmon                                                                                                     ┃ │
+│  35. Quince                                                                                                        ┃ │
+│  36. Mulberry                                                                                                      ┃ │
+│  37. Star fruit                                                                                                    ┃ │
+│  38. Jackfruit                                                                                                     ┃ │
+│  39. Durian                                                                                                        ┃ │
+│  40. Kumquat                                                                                                       ┃ │
+│                                                                                                                      │
+│ esc to dismiss · ctrl+e to expand · ctrl+y to copy answer                                                            │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+wd | Copilot Fusion · Standard → GPT-6 Luna | Session: 0h 00m | Ctx: 8% | Today: 51 credits | Month: 3264 credits |
+Unlimited

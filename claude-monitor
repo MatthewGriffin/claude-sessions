@@ -412,6 +412,8 @@ def describe_tool(name, tool_input):
 class Transcript:
     """Follows one session's transcript, parsing only bytes added since last poll."""
 
+    provider = "claude"
+
     def __init__(self, session_id, path=None, is_subagent=False):
         self.session_id = session_id
         self.path = path
@@ -907,6 +909,7 @@ class Monitor:
         self.raw_sessions = []  # As `claude agents` last listed them.
         self.agents_at = 0
         self.agents_files = None  # The session files there were then.
+        self.copilot_modes = {}  # Session id -> (when read, its mode from the screen's footer).
 
     def refresh(self):
         try:
@@ -935,12 +938,24 @@ class Monitor:
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             # Keep showing the last good list, with the failure in the header.
             self.error = f"could not list sessions: {clean(exc)}"
+        copilot = copilot_live_sessions()
+        names = read_names()
+        for session in copilot:
+            session["name"] = clean(names.get(session["sessionId"], "")) or session.get("name")
+        self.sessions = [s for s in self.sessions if s.get("provider") != "copilot"] + copilot
         self.panes = hosted_panes()
         self._notice_new_ids()
-        live = {s["sessionId"] for s in self.sessions}
+        live = {s["sessionId"]: s for s in self.sessions}
         self.transcripts = {sid: t for sid, t in self.transcripts.items() if sid in live}
-        for sid in live:
-            self.transcripts.setdefault(sid, Transcript(sid)).poll()
+        for sid, session in live.items():
+            transcript = self.transcripts.setdefault(sid, self.new_transcript(session))
+            transcript.poll()
+            if session.get("provider") == "copilot":
+                session["status"] = COPILOT_STATUS[transcript.state]
+
+    @staticmethod
+    def new_transcript(session):
+        return (CopilotTranscript if session.get("provider") == "copilot" else Transcript)(session["sessionId"])
 
     def _from_session_files(self, files):
         """The last `claude agents` list with each session's status and name as its own file has them now.
@@ -969,7 +984,7 @@ class Monitor:
 
     def _notice_new_ids(self):
         """/clear gives a session a new id but keeps its process, so follow it across the change."""
-        current = {s.get("pid"): s["sessionId"] for s in self.sessions}
+        current = {s.get("pid"): s["sessionId"] for s in self.sessions if s.get("provider") != "copilot"}
         changes = [(self.pid_ids[pid], sid) for pid, sid in current.items() if pid in self.pid_ids and self.pid_ids[pid] != sid]
         self.pid_ids = current
         if not changes:
@@ -1010,6 +1025,8 @@ class Monitor:
             changed = True
         self.retired_ids = set()
         for session in sessions:
+            if session.get("provider") == "copilot":
+                continue
             if session.get("startedBy"):
                 # Started by another session to be thrown away once it reports back: never offered again.
                 changed = entries.pop(session["id"], None) is not None or changed
@@ -1042,7 +1059,7 @@ class Monitor:
         )
 
     def transcript(self, session):
-        return self.transcripts.get(session["sessionId"]) or Transcript(session["sessionId"])
+        return self.transcripts.get(session["sessionId"]) or self.new_transcript(session)
 
     def snapshot(self):
         """JSON-ready state for the web view, cached so several tabs share one poll."""
@@ -1058,6 +1075,9 @@ class Monitor:
                     failure = transcript.failure if transcript else None
                     session["failure"] = None if failure and queue_state["dismissed"].get(session["id"]) == failure["at"] else failure
                     session["retryAt"] = (queue_state["retries"].get(session["id"]) or {}).get("at")
+                    if session["provider"] == "copilot":
+                        session["contextPercent"], session["modelNow"] = transcript.context_percent, session["model"]
+                        continue
                     session["contextPercent"] = context_percents.get(session["id"])
                     # The status line hears of a /model switch at once; the transcript only by the next reply.
                     shown, saved = models.get(session["id"], ("", 0))
@@ -1083,6 +1103,8 @@ class Monitor:
     def session_state(self, session):
         transcript = self.transcript(session)
         quiet = quiet_seconds(transcript)
+        if session.get("provider") == "copilot":
+            return self.copilot_state(session, transcript, quiet)
         if session.get("status") == "busy" and (session.get("fileStatus") == "shell" or (
                 not transcript.pending and turn_ended(session, self.panes.get(session.get("pid"))))):
             # Claude Code stays "busy" while a background task runs, though Claude is free. Treated
@@ -1091,6 +1113,7 @@ class Monitor:
         started = session.get("startedAt")
         busy = session.get("status") == "busy"
         return {
+            "provider": "claude",
             "id": session["sessionId"],
             "name": session.get("name") or session["sessionId"][:8],
             "status": session.get("status", "?"),
@@ -1119,6 +1142,63 @@ class Monitor:
             "waitingFor": str(session.get("waitingFor") or "")[:60],
             "draft": self.drafts.get(session["sessionId"], "")[:MAX_REPLY_BYTES],
         }
+
+    def copilot_state(self, session, transcript, quiet):
+        """A Copilot CLI session's state for the page: the same fields as a Claude session's, from its event log."""
+        started = session.get("startedAt")
+        status = COPILOT_STATUS[transcript.state]
+        pending = list(transcript.pending.values())
+        target = self.panes.get(session.get("pid"))
+        return {
+            "provider": "copilot",
+            "id": session["sessionId"],
+            "name": session.get("name") or transcript.title[:60] or session["sessionId"][:8],
+            "status": status,
+            "kind": "",
+            "pid": session.get("pid"),
+            "cwd": session.get("cwd", ""),
+            "project": os.path.basename(session.get("cwd", "").rstrip("/\\")),
+            "branch": transcript.branch,
+            "model": transcript.model,
+            "context": format_tokens(transcript.context),
+            "up": format_age(time.time() - started / 1000) if started else "-",
+            "quiet": int(quiet) if quiet is not None else None,
+            "title": transcript.title[:MAX_TEXT],
+            "prompt": transcript.prompt[:MAX_TEXT],
+            "said": transcript.text[:MAX_TEXT],
+            "now": pending[-1][:MAX_TEXT] if status == "busy" and pending else "",
+            "actions": [a[:MAX_TEXT] for a in reversed(transcript.actions)],
+            "subagents": [],
+            "background": [],
+            "job": "",
+            "hosted": bool(target),
+            "tmux": target,
+            "attention": self.copilot_attention(transcript),
+            "heldBusy": False,
+            "panel": False,
+            "waitingFor": "",
+            "draft": "",
+            "mode": self.copilot_mode_label(session["sessionId"], target, transcript),
+        }
+
+    def copilot_mode_label(self, session_id, target, transcript):
+        """"Autopilot · allow all" and the like: from the footer of a hosted session's screen, else from its log."""
+        cached = self.copilot_modes.get(session_id)
+        if target and (not cached or time.monotonic() - cached[0] > COPILOT_MODE_SECONDS):
+            # The footer shows the mode only while it's idle, so a screen without it keeps what was last read.
+            cached = self.copilot_modes[session_id] = (time.monotonic(), copilot_mode(session_screen(target)) or (cached[1] if cached else None))
+        found = cached[1] if cached and target else None
+        if found:
+            return " · ".join(part for part in (found["run"].capitalize() if found["run"] != "interactive" else "",
+                                                "allow all" if found["approval"] == "allow-all" else "") if part)
+        return transcript.permission_mode.capitalize() if transcript.permission_mode not in ("", "interactive") else ""
+
+    @staticmethod
+    def copilot_attention(transcript):
+        wanted = transcript.attention()
+        if not wanted:
+            return None
+        return {"kind": wanted["kind"], "message": wanted["message"], "at": wanted["at"], "ago": int(time.time() - wanted["at"]) if wanted["at"] else 0}
 
     def background_state(self, session, transcript):
         open_tasks = open_background_tasks()
@@ -1208,7 +1288,7 @@ class Monitor:
         if not path:
             return None
         if not self.history_reader or self.history_reader.path != path:
-            self.history_reader = HistoryReader(path)
+            self.history_reader = (CopilotHistoryReader if getattr(transcript, "provider", "claude") == "copilot" else HistoryReader)(path)
         self.history_reader.poll()
         return self.history_reader
 
@@ -1234,6 +1314,8 @@ class Monitor:
             path = transcript.path if transcript else None
         if not session:
             return None
+        if session.get("provider") == "copilot":
+            return []  # Claude Code's commands and skills mean nothing to Copilot, which can't be sent them from here yet.
         skills = transcript_skills(path) if path else {}
         found = {name: {"name": name, "hint": hint, "description": text, "source": "built-in"} for name, hint, text in builtin_commands()}
         for name, text in skills.items():
@@ -1253,7 +1335,7 @@ class Monitor:
         """Conversation for a live session, or just {"unchanged"} if it matches revision `since`."""
         # Outside the lock below, so that a slow repository can't hold up other readers.
         git_state = self._git_state(session_id)
-        btw = [{k: e.get(k) for k in ("id", "kind", "question", "command", "title", "text", "at", "state", "answer", "answered")}
+        btw = [{k: e.get(k) for k in ("id", "kind", "question", "verb", "command", "title", "text", "at", "state", "answer", "answered")}
                for e in btw_for(session_id)]
         context = self.context_usage(session_id)
         btw_revision = hashlib.sha256(json.dumps([btw, context]).encode()).hexdigest()[:12] if btw or context else ""
@@ -1296,6 +1378,8 @@ class Monitor:
         model). It's checked again when the conversation has grown, at most every CONTEXT_CHECK_SECONDS.
         """
         session = next((s for s in self.sessions if s.get("sessionId") == session_id), None)
+        if session and session.get("provider") == "copilot":
+            return None  # /context is Claude Code's; its headless check can't read a Copilot session.
         with self.lock:
             known = self.contexts.get(session_id)
             transcript = self.transcripts.get(session_id)
@@ -3655,6 +3739,476 @@ class HistoryReader:
         return self._turn_changes(self.changed_turn, False)
 
 
+# --- GitHub Copilot CLI sessions ------------------------------------------------------------------------
+# Read only, from what Copilot itself writes: ~/.copilot/session-state/<id>/ holds workspace.yaml (folder,
+# name), events.jsonl (a typed event log) and, while a copilot process has the session open, inuse.<pid>.lock.
+# Copilot's event format is internal, so these fields may go blank after an update, as Claude Code's do.
+
+COPILOT_HOME = os.environ.get("COPILOT_HOME") or os.path.expanduser("~/.copilot")
+COPILOT_STATE_DIR = os.path.join(COPILOT_HOME, "session-state")
+COPILOT_MODE_SECONDS = 3  # How often a hosted session's screen is read for its mode.
+COPILOT_SCAN_SECONDS = 3  # Looking at every session folder is cheap, but not worth doing for every page poll.
+COPILOT_PROCESS_WORDS = ("copilot", "node", "bun")  # Copilot is a native program or runs under one of these.
+COPILOT_STATUS = {"working": "busy", "waiting": "waiting", "idle": "idle"}  # Copilot's word -> this app's.
+COPILOT_EVENT_TYPE = re.compile(rb'^\s*\{\s*"type"\s*:\s*"([^"]+)"')
+# Events worth parsing. The rest (model snapshots, telemetry) are the bulk of a log, so they are skipped unread.
+COPILOT_EVENTS = frozenset({
+    "session.start", "session.model_change", "session.mode_changed", "session.context_changed", "session.shutdown",
+    "session.error", "session.usage_record", "session.compaction_complete", "session.info", "session.warning",
+    "user.message", "assistant.message", "assistant.turn_start", "assistant.turn_end", "abort", "session.task_complete",
+    "tool.execution_start", "tool.execution_complete", "permission.requested", "permission.completed",
+})
+COPILOT_EDIT_TOOLS = ("edit", "create", "apply_patch")
+COPILOT_SHELL_TOOLS = ("powershell", "bash", "shell")
+
+
+def copilot_time(stamp):
+    """Seconds since the epoch of one of Copilot's ISO timestamps ("2026-11-20T15:08:34.448Z"), or 0."""
+    try:
+        return datetime.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0
+
+
+def copilot_process(pid):
+    """(program name, start time) of a running process, or None. A lock file outlives a crash and its process id
+    can be reused, so both are needed to know the process is the one that wrote the lock."""
+    if not WINDOWS:
+        try:
+            with open(f"/proc/{pid}/comm") as handle:
+                return handle.read().strip(), os.stat(f"/proc/{pid}").st_ctime
+        except OSError:
+            return None
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    handle = ctypes.c_void_p(handle)
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:  # STILL_ACTIVE
+            return None
+        size, buffer = ctypes.c_ulong(1024), ctypes.create_unicode_buffer(1024)
+        name = os.path.basename(buffer.value) if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)) else ""
+        times = [ctypes.c_ulonglong() for _ in range(4)]
+        kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times])
+        return name, times[0].value / 1e7 - 11644473600  # FILETIME (100 ns since 1601) -> epoch
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def copilot_lock_pid(lock):
+    """The process id a lock file names if that process is a live copilot that started before the lock was written."""
+    try:
+        pid = int(os.path.basename(lock).split(".")[1])
+        info = copilot_process(pid)
+        if not info:
+            return None
+        name, started = info
+        if name and not any(word in name.lower() for word in COPILOT_PROCESS_WORDS):
+            return None
+        return pid if started <= os.path.getmtime(lock) + 5 else None
+    except (ValueError, IndexError, OSError):
+        return None
+
+
+def read_flat_yaml(path):
+    """workspace.yaml is flat "key: value" lines, so no YAML library is needed."""
+    values = {}
+    with contextlib.suppress(OSError, UnicodeDecodeError):
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                key, found, value = line.rstrip("\n").partition(": ")
+                if found:
+                    values[key] = value
+    return values
+
+
+_copilot_scan = {"at": 0.0, "sessions": []}
+
+
+def copilot_live_sessions():
+    """Copilot CLI sessions with a running process, in the shape `claude agents --json` lists Claude's."""
+    if time.monotonic() - _copilot_scan["at"] < COPILOT_SCAN_SECONDS:
+        return [dict(s) for s in _copilot_scan["sessions"]]
+    found = []
+    try:
+        folders = [e.path for e in os.scandir(COPILOT_STATE_DIR) if e.is_dir()]
+    except OSError:
+        folders = []
+    for folder in folders:
+        pids = [pid for pid in map(copilot_lock_pid, glob.glob(os.path.join(glob.escape(folder), "inuse.*.lock"))) if pid]
+        if not pids:
+            continue
+        meta = read_flat_yaml(os.path.join(folder, "workspace.yaml"))
+        session_id = os.path.basename(folder)
+        started = copilot_time(meta.get("created_at"))
+        found.append({
+            "sessionId": session_id, "pid": max(pids), "cwd": meta.get("cwd", ""), "name": clean(meta.get("name", "")),
+            "startedAt": int(started * 1000) if started else 0, "status": "idle", "kind": "", "provider": "copilot",
+            "client": meta.get("client_name", ""),
+        })
+    found.sort(key=lambda s: s["startedAt"])
+    _copilot_scan.update(at=time.monotonic(), sessions=found)
+    return [dict(s) for s in found]
+
+
+def copilot_describe_tool(name, arguments):
+    """One line for a Copilot tool call, as describe_tool does for Claude's."""
+    if isinstance(arguments, str):
+        arguments = {"command": arguments}
+    if isinstance(arguments, dict):
+        for key in ("description", "command", "path", "pattern", "query", "skill", "url", "message", "summary"):
+            if arguments.get(key):
+                return f"{name}: {clean(arguments[key])}"
+    return name
+
+
+def copilot_patch_files(patch):
+    """{path: (kind, [diff lines])} for an apply_patch call's text; kind is "create" or "update"."""
+    files, current = {}, None
+    for line in str(patch).split("\n"):
+        header = re.match(r"\*\*\* (Add|Update|Delete) File: (.+)", line)
+        if header:
+            current = header.group(2).strip()
+            files[current] = ("create" if header.group(1) == "Add" else "update", [])
+        elif current and line[:1] in ("+", "-", " ") and not line.startswith(("+++", "---")):
+            files[current][1].append(line)
+    return files
+
+
+def copilot_line_of(path, text):
+    """The line a piece of text starts on in a file as it is now, or 1."""
+    with contextlib.suppress(OSError, ValueError):
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            content = handle.read()
+        at = content.find(text.split("\n")[0]) if text else -1
+        return content.count("\n", 0, at) + 1 if at >= 0 else 1
+    return 1
+
+
+COPILOT_DIFF_FILE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+COPILOT_DIFF_HUNK = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def copilot_diff_results(diff):
+    """note_file_change's input for each file in the git-style diff a finished edit reports (result.detailedContent)."""
+    results, current, hunk = [], None, None
+    for line in str(diff).split("\n"):
+        header = COPILOT_DIFF_FILE.match(line)
+        if header:
+            current = {"filePath": header.group(2), "type": "update", "structuredPatch": []}
+            results.append(current)
+            hunk = None
+        elif current is None:
+            continue
+        elif line.startswith("new file mode"):
+            current["type"] = "create"
+        elif COPILOT_DIFF_HUNK.match(line):
+            start = COPILOT_DIFF_HUNK.match(line)
+            hunk = {"oldStart": int(start.group(1)), "newStart": int(start.group(2)), "lines": []}
+            current["structuredPatch"].append(hunk)
+        elif hunk is not None and line[:1] in ("+", "-", " "):
+            hunk["lines"].append(line)
+    return results
+
+
+def note_copilot_edit(files, name, arguments, cwd="", diff=""):
+    """Add what an edit, create or apply_patch call changed to {path: change}, as note_file_change does for Claude's.
+
+    The diff a finished call reports is used when there is one; else the change is worked out from its arguments."""
+    if "diff --git" in str(diff):
+        for result in copilot_diff_results(diff):
+            note_file_change(files, result)
+        return
+    if isinstance(arguments, str) and name == "apply_patch":
+        arguments = {"patch": arguments}
+    if not isinstance(arguments, dict):
+        return
+    results = []
+    if name == "edit" and arguments.get("path"):
+        old, new = str(arguments.get("old_str", "")), str(arguments.get("new_str", ""))
+        lines = ["-" + line for line in old.split("\n")] if old else []
+        lines += ["+" + line for line in new.split("\n")] if new else []
+        line = copilot_line_of(arguments["path"], new)
+        results.append({"filePath": arguments["path"], "type": "update",
+                        "structuredPatch": [{"oldStart": line, "newStart": line, "lines": lines}]})
+    elif name == "create" and arguments.get("path"):
+        results.append({"filePath": arguments["path"], "type": "create", "structuredPatch": [], "content": str(arguments.get("file_text", ""))})
+    elif name == "apply_patch":
+        for path, (kind, lines) in copilot_patch_files(arguments.get("patch") or arguments.get("input") or "").items():
+            full = path if os.path.isabs(path) else os.path.join(cwd, path)
+            first_added = next((text[1:] for text in lines if text[:1] == "+"), "")
+            line = copilot_line_of(full, first_added)
+            results.append({"filePath": full, "type": kind,
+                            "structuredPatch": [{"oldStart": line, "newStart": line, "lines": lines}] if lines else []})
+    for result in results:
+        note_file_change(files, result)
+
+
+class CopilotTranscript:
+    """Follows one Copilot session's events.jsonl, with the attributes the page's session list needs, as Transcript has."""
+
+    provider = "copilot"
+
+    def __init__(self, session_id, path=None):
+        self.session_id = session_id
+        self.path = path or os.path.join(COPILOT_STATE_DIR, session_id, "events.jsonl")
+        self.is_subagent = False
+        self.subagents = {}
+        self.offset = None
+        self.mtime = None
+        self.title = self.prompt = self.text = self.model = self.branch = ""
+        self.model_at = 0
+        self.resume_model = None
+        self.context = 0
+        self.context_limit = 0
+        self.actions = collections.deque(maxlen=8)
+        self.pending = {}  # Tool call id -> what it is, until it finishes.
+        self.permission_mode = ""
+        self.failure = None
+        self.human_messages = 0
+        self.device_uses = {}
+        self.task_folders = {session_id}
+        self.read_whole = False
+        self.turn_open = False
+        self.permissions = {}  # Permission request id -> what is being asked, until answered.
+        self.questions = {}  # ask_user tool call id -> the question, until answered.
+        self.waiting_at = 0  # When the prompt now waiting was raised.
+
+    @property
+    def state(self):
+        """Copilot's word for what the session is doing: "waiting" for the user, "working", or "idle"."""
+        if self.permissions or self.questions:
+            return "waiting"
+        return "working" if self.turn_open else "idle"
+
+    @property
+    def context_percent(self):
+        return round(100 * self.context / self.context_limit) if self.context and self.context_limit else None
+
+    def attention(self):
+        """What the session is waiting on, in the shape read_attention gives for Claude: {kind, message} or None."""
+        if self.permissions:
+            return {"kind": "permission", "message": list(self.permissions.values())[-1], "at": self.waiting_at}
+        if self.questions:
+            return {"kind": "question", "message": list(self.questions.values())[-1], "at": self.waiting_at}
+        return None
+
+    def find_task_folders(self):
+        pass
+
+    def subagent_states(self):
+        return []
+
+    def background_tasks(self, live, started):
+        return []
+
+    def poll(self):
+        try:
+            stat = os.stat(self.path)
+            mtime = stat.st_mtime
+            if self.offset is not None and stat.st_size == self.offset:
+                self.mtime = mtime
+                return
+            if self.offset is None or stat.st_size < self.offset:
+                self.__init__(self.session_id, self.path)
+                window = FIRST_READ_BYTES  # Widen until a message from the user is found, since long tool results fill a log.
+                while True:
+                    start = max(0, stat.st_size - window)
+                    self._read(start, start > 0)
+                    self.read_whole = start == 0
+                    if start == 0 or self.prompt:
+                        break
+                    window *= 4
+            else:
+                self._read(self.offset, False)
+            self.mtime = mtime
+        except OSError:
+            pass
+
+    def _read(self, start, starts_mid_line):
+        with open(self.path, "rb") as handle:
+            handle.seek(start)
+            data = handle.read()
+        end = data.rfind(b"\n") + 1  # A trailing partial line stays unread until Copilot finishes it.
+        self.offset = start + end
+        lines = data[:end].split(b"\n")
+        for line in lines[1:] if starts_mid_line else lines:
+            kind = COPILOT_EVENT_TYPE.match(line)
+            if kind and kind.group(1).decode("ascii", "replace") in COPILOT_EVENTS:
+                try:
+                    self._ingest(json.loads(line))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+
+    def _ingest(self, event):
+        kind, data = event["type"], event.get("data") or {}
+        if kind in ("session.start", "session.model_change"):
+            self.model = str(data.get("newModel") or data.get("selectedModel") or self.model)
+            self.model_at = copilot_time(event.get("timestamp")) or time.time()
+        elif kind == "session.mode_changed":
+            self.permission_mode = str(data.get("newMode", ""))
+        elif kind == "session.context_changed":
+            self.branch = str(data.get("branch") or self.branch)
+        elif kind == "user.message":
+            self.human_messages += 1
+            self.prompt = clean(str(data.get("content", "")))
+            self.title = self.title or self.prompt[:120]
+            self.failure = None
+        elif kind == "assistant.message":
+            self.model = str(data.get("model") or self.model)  # Each reply names its model; the start of the log may be out of reach.
+            if str(data.get("content", "")).strip():
+                self.text = clean(str(data["content"]))
+        elif kind == "assistant.turn_start":
+            self.turn_open, self.failure = True, None
+        elif kind in ("assistant.turn_end", "abort", "session.task_complete"):
+            self.turn_open = False
+            if kind == "abort":
+                self.permissions.clear()
+                self.questions.clear()
+        elif kind == "tool.execution_start":
+            name, arguments = str(data.get("toolName", "?")), data.get("arguments")
+            description = copilot_describe_tool(name, arguments)
+            self.pending[data.get("toolCallId")] = description
+            self.actions.append(description)
+            if name == "ask_user" and isinstance(arguments, dict):
+                self.waiting_at = copilot_time(event.get("timestamp"))
+                self.questions[data.get("toolCallId")] = clean(str(arguments.get("message") or arguments.get("question") or "Has a question"))[:MAX_TEXT]
+        elif kind == "tool.execution_complete":
+            self.pending.pop(data.get("toolCallId"), None)
+            self.questions.pop(data.get("toolCallId"), None)
+            metrics = ((data.get("toolTelemetry") or {}).get("metrics")) or {}
+            if metrics.get("context_current_tokens"):
+                self.context = int(metrics["context_current_tokens"])
+                self.context_limit = int(metrics.get("context_token_limit") or self.context_limit)
+        elif kind == "permission.requested":
+            request = data.get("permissionRequest") or {}
+            self.waiting_at = copilot_time(event.get("timestamp"))
+            self.permissions[data.get("requestId")] = clean(str(request.get("intention") or request.get("fullCommandText") or request.get("kind") or "Permission"))[:MAX_TEXT]
+        elif kind == "permission.completed":
+            self.permissions.pop(data.get("requestId"), None)
+        elif kind == "session.usage_record":
+            usage = data.get("usage") or {}
+            if usage.get("maxPromptTokens"):
+                self.context_limit = int(usage["maxPromptTokens"])
+                self.context = int(usage.get("inputTokens") or 0) + int(usage.get("cacheReadTokens") or 0)
+        elif kind == "session.error":
+            self.turn_open = False
+            self.failure = {"message": clean(str(data.get("message", "")))[:MAX_TEXT] or "The request failed.",
+                            "kind": clean(str(data.get("errorCode") or data.get("errorType") or "")),
+                            "at": copilot_time(event.get("timestamp")), "resets": None}
+        elif kind == "session.shutdown":
+            self.turn_open = False
+            self.permissions.clear()
+            self.questions.clear()
+            self.pending.clear()
+
+
+class CopilotHistoryReader(HistoryReader):
+    """The conversation in a Copilot session's events.jsonl, as HistoryReader gives Claude's."""
+
+    def __init__(self, path, is_subagent=False):
+        super().__init__(path, is_subagent)
+        self.cwd = ""
+
+    def _ingest(self, entry, position):
+        kind, data = entry.get("type"), entry.get("data") or {}
+        if kind not in COPILOT_EVENTS:
+            return
+        self.entry_at = copilot_time(entry.get("timestamp"))
+        self.first_at = self.first_at or self.entry_at
+        if kind == "session.start":
+            self.cwd = str((data.get("context") or {}).get("cwd", ""))
+            self.model = str(data.get("selectedModel") or self.model)
+        elif kind == "session.model_change":
+            name = str(data.get("newModel") or "")
+            if name and name != self.model:
+                self._model_note("auto" if data.get("source") == "auto" else "you", name, self.model)
+                self.model = name
+        elif kind == "session.mode_changed":
+            self._add_note(f"Mode: {data.get('previousMode', '?')} → {data.get('newMode', '?')}")
+        elif kind == "session.compaction_complete" and data.get("success"):
+            self._add_note("The conversation was compacted to free up context")
+        elif kind in ("session.info", "session.warning") and str(data.get("message", "")).strip():
+            self._add_note(data["message"])
+        elif kind == "session.error":
+            self.add({"role": "system", "text": history_text(data.get("message") or "The request failed.", HISTORY_TEXT)})
+        elif kind == "user.message":
+            self._copilot_user(str(data.get("content", "")))
+        elif kind == "assistant.message":
+            if str(data.get("reasoningText", "")).strip():
+                self.add({"role": "thinking", "text": history_text(data["reasoningText"], HISTORY_TEXT)})
+            if str(data.get("content", "")).strip():
+                self.add({"role": "claude", "text": history_text(data["content"], HISTORY_TEXT)})
+        elif kind == "tool.execution_start":
+            self._copilot_tool_use(data, position)
+        elif kind == "tool.execution_complete":
+            self._copilot_tool_result(data, position)
+
+    def _copilot_user(self, text):
+        text, parts = pasted_parts(text)
+        text = history_text(text, HISTORY_TEXT)
+        self.add({"role": "you", "text": text, **({"parts": parts} if parts else {})})
+        if self.turn["files"]:
+            self.changed_turn = self.turn
+        self.previous_turn_at[id(self.turn)] = self.entry_at
+        self.turn = self.new_turn(text, self.entry_at)
+
+    def _copilot_tool_use(self, data, position):
+        name, arguments, call_id = str(data.get("toolName", "?")), data.get("arguments"), data.get("toolCallId")
+        if name in COPILOT_SHELL_TOOLS:
+            self.turn["shell"] += 1
+        text = json.dumps(arguments, indent=1)
+        message = self.add({
+            "role": "tool", "id": call_id, "text": copilot_describe_tool(name, arguments)[:300], "input": preview(text),
+            "result": "", "error": False, "images": 0, "more": len(text) > HISTORY_TOOL_TEXT, "pending": True, "starts_agent": False,
+        })
+        self.tools[call_id] = {"message": message, "use_at": position, "result_at": None, "name": name, "arguments": arguments}
+        command = str(arguments.get("command", "")) if isinstance(arguments, dict) and name in COPILOT_SHELL_TOOLS else ""
+        sent = shell_requests(command) if command else []
+        if sent:
+            self.requests.append({"message": message, "method": sent[0][0], "urls": [url for _, url in sent[:5]], "more": len(sent) > 5,
+                                  "bare_status": "http_code" in command or "response_code" in command})
+
+    def _copilot_tool_result(self, data, position):
+        tool = self.tools.get(data.get("toolCallId"))
+        if not tool:
+            return
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        error = data.get("error") if isinstance(data.get("error"), dict) else {}
+        text = str(result.get("content") or error.get("message") or "")
+        message = tool["message"]
+        tool["result_at"] = position
+        message["pending"] = False
+        if self.entry_at:
+            message["done"] = round(self.entry_at, 1)
+        message["result"] = preview(text)
+        message["error"] = data.get("success") is False
+        message["more"] = message["more"] or len(text) > HISTORY_TOOL_TEXT
+        if data.get("success") is not False and (tool["name"] in COPILOT_EDIT_TOOLS or data.get("fileEdits")):
+            note_copilot_edit(self.turn["files"], tool["name"], tool["arguments"], self.cwd, result.get("detailedContent", ""))
+
+    def tool_details(self, tool_id):
+        tool = self.tools.get(tool_id)
+        if not tool:
+            return None
+        arguments = (self._read_entry(tool["use_at"]).get("data") or {}).get("arguments")
+        details = {"input": history_text(json.dumps(arguments, indent=1), FULL_TOOL_TEXT), "result": "", "images": []}
+        if tool["result_at"] is not None:
+            result = (self._read_entry(tool["result_at"]).get("data") or {}).get("result")
+            details["result"] = history_text(result.get("content", "") if isinstance(result, dict) else "", FULL_TOOL_TEXT)
+        return details
+
+    def tool_image(self, tool_id, number):
+        return None
+
+    def subagent_reader(self, agent_id):
+        return None
+
+
 def tmux(*args, stdin=None):
     """Run a command on the private tmux server that hosts sessions the app starts."""
     try:
@@ -3749,8 +4303,25 @@ def kill_terminal(session_id):
 HOST_TOKEN_FILE = os.path.join(MONITOR_DIR, "host-token")
 TERMINAL_KEYS = {
     "Enter": "\r", "Escape": "\x1b", "Up": "\x1b[A", "Down": "\x1b[B", "Right": "\x1b[C", "Left": "\x1b[D",
-    "Tab": "\t", "BSpace": "\x7f", "Space": " ", "C-x": "\x18", "C-s": "\x13", "C-j": "\n",
+    "Tab": "\t", "BSpace": "\x7f", "Space": " ", "C-x": "\x18", "C-s": "\x13", "C-j": "\n", "C-c": "\x03", "C-e": "\x05", "C-u": "\x15",
 }
+
+
+ANSWER_END = r"(?:\x1b\\|\x07)"
+TERMINAL_QUERIES = [  # What a program asks its terminal, and a plausible answer (dark colours, no extras).
+    (re.compile(r"\x1b\]1([01]);\?" + ANSWER_END), lambda m: f"\x1b]1{m.group(1)};rgb:{'e5e5/e5e5/e5e5' if m.group(1) == '0' else '1e1e/1e1e/1e1e'}\x1b\\"),
+    (re.compile(r"\x1b\]4;(\d+);\?" + ANSWER_END), lambda m: f"\x1b]4;{m.group(1)};rgb:8080/8080/8080\x1b\\"),
+    (re.compile(r"\x1b\[14t"), lambda m: "\x1b[4;800;1200t"),
+    (re.compile(r"\x1b\[\?996n"), lambda m: "\x1b[?997;1n"),
+    (re.compile(r"\x1b\[\?(\d+)\$p"), lambda m: f"\x1b[?{m.group(1)};2$y"),
+    (re.compile(r"\x1b\[\?u"), lambda m: "\x1b[?0u"),
+    (re.compile(r"\x1b\[>q"), lambda m: "\x1bP>|claude-sessions\x1b\\"),
+]
+
+
+def terminal_answers(data):
+    """The answers to send back for the questions a program's output asks of its terminal."""
+    return [reply(match) for pattern, reply in TERMINAL_QUERIES for match in pattern.finditer(data)]
 
 
 def host_call(op, start=False, timeout=5, **fields):
@@ -3860,6 +4431,14 @@ class HostedTerminal:
                 # Answers to the program's questions about the terminal, such as where the cursor is.
                 self.write(data)
 
+            def report_device_status(screen, mode, private=False, **kwargs):
+                if not private:  # pyte raises on the private forms (CSI ? 6 n), which would end the reader.
+                    super().report_device_status(mode)
+
+            def report_device_attributes(screen, mode=0, **kwargs):
+                if not kwargs.get("private"):
+                    super().report_device_attributes(mode, **kwargs)
+
         self.name = name
         self.lock = threading.Lock()
         self.ended = False
@@ -3867,6 +4446,7 @@ class HostedTerminal:
         self.stream = pyte.Stream(self.screen)
         self.subscribers = set()  # Queues of terminal windows attached to this session, each given its output.
         program = shutil.which(command[0]) or command[0]
+        self.answers_queries = "copilot" in os.path.basename(program).lower()  # Claude Code doesn't wait on these.
         self.process = PtyProcess.spawn([program, *command[1:]], cwd=cwd, dimensions=(TERM_ROWS, TERM_COLUMNS))
         threading.Thread(target=self.read_output, daemon=True).start()
 
@@ -3877,8 +4457,14 @@ class HostedTerminal:
             except Exception:  # EOFError when it ends; anything else also means no more output.
                 break
             if data:
+                if self.answers_queries:
+                    for answer in terminal_answers(data):
+                        self.write(answer)
                 with self.lock:
-                    self.stream.feed(data)
+                    try:
+                        self.stream.feed(data)
+                    except Exception:  # One sequence the emulator can't take must not freeze every later screen.
+                        pass
                     for updates in self.subscribers:
                         updates.put(data)
             elif not self.process.isalive():
@@ -4048,6 +4634,13 @@ def run_session_host():
                 # As tmux pastes: line breaks become carriage returns, inside bracketed-paste markers.
                 text = "\x1b[200~" + text.replace("\r\n", "\n").replace("\n", "\r") + "\x1b[201~"
             return {"ok": terminal.write(text)}
+        if op == "resize":
+            try:
+                columns, rows = int(request.get("columns", TERM_COLUMNS)), int(request.get("rows", TERM_ROWS))
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "Invalid request."}
+            terminal.resize(columns, rows, repaint=True)
+            return {"ok": True}
         if op == "kill":
             with terminals_lock:
                 terminals.pop(name, None)
@@ -4154,7 +4747,7 @@ def custom_commands(cwd):
     return list(found.values())
 
 
-def menu_options(screen):
+def claude_menu_options(screen):
     """The answers of the menu Claude Code is showing, or [] if no menu can be read for certain.
 
     Each is {key, label, description, checked, highlighted}. key is the number to press, or ""
@@ -4218,6 +4811,62 @@ def menu_options(screen):
     return options if keys and keys == [str(k) for k in range(1, len(keys) + 1)] and at_bottom(end) else []
 
 
+# GitHub Copilot's screen. Its input box is drawn between a "╻▄▄▄" row and a "╹▀▀▀" row, its permission and
+# folder-trust questions are numbered menus inside a bordered panel, and its own questions are a list under
+# "Copilot needs information". Each marker is a whole line, so a conversation that quotes one doesn't match.
+COPILOT_SCREEN = re.compile(
+    r"^[╻╹][▄▀]{3,}|^ ?Copilot needs information\.?\s*$|^│ Do you (?:want to run this command|trust the files in this folder)\?"
+    r"|^│ ↑/↓ to navigate · enter to select|^ ?↑/↓ select · enter accept", re.M)
+COPILOT_PANEL_HIGHLIGHT = re.compile(r"^│\s*❯\s+\d")
+COPILOT_MODE = re.compile(r"\b(Interactive|Autopilot|Plan)\s+·\s+(Manual Approval|Allow All)\b")
+COPILOT_WORKING = re.compile(r"^\s*○ Working\b[^\n]*?(?=\s{3,}|$)", re.M)
+COPILOT_TRUST = re.compile(r"^│ Do you trust the files in this folder\?", re.M)
+COPILOT_BELOW = 4  # Lines under its input box: a hint and the status line.
+
+
+def is_copilot_screen(screen):
+    return bool(COPILOT_SCREEN.search(screen))
+
+
+def copilot_input_box(screen):
+    """The text in Copilot's input box, or None unless the box is showing (a question or panel replaces it)."""
+    lines = [line.rstrip() for line in screen.split("\n")]
+    top = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith("╻")), None)
+    bottom = next((j for j in range(top + 1, len(lines)) if lines[j].startswith("╹")), None) if top is not None else None
+    if bottom is None or sum(1 for line in lines[bottom + 1:] if line.strip()) > COPILOT_BELOW:
+        return None
+    return "\n".join((line[1:] if line.startswith("┃") else line).strip() for line in lines[top + 1:bottom]).strip()
+
+
+def copilot_menu_options(screen):
+    """The answers of the question Copilot is showing, as claude_menu_options gives Claude Code's, or []."""
+    lines = [line.rstrip() for line in screen.split("\n")]
+    ask = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip().startswith("Copilot needs information")), None)
+    if ask is not None:
+        end = next((j for j in range(ask, len(lines)) if "enter accept" in lines[j]), None)
+        return claude_menu_options("\n".join(lines[ask:end + 1])) if end is not None else []
+    here = next((i for i in range(len(lines) - 1, -1, -1) if COPILOT_PANEL_HIGHLIGHT.match(lines[i])), None)
+    if here is None:
+        return []
+    top = next((i for i in range(here - 1, -1, -1) if lines[i].startswith("╭")), None)
+    bottom = next((j for j in range(here + 1, len(lines)) if lines[j].startswith("╰")), None)
+    if top is None or bottom is None:
+        return []
+    inside = [re.sub(r"\s*│$", "", re.sub(r"^│ ?", "", line)) for line in lines[top + 1:bottom]]
+    return claude_menu_options("\n".join(inside))
+
+
+def copilot_mode(screen):
+    """{"run": "interactive"|"autopilot"|"plan", "approval": "manual"|"allow-all"} from Copilot's footer, or None."""
+    found = COPILOT_MODE.search(screen)
+    return {"run": found.group(1).lower(), "approval": "allow-all" if found.group(2) == "Allow All" else "manual"} if found else None
+
+
+def menu_options(screen):
+    """The answers of the menu a session is showing, whichever program it is."""
+    return copilot_menu_options(screen) if is_copilot_screen(screen) else claude_menu_options(screen)
+
+
 def choose_answer(target, answer, text=None, by_number=True, press=True):
     """Pick one answer of the menu on a session's screen: by its number, or by moving the highlight
     onto it and pressing Enter. With text, the answer is "Type something" and the text is typed in.
@@ -4268,6 +4917,13 @@ SCREEN_CHROME = re.compile(r"[▐▛▜▝▘▗▖█▌]{2}|^\s*Claude Code v\
 
 
 def live_activity(screen):
+    if not is_copilot_screen(screen):
+        return claude_live_activity(screen)
+    working = COPILOT_WORKING.search(screen)  # Its footer says "Working" while a turn runs.
+    return {"head": working.group(0).strip().lstrip("○").strip() if working else "", "lines": []}
+
+
+def claude_live_activity(screen):
     """What the terminal shows above its input box: the status line, and the lines leading up to it.
 
     Claude Code doesn't record the status line, running output or text still arriving, so the screen
@@ -4340,6 +4996,8 @@ def start_session(monitor, request):
     An untrusted folder is only trusted when the request carries the user's approval of this
     exact path. Otherwise the attempt ends and the user is asked, so no prompt is left waiting.
     """
+    if request.get("provider") == "copilot":
+        return start_copilot_session(monitor, request)
     cwd = os.path.expanduser(str(request.get("cwd", "")).strip())
     prompt = str(request.get("prompt", "")).strip()
     name = clean(request.get("name", ""))
@@ -4368,6 +5026,107 @@ def start_session(monitor, request):
     if started and (model or chrome):
         remember_model(monitor, session_id, model, chrome)
     return started, message
+
+
+COPILOT_NEW_MODES = {"manual", "allow-all", "autopilot"}
+COPILOT_NAME_CHARS = re.compile(r"[^\w .,'()\-]")  # Nothing a command line could read as more than a name.
+COPILOT_SETTLE_STEPS = 4  # Half-seconds the screen must stay the same before a message is typed into it.
+COPILOT_DELIVERY_SECONDS = 15
+
+
+def copilot_logged_user_message(session_id):
+    """Whether Copilot has recorded a message from the user in this session yet."""
+    try:
+        with open(os.path.join(COPILOT_STATE_DIR, session_id, "events.jsonl"), "rb") as handle:
+            return b'"user.message"' in handle.read()
+    except OSError:
+        return False
+
+
+def accept_copilot_trust(session_id):
+    """Answer Copilot's folder-trust menu with "Yes, and remember this folder", moving to it and checking it is highlighted."""
+    remember = next((o for o in menu_options(session_screen(session_id)) if o["label"].startswith("Yes, and remember")), None)
+    if not remember or not choose_answer(session_id, remember, by_number=False):
+        return False
+    return wait_for_screen(lambda screen: not COPILOT_TRUST.search(screen), session_id, 10)
+
+
+def wait_for_screen(check, session_id, seconds):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        screen = session_screen(session_id)
+        if check(screen):
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def start_copilot_session(monitor, request):
+    """Start a GitHub Copilot CLI session in a hosted terminal and give it its first message. Returns (succeeded, message).
+
+    The message is typed once Copilot's input box has stopped changing, and checked against Copilot's own log:
+    one typed too early is dropped, so it is typed again until the log shows it arrived."""
+    cwd = os.path.expanduser(str(request.get("cwd", "")).strip())
+    prompt = str(request.get("prompt", "")).strip()
+    name = COPILOT_NAME_CHARS.sub("", clean(request.get("name", ""))).strip()[:80]
+    mode = str(request.get("mode") or "manual")
+    if not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        return False, f"Not an existing folder: {cwd or '(empty)'}"
+    if not prompt:
+        return False, "Enter what the session should do."
+    if mode not in COPILOT_NEW_MODES:
+        return False, f"Permission mode not available here: {mode}"
+    if not shutil.which("copilot"):
+        return False, "GitHub Copilot CLI (copilot) isn't installed, or isn't on your PATH."
+    session_id = str(uuid.uuid4())
+    command = ["copilot", "--session-id", session_id]
+    if name:
+        command += ["--name", name]
+    if mode in ("allow-all", "autopilot"):
+        command.append("--allow-all")
+    if mode == "autopilot":
+        command.append("--autopilot")
+    started, error = new_terminal(session_id, cwd, command)
+    if not started:
+        return False, f"Could not start the session: {error}"
+    trust_approved, trust_answered, steady, last = same_folder(request.get("trust"), cwd), False, 0, None
+    deadline = time.time() + START_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if session_id not in hosted_sessions():
+            return False, "The session exited right after starting."
+        screen = session_screen(session_id)
+        if COPILOT_TRUST.search(screen):
+            if not trust_approved:
+                kill_terminal(session_id)
+                return False, {"error": "This folder isn't trusted yet.", "needsTrust": True, "cwd": cwd}
+            if not trust_answered and not accept_copilot_trust(session_id):
+                shown = clean(session_screen(session_id))[-300:]
+                kill_terminal(session_id)
+                return False, f"Could not answer the trust prompt. Run copilot in {cwd} once and accept it, then retry. Its screen showed: {shown}"
+            trust_answered = True
+            continue
+        steady = steady + 1 if screen == last and input_box(screen) == "" else 0
+        last = screen
+        if steady >= COPILOT_SETTLE_STEPS:
+            break
+        time.sleep(0.5)
+    else:
+        shown = clean(session_screen(session_id))[-300:]
+        kill_terminal(session_id)
+        return False, "The session didn't start in time. Its screen showed: " + shown
+    target = {"tmux": session_id}
+    for _ in range(3):
+        if not type_into(target, prompt, in_box="") or not send_keys(session_id, "Enter"):
+            return False, "The session started, but typing into it failed. Find it in the list and send your message there."
+        if wait_for_screen(lambda screen: copilot_logged_user_message(session_id), session_id, COPILOT_DELIVERY_SECONDS):
+            return True, "Started."
+        box = input_box(session_screen(session_id))
+        if box:  # Typed, but Enter didn't send it.
+            send_keys(session_id, "Enter")
+            if wait_for_screen(lambda screen: copilot_logged_user_message(session_id), session_id, COPILOT_DELIVERY_SECONDS):
+                return True, "Started."
+            clear_input_box(session_id)
+    return True, "Started, but its first message may not have gone in. Check the session and send it again if needed."
 
 
 def remember_model(monitor, session_id, model, chrome=False):
@@ -4755,6 +5514,11 @@ def type_message(session, text, images=(), pasted=(), replaces=""):
 
 
 def input_box(screen):
+    """The text in a session's input box, or None unless the box is showing and no menu is."""
+    return copilot_input_box(screen) if is_copilot_screen(screen) else claude_input_box(screen)
+
+
+def claude_input_box(screen):
     """The text in Claude Code's input box, or None unless the box is showing and no menu is.
 
     The box is a "❯" line with a divider right above it and another below it, near the bottom.
@@ -4890,7 +5654,7 @@ def send_tracked(monitor, session, text, state, images=(), pasted=(), replaces="
     if succeeded:
         state["sent"][session["id"]] = time.time()
         note_btw(session, text)
-        if text.startswith("/") and not BTW_COMMAND.match(text):
+        if text.startswith("/") and not side_question(session, text):
             sent_commands[session["id"]] = (text.split()[0][:60], time.time())
         if not text.startswith("/"):  # Slash commands aren't recorded as messages.
             state["checks"][session["id"]] = {"text": text, "images": list(images), "pasted": list(pasted), "count": before, "at": time.time()}
@@ -4900,6 +5664,13 @@ def send_tracked(monitor, session, text, state, images=(), pasted=(), replaces="
 # Side questions (/btw). Claude Code answers them in a panel at the bottom of its screen and
 # saves them nowhere, so the app notes each one it sends and reads the answer off the screen.
 BTW_COMMAND = re.compile(r"^/btw\s+(\S.*)$", re.S)
+ASK_COMMAND = re.compile(r"^/ask\s+(\S.*)$", re.S)
+
+
+def side_question(session, text):
+    """The question if this is a side question for the program the session runs (/btw for Claude Code, /ask for Copilot)."""
+    match = (ASK_COMMAND if session.get("provider") == "copilot" else BTW_COMMAND).match(text)
+    return " ".join(match.group(1).split()) if match else None
 BTW_HINT = re.compile(r"\bEsc to close\s*$")
 BTW_QUESTION = re.compile(r"^ {2,8}/btw\s+(\S.*)$")
 BTW_KEEP = 30  # Per session.
@@ -4930,14 +5701,14 @@ def btw_for(session_id):
 
 def note_btw(session, text):
     """Record a side question just sent, so its answer can be looked for."""
-    match = BTW_COMMAND.match(text)
-    if not match:
+    question = side_question(session, text)
+    if not question:
         return
     with btw_lock:
         data = read_btw()
         entries = data.setdefault(session["id"], [])
-        entries.append({"id": secrets.token_hex(6), "question": " ".join(match.group(1).split()), "at": time.time(),
-                        "state": "answering", "answer": "", "tmux": session["tmux"]})
+        entries.append({"id": secrets.token_hex(6), "question": question, "at": time.time(), "state": "answering", "answer": "",
+                        "tmux": session["tmux"], "verb": "/ask" if session.get("provider") == "copilot" else "/btw"})
         del entries[:-BTW_KEEP]
         write_btw(data)
 
@@ -4981,6 +5752,79 @@ def btw_panel(screen):
     return {"question": " ".join(BTW_QUESTION.match(lines[last]).group(1).split()), "answer": answer if done else "", "done": done}
 
 
+# Copilot's side-question panel is a bordered box: "/ask question", then the answer, then a hint line. While
+# the answer is coming the hint says "esc to cancel"; after it, "esc to dismiss" and "ctrl+y to copy answer"
+# (an error shows its text in place of an answer, without the copy hint). The panel is collapsed to the
+# last few lines of a long answer until it is expanded with Ctrl+E.
+COPILOT_ASK_HINT = re.compile(r"^│ esc to (cancel|dismiss) · ctrl\+e to (?:expand|collapse)(.*?)\s*│?\s*$")
+COPILOT_ASK_QUESTION = re.compile(r"^│ /ask\s+(\S.*?)\s*│?\s*$")
+COPILOT_THINKING = re.compile(r"^[○◉●◎◌]\s+Thinking\s*$")
+COPILOT_READ_COLUMNS, COPILOT_READ_ROWS = 300, 200  # What the host allows is a little more than this.
+
+
+def copilot_ask_panel(screen):
+    """The /ask panel at the bottom of a Copilot screen: {question, answer, done, failed}, or None."""
+    lines = [line.rstrip() for line in screen.split("\n")]
+    hint = next((i for i in range(len(lines) - 1, -1, -1) if COPILOT_ASK_HINT.match(lines[i])), None)
+    if hint is None:
+        return None
+    top = next((i for i in range(hint - 1, -1, -1) if COPILOT_ASK_QUESTION.match(lines[i])), None)
+    if top is None or any(line.startswith("╰") for line in lines[top:hint]):
+        return None
+    shown = COPILOT_ASK_HINT.match(lines[hint])
+    # Inside the borders; a scrollbar can sit at the right edge of an expanded panel.
+    body = [re.sub(r"(?:\s*[│┃])+$", "", re.sub(r"^│ ?", "", line)).rstrip() for line in lines[top + 1:hint]]
+    while body and not body[0].strip():
+        body.pop(0)
+    while body and (not body[-1].strip() or COPILOT_THINKING.match(body[-1].strip())):
+        body.pop()
+    done = shown.group(1) == "dismiss"
+    answer = "\n".join(body)
+    return {"question": " ".join(COPILOT_ASK_QUESTION.match(lines[top]).group(1).split()), "answer": answer if done else "",
+            "done": done, "failed": done and "copy answer" not in shown.group(2)}
+
+
+def resize_terminal(session_id, columns, rows):
+    """Make a hosted terminal this big. Returns the size it was, to put back, or None if it can't be resized."""
+    if WINDOWS:
+        return (TERM_COLUMNS, TERM_ROWS) if (host_call("resize", name=session_id, columns=columns, rows=rows) or {}).get("ok") else None
+    target = tmux_target(session_id)
+    size = tmux("display-message", "-p", "-t", target, "#{window_width} #{window_height}").stdout.split()
+    if len(size) != 2 or not all(n.isdigit() for n in size):
+        return None
+    tmux("resize-window", "-t", target, "-x", str(columns), "-y", str(rows))
+    return int(size[0]), int(size[1])
+
+
+def restore_terminal(session_id, size):
+    if WINDOWS:
+        host_call("resize", name=session_id, columns=size[0], rows=size[1])
+        return
+    target = tmux_target(session_id)
+    tmux("resize-window", "-t", target, "-x", str(size[0]), "-y", str(size[1]))
+    tmux("set-option", "-w", "-u", "-t", target, "window-size")  # Follow an attached terminal again.
+
+
+def copilot_whole_answer(session_id, question):
+    """The whole answer in a Copilot /ask panel, or None if it can't be had: its terminal is made much bigger
+    for a moment and the panel expanded, so that a long answer isn't cut to its last lines."""
+    size = resize_terminal(session_id, COPILOT_READ_COLUMNS, COPILOT_READ_ROWS)
+    if not size:
+        return None
+    try:
+        time.sleep(1)  # Copilot draws itself again at the new size.
+        send_keys(session_id, "C-e")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            time.sleep(0.4)
+            panel = copilot_ask_panel(session_screen(session_id))
+            if panel and panel["done"] and same_question(question, panel["question"]):
+                return panel
+        return None
+    finally:
+        restore_terminal(session_id, size)
+
+
 def whole_screen(session_id):
     """The screen with room for everything on it. On Linux the terminal is made much bigger for a
     moment, so Claude Code redraws a long panel whole and unwrapped, then put back as it was."""
@@ -5010,13 +5854,18 @@ def watch_btw(monitor):
         pending = [(sid, e) for sid, entries in read_btw().items() for e in entries if e.get("state") == "answering"]
     for session_id, entry in pending:
         state, answer = None, ""
-        panel = btw_panel(session_screen(entry["tmux"]))
+        copilot = entry.get("verb") == "/ask"
+        read = copilot_ask_panel if copilot else btw_panel
+        panel = read(session_screen(entry["tmux"]))
         if panel and panel["done"] and same_question(entry["question"], panel["question"]):
-            whole = btw_panel(whole_screen(entry["tmux"]))
+            if copilot:
+                whole = copilot_whole_answer(entry["tmux"], entry["question"])
+            else:
+                whole = btw_panel(whole_screen(entry["tmux"]))
             answer = (whole if whole and same_question(entry["question"], whole["question"]) else panel)["answer"]
             state = "answered"
-            # Closed only while it still shows, as Esc anywhere else would interrupt Claude.
-            again = btw_panel(session_screen(entry["tmux"]))
+            # Closed only while it still shows, as Esc anywhere else would interrupt the session.
+            again = read(session_screen(entry["tmux"]))
             if again and again["done"]:
                 send_keys(entry["tmux"], "Escape")
         elif time.time() - entry["at"] > BTW_WAIT_SECONDS or entry["tmux"] not in hosted_sessions():
@@ -5137,7 +5986,10 @@ def panel_allowed(session):
 
 def panel_open(session):
     """Whether a command's panel covers the input box, where anything typed would land in the panel."""
-    return bool(session.get("tmux")) and command_panel(session_screen(session["tmux"])) is not None
+    if not session.get("tmux"):
+        return False
+    screen = session_screen(session["tmux"])
+    return command_panel(screen) is not None or copilot_ask_panel(screen) is not None
 
 
 def watch_panels(monitor):
@@ -5151,7 +6003,9 @@ def watch_panels(monitor):
             continue
         screen = session_screen(session["tmux"])
         panel = command_panel(screen)
-        if panel and not btw_panel(screen):  # Side questions have their own entries.
+        if copilot_ask_panel(screen):  # A side question: it has its own entry, and nothing is kept when it closes.
+            seen[session["id"]] = {"title": "/ask", "text": "", "keys": [], "options": [], "side": True}
+        elif panel and not btw_panel(screen):  # Side questions have their own entries.
             seen[session["id"]] = panel
         elif session["status"] == "idle":
             drafts[session["id"]] = input_draft(session, screen)
@@ -5159,7 +6013,7 @@ def watch_panels(monitor):
         before, monitor.panels = monitor.panels, seen
         monitor.drafts = drafts
     for session_id, panel in before.items():
-        if session_id in seen:
+        if session_id in seen or panel.get("side"):
             continue  # Still open, though perhaps on another step, such as /model asking to confirm.
         # Closed: keep what it last showed, as nothing else records it.
         with btw_lock:
@@ -5254,8 +6108,8 @@ def send_reply(monitor, request):
         replaces = str(request.get("replaces") or "")[:MAX_REPLY_BYTES]
         item = {"id": secrets.token_hex(8), "text": text, **({"images": images} if images else {}), **({"pasted": pasted} if pasted else {}),
                 **({"replaces": replaces} if replaces.strip() else {})}
-        if BTW_COMMAND.match(text) and session["status"] == "busy":
-            # A side question is answered while Claude works, so it neither waits nor interrupts.
+        if side_question(session, text) and session["status"] == "busy":
+            # A side question is answered while the session works, so it neither waits nor interrupts.
             return send_btw_now(session, text)
         if not items and may_type_now(session, state) and not panel_open(session):
             succeeded, message = send_tracked(monitor, session, text, state, images, pasted, replaces)
@@ -5534,11 +6388,18 @@ def press_key(monitor, request):
         # Tied to the prompt that was on screen, so it can't land on a newer one.
         if not is_permission or attention.get("at") != request.get("prompt"):
             return False, "That prompt is no longer waiting. Check the screen and try again."
+        if session.get("provider") == "copilot":
+            # Its menu is moved through, not typed into: Enter is only pressed with Yes seen to be highlighted.
+            yes = next((o for o in menu_options(session_screen(session["tmux"])) if o["label"].startswith("Yes")), None)
+            if action == "approve" and not (yes and choose_answer(session["tmux"], yes, by_number=False)):
+                return False, "Could not pick Yes. Check the screen and try again."
+            if action == "approve":
+                return True, "Sent."
         key = "1" if action == "approve" else "Escape"  # Option 1 is always Yes.
     elif action == "interrupt":
         if status != "busy":
             return False, "It isn't working on anything right now."
-        key = "Escape"
+        key = "C-c" if session.get("provider") == "copilot" else "Escape"
     elif action in ("up", "down", "enter", "escape"):
         if status != "waiting" or (is_permission and action != "escape"):
             return False, "That prompt is no longer waiting."
@@ -5612,7 +6473,7 @@ def attach_in_terminal(session):
     try:
         terminal = shutil.which("wt")  # Windows Terminal, where it's installed: it handles keys and pasting better.
         if terminal:
-            subprocess.Popen([terminal, "new-tab", "--title", f"Claude: {session['name']}"[:60], *command],
+            subprocess.Popen([terminal, "new-tab", "--title", f"{'Copilot' if session.get('provider') == 'copilot' else 'Claude'}: {session['name']}"[:60], *command],
                              close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.Popen(command, creationflags=0x00000010, close_fds=True)  # CREATE_NEW_CONSOLE
@@ -5633,14 +6494,15 @@ def hand_to_console(monitor, session):
     cwd = session.get("cwd") or entry.get("cwd") or ""
     if not os.path.isdir(cwd):
         return False, f"Its folder no longer exists: {cwd or '(unknown)'}"
-    command = resume_command(session_id, entry)
+    copilot = session.get("provider") == "copilot"
+    command = ["copilot", f"--resume={session_id}"] if copilot else resume_command(session_id, entry)
     if not kill_terminal(session["tmux"]):
         return False, "Could not end the copy running in the app, so nothing was opened."
     monitor.invalidate()
     try:
         subprocess.Popen(["cmd.exe", "/k", *command], cwd=cwd, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
     except OSError as exc:
-        return False, f"The copy in the app was ended, but the terminal wouldn't open ({clean(exc)}). Run: claude --resume {session_id}"
+        return False, f"The copy in the app was ended, but the terminal wouldn't open ({clean(exc)}). Run: {' '.join(command)}"
     return True, "Opened. The session now runs in that window."
 
 
@@ -6663,9 +7525,9 @@ def row_values(session, transcript):
     quiet = quiet_seconds(transcript)
     started = session.get("startedAt")
     return [
-        session.get("name") or session["sessionId"][:8],
+        ("[GH] " if session.get("provider") == "copilot" else "") + (session.get("name") or session["sessionId"][:8]),
         session.get("status", "?"),
-        os.path.basename(session.get("cwd", "").rstrip("/")),
+        os.path.basename(session.get("cwd", "").rstrip("/\\")),
         transcript.branch or "-",
         transcript.model or "-",
         format_tokens(transcript.context),
@@ -6961,6 +7823,7 @@ details p{margin:0;font-size:13px;overflow-wrap:anywhere}
 details ul{margin:0;padding:0;list-style:none;font-size:12px;color:var(--dim)}
 details li{overflow-wrap:anywhere;padding:1px 0}
 #empty{padding:40px 16px;text-align:center;color:var(--dim)}
+#histAllow:disabled,#histAuto:disabled{opacity:.45;cursor:default}
 button{font:inherit;color:var(--text);background:#2b2e40;border:1px solid var(--line);border-radius:4px;padding:3px 10px;cursor:pointer}
 button:hover{background:#383c52}
 button.primary{background:#1d4231;border-color:#3b6b52;color:var(--busy);font-weight:700}
@@ -6999,6 +7862,12 @@ button.update svg{flex:none}
 .card{cursor:pointer}.card:hover{border-color:#6a7094}
 .card.needs{border-color:var(--warn);box-shadow:0 0 0 1px var(--warn)}
 .top .pill{margin-left:auto}.hbtn{flex:none;font-size:12px;padding:0 7px}
+.p-claude{--prov:#e08a63}.p-copilot{--prov:#a596ff}
+.prov{flex:none;display:inline-flex;align-items:center;gap:5px;align-self:center;font-size:11px;font-weight:700;line-height:1.5;padding:0 8px 0 5px;border-radius:999px;border:1px solid var(--prov,var(--line));color:var(--prov,var(--dim));white-space:nowrap}
+.prov svg{width:13px;height:13px;flex:none}
+.card.p-claude,.card.p-copilot{box-shadow:inset 4px 0 0 var(--prov)}
+.card.needs.p-claude,.card.needs.p-copilot{box-shadow:0 0 0 1px var(--warn),inset 4px 0 0 var(--prov)}
+#hist>.dhead .prov{font-size:12px}
 .need{padding:6px 12px;background:#4a3a18;color:#ffd98a;overflow-wrap:anywhere}
 .need.done{background:#1d3129;color:#a8e6c4}
 .need.failed{background:#3d2022;color:#f5b5b3}
@@ -7263,7 +8132,7 @@ textarea{min-height:110px;resize:vertical}
 <header><h1>Claude Sessions</h1><span id="summary">connecting…</span><span id="error"></span><button id="updateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="restartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><span id="usage" class="usage"></span><button id="devices">Devices</button><button id="phoneBtn" title="Use this app from your phone, on the same Wi-Fi" aria-label="Phone access"><svg viewBox="0 0 16 16" width="14" height="16" aria-hidden="true"><rect x="4" y="1.5" width="8" height="13" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7 12h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button><button id="new" class="primary">New session</button></header>
 <main id="grid"></main><div id="empty" hidden>No sessions running.</div>
 <section id="previous" aria-labelledby="prevTitle"><div id="prevHead"><h2 id="prevTitle">Previous sessions</h2><button id="prevAll" type="button" hidden>Resume all</button><label title="Keeps a list of sessions that have ended, for example after a restart, so you can bring them back. Turning this off clears the list."><input id="prevRemember" type="checkbox">Remember sessions</label></div><div id="prevErr" role="alert"></div><div id="prevList"></div></section>
-<dialog id="askDlg" aria-labelledby="askText"><form method="dialog" id="askForm"><p id="askText"></p><div class="askbtns"><button value="no" id="askNo">Cancel</button><button value="yes" id="askYes" class="primary">OK</button></div></form></dialog><dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
+<dialog id="askDlg" aria-labelledby="askText"><form method="dialog" id="askForm"><p id="askText"></p><div class="askbtns"><button value="no" id="askNo">Cancel</button><button value="yes" id="askYes" class="primary">OK</button></div></form></dialog><dialog id="hist" aria-labelledby="histName"><div class="dhead"><button id="histClose" aria-label="Back to sessions">←<span class="wide"> Sessions</span></button><span id="histProv" class="prov"></span><h2 id="histName"></h2><span id="histModel" title="The model this session is using"></span><span id="histCtx"></span><button id="histMore" type="button" aria-expanded="false" aria-label="More actions" title="More actions">⋯</button><button id="histUpdateApp" class="primary update" hidden><svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5v8.5M4.5 6.5 8 10l3.5-3.5M2.5 12.5v2h11v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span></span></button><button id="histRestartApp" class="primary" title="Loads the new version of this app. Your sessions keep running." hidden>Restart to update</button><form id="renameForm" hidden><input id="renameText" aria-label="Session name" maxlength="80" autocomplete="off" placeholder="Leave empty for its original name"><button type="submit" class="primary">Save</button><button type="button" id="renameCancel">Cancel</button></form><button id="histRename">Rename</button><span id="histUsage" class="usage"></span><button id="histRefresh" title="Save progress to the project's notes, clear the chat, then read the notes and carry on">Fresh start</button><button id="histFiles" aria-expanded="false">Files changed</button><button id="histAgents" hidden>Subagents</button><button id="histTerm">Open in terminal</button><button id="histEnd">End session</button><button id="histAllow" hidden title="Same as typing /allow-all: stop asking for permission in this session">Allow all</button><button id="histAuto" hidden title="Same as typing /autopilot: let it keep going without you">Autopilot</button></div><div id="previewHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the preview. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><div id="histPage"><div id="histDevices" aria-label="Live preview" hidden><section id="printCtl" aria-label="Printer controls" hidden></section></div><div id="histChat"><div id="histHint"></div><div id="histBody"></div>
 <div id="histFoot"><div id="failBox" role="alert" hidden><span id="failText"></span><button id="failNow" type="button">Retry now</button><button id="failReset" type="button" class="primary"></button><button id="failCancel" type="button">Cancel retry</button><button id="failDismiss" type="button">Dismiss</button></div><pre id="screen" hidden></pre><div id="keys"></div><div id="replyErr" role="alert"></div><div id="replySlow" role="status"></div><div id="replyNote"></div><div id="replyDraft" hidden><span id="replyDraftText"></span> <button id="replyDraftClear" type="button">Empty its input box</button></div><div id="queue" hidden></div>
 <div id="replyImages" aria-label="Pictures to send" hidden></div><form id="replyForm"><div id="cmdList" role="listbox" aria-label="Commands" hidden></div><button id="replyCamera" type="button" title="Take a photo" aria-label="Take a photo" hidden><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2 4.5h3l1.2-2h3.6l1.2 2h3v9H2z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="8" cy="8.7" r="2.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button><input id="replyCameraFile" type="file" accept="image/jpeg" capture="environment" hidden><button id="replyAttach" type="button" title="Add pictures. You can also paste or drop them into the reply box." aria-label="Add pictures"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><rect x="2" y="3" width="12" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 12l3.5-4 2.5 3 1.5-1.5L13 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><circle cx="10.5" cy="6" r="1" fill="currentColor"/></svg></button><input id="replyFile" type="file" accept="image/*" multiple hidden><textarea id="replyText" aria-label="Reply" aria-controls="cmdList" aria-autocomplete="list" placeholder="Reply…"></textarea><button id="replySend" type="submit" class="primary">Send</button></form></div></div><div id="sideHandle" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize the side panel. Double-click to reset." tabindex="0" title="Drag to resize. Double-click to reset." hidden></div><aside id="histSide" hidden><div id="sideTabs" role="tablist" aria-label="What to show" hidden><button id="tabChat" type="button" role="tab" hidden>Chat</button><button id="tabPreview" type="button" role="tab">Preview</button><button id="tabRequests" type="button" role="tab" hidden>Requests</button><button id="tabBtw" type="button" role="tab" title="Slash commands: what they showed, side questions (/btw), and any panel open now" hidden>Commands</button><button id="tabFiles" type="button" role="tab">Files changed</button><button id="tabContext" type="button" role="tab" title="What fills this session's context window">Context</button><button id="tabAgents" type="button" role="tab" hidden>Subagents</button></div><div id="histChanges" aria-label="Files changed"></div><div id="reqBox" aria-label="Requests" hidden></div><div id="btwBox" aria-label="Commands" hidden><section id="panelLive" aria-label="Panel open on its screen" hidden><h3 id="panelTitle"></h3><div class="reqnote">A command has this panel open on the session’s screen. Use the buttons as you would the keys. Messages wait in the queue until it closes.</div><pre id="panelText"></pre><div id="panelOpts" class="panelbtns"></div><div id="panelKeys" class="panelbtns"></div><form id="panelType"><input id="panelTypeText" aria-label="Type into the panel" placeholder="Type into it, such as to search or filter" maxlength="200" autocomplete="off"><button type="submit">Type</button></form><div id="panelErr" class="err"></div></section><div id="cmdHist"></div></div><div id="ctxBox" aria-label="Context" hidden></div><div id="startedBox" aria-label="Sessions it started" hidden></div><div id="agentList" aria-label="Subagents" hidden></div></aside></div></dialog>
 <dialog id="devDlg" aria-labelledby="devTitle"><div class="dhead"><h2 id="devTitle">Devices</h2><button id="devClose" style="margin-left:auto">Close</button></div><div id="devEmpty">No emulators or devices found. Emulators appear here once they start, and -no-window keeps them from opening their own window.</div><div id="devGrid"></div>
@@ -7282,14 +8151,15 @@ textarea{min-height:110px;resize:vertical}
 <p class="note">Anyone on your network who gets this link can control your sessions, so only share it with your own devices. The connection isn't encrypted, so use it on your home Wi-Fi, not public Wi-Fi. Turning this off stops the app listening on the network.</p>
 </div></dialog>
 <dialog id="newDlg" aria-labelledby="newTitle"><form id="newForm"><h2 id="newTitle">New session</h2>
+<label>Program<select id="newProg"><option value="claude">Claude Code</option><option value="copilot">GitHub Copilot CLI</option></select></label>
 <label>Folder<input id="newCwd" list="cwds" required placeholder="/path/to/project" autocomplete="off"><datalist id="cwds"></datalist></label>
 <label>What should it do?<textarea id="newPrompt" required></textarea></label>
 <label>Name (optional)<input id="newName" autocomplete="off"></label>
-<label>Model<select id="newModel"><option value="">Default (your Claude Code setting)</option><option value="fable">Fable (most capable)</option><option value="opus">Opus</option><option value="sonnet">Sonnet (faster, uses less of your limit)</option><option value="haiku">Haiku (fastest, for simple tasks)</option><option value="opusplan">Opus to plan, Sonnet to do the work</option></select></label>
-<label class="check"><input type="checkbox" id="newChrome"> Let it use my Chrome (web UI and API testing; needs the Claude in Chrome extension)</label>
+<label id="newModelRow">Model<select id="newModel"><option value="">Default (your Claude Code setting)</option><option value="fable">Fable (most capable)</option><option value="opus">Opus</option><option value="sonnet">Sonnet (faster, uses less of your limit)</option><option value="haiku">Haiku (fastest, for simple tasks)</option><option value="opusplan">Opus to plan, Sonnet to do the work</option></select></label>
+<label class="check" id="newChromeRow"><input type="checkbox" id="newChrome"> Let it use my Chrome (web UI and API testing; needs the Claude in Chrome extension)</label>
 <label>Permissions<select id="newMode"><option value="manual">Ask me first</option><option value="acceptEdits">Accept file edits automatically</option><option value="plan">Plan only</option><option value="auto">Auto (Claude Code decides what needs asking)</option></select></label>
 <p class="note">It runs without a terminal and works directly in this folder. You can reply and approve from this app, and it keeps running after you close the window. If the folder isn't trusted yet, you'll be asked first.</p>
-<div id="trustAsk" role="alert" hidden><p><b>Trust this folder?</b> <code id="trustPath"></code></p><p>Claude Code will be able to read, edit and run files here, and any hooks or settings the folder defines will apply. Only trust a project you created or know is safe. This is remembered for future sessions.</p><div class="row"><button type="button" id="trustNo">Don't trust</button><button type="button" id="trustYes" class="deny">Trust and start session</button></div></div>
+<div id="trustAsk" role="alert" hidden><p><b>Trust this folder?</b> <code id="trustPath"></code></p><p>The session will be able to read, edit and run files here, and any hooks or settings the folder defines will apply. Only trust a project you created or know is safe. This is remembered for future sessions.</p><div class="row"><button type="button" id="trustNo">Don't trust</button><button type="button" id="trustYes" class="deny">Trust and start session</button></div></div>
 <div id="newErr" role="alert"></div><div class="row"><button type="button" id="newCancel">Cancel</button><button type="submit" id="newStart" class="primary">Start session</button></div></form></dialog>
 <script>
 /*PRINT_SUMMARY*/
@@ -7435,6 +8305,19 @@ function age(sec){if(sec===null||sec===undefined)return'-';if(sec<60)return sec+
 
 const LABELS={permission:'Needs permission',question:'Has a question',input:'Needs you',done:'Finished'};
 const $=id=>document.getElementById(id);
+// Which program a session belongs to: a mark and its name, so no session can be mistaken for the other kind.
+const PROVIDERS={
+ claude:{label:'Claude',title:'Claude Code session',icon:'<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5v13M1.5 8h13M3.4 3.4l9.2 9.2M12.6 3.4l-9.2 9.2" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>'},
+ copilot:{label:'Copilot',title:'GitHub Copilot CLI session',icon:'<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.4" y="4.2" width="13.2" height="8.6" rx="4.1" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="5.6" cy="8.5" r="1.25" fill="currentColor"/><circle cx="10.4" cy="8.5" r="1.25" fill="currentColor"/><path d="M8 4.2V2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>'}
+};
+function providerOf(s){return PROVIDERS[s&&s.provider]?s.provider:'claude'}
+function provBadge(node,s){
+ const p=providerOf(s),v=PROVIDERS[p];
+ node.className='prov p-'+p;
+ node.innerHTML=v.icon+'<span></span>';
+ node.lastChild.textContent=v.label;
+ node.title=v.title;node.setAttribute('aria-label',v.title);
+}
 const cards=new Map(),gridEl=$('grid');
 function contextText(s){
  if(s.context==='-'&&s.contextPercent===null)return'';
@@ -7527,8 +8410,8 @@ function renderUsage(u){
  }
 }
 function makeCard(s){
- const root=el('article','card'),head=el('div','head',root),top=el('div','top',head);
- const c={root,name:el('span','name',top),pill:el('span','pill',top),meta:el('div','meta',head),title:el('div','title',head)};
+ const root=el('article','card'),head=el('div','head',root),top=el('div','top',head),prov=el('span','prov',top);
+ const c={root,prov,name:el('span','name',top),pill:el('span','pill',top),meta:el('div','meta',head),title:el('div','title',head)};
  c.hbtn=el('button','hbtn',top,'History');c.hbtn.addEventListener('click',()=>openHistory(c.session));
  c.need=el('div','need',root);
  c.fail=el('div','need failed',root);c.fail.hidden=true;
@@ -7551,7 +8434,8 @@ function update(c,s){
  c.hbtn.textContent=s.hosted?'Reply':'History';
  if(histSession===s.id)updateFoot(s);
  const needs=s.attention&&s.attention.kind!=='done';
- c.root.className='card '+cls+(needs?' needs':'');
+ c.root.className='card '+cls+(needs?' needs':'')+' p-'+providerOf(s);
+ provBadge(c.prov,s);
  c.need.hidden=!s.attention;
  if(s.attention){
   c.need.className='need'+(needs?'':' done');
@@ -7563,7 +8447,7 @@ function update(c,s){
  c.pill.title=waiting?'Claude has finished its turn and is waiting for background tasks':'';
  const stale=s.status==='busy'&&!waiting&&s.quiet!==null&&s.quiet>STALE;
  c.meta.replaceChildren();
- c.meta.append([s.startedBy?'started by '+s.startedBy.name:'',s.project,s.branch,s.model,contextText(s),'up '+s.up].filter(Boolean).join(' · ')+' · ');
+ c.meta.append([s.startedBy?'started by '+s.startedBy.name:'',s.project,s.branch,s.model,s.mode,contextText(s),'up '+s.up].filter(Boolean).join(' · ')+' · ');
  if(s.queue&&s.queue.length)el('span','quiet',c.meta,s.queue.length+' queued · ');
  el('span',stale?'quiet':'',c.meta,stale?'quiet '+age(s.quiet):'active '+age(s.quiet)+' ago');
  c.title.textContent=s.title;c.title.hidden=!s.title;
@@ -8282,12 +9166,15 @@ function updateFoot(s){
  if($('histAgents').textContent!==label){$('histAgents').textContent=label;$('tabAgents').textContent=label}
  renderStarted(started);
  if(agentCount!==total){agentCount=total;layoutPreview()}
- $('histName').textContent=s.name;
+ $('histName').textContent=s.name;provBadge($('histProv'),s);
  const a=s.attention||{},permission=s.status==='waiting'&&a.kind==='permission',waiting=s.status==='waiting'&&!s.panel;
  $('histTerm').hidden=!(s.hosted||s.job);
  $('histEnd').hidden=!s.hosted;
+ const cop=s.provider==='copilot'&&s.hosted;
+ $('histAllow').hidden=$('histAuto').hidden=!cop;
+ if(cop){$('histAllow').disabled=/allow all/.test(s.mode||'');$('histAuto').disabled=/^Autopilot/.test(s.mode||'')}
  const refreshing=(s.queue||[]).filter(i=>i.refresh);
- $('histRefresh').hidden=!s.hosted;
+ $('histRefresh').hidden=!s.hosted||s.provider==='copilot';
  $('histRefresh').disabled=refreshing.length>0&&!refreshing.some(i=>i.error);
  $('histRefresh').textContent=refreshing.some(i=>i.error)?'Try Fresh start again':refreshing.length?'Starting fresh…':'Fresh start';
  $('replyForm').hidden=!s.hosted;
@@ -8301,10 +9188,11 @@ function updateFoot(s){
  $('replyText').placeholder=s.panel&&!waiting&&!answerFor?'A command’s panel is open on its screen (see Commands). Messages wait until it closes.':answerFor?'Type your own answer, or pick one above (Enter to answer, Shift+Enter for a new line)':
   (sendsNow?'Reply…':waiting?'Queue a message for after you answer the prompt…':'Queue a message for when it finishes…')+' (Enter to '+(sendsNow?'send':'queue')+', Shift+Enter for a new line)';
  syncDraft(s);
- $('replyNote').textContent=s.hosted?'':s.job?'Started outside this app. To reply, use Open in terminal.':'Started in its own terminal. Reply there.';
+ $('replyNote').textContent=s.hosted?'':s.job?'Started outside this app. To reply, use Open in terminal.':s.provider==='copilot'?'A GitHub Copilot session, shown read-only for now. Reply in its own terminal.':'Started in its own terminal. Reply there.';
  const want=!s.hosted?'':waiting&&options.length?'menu:'+a.at+':'+JSON.stringify(options):permission?'perm:'+a.at:waiting?'wait':s.status==='busy'?'busy':'';
  if(want===keysFor)return;
  keysFor=want;$('keys').replaceChildren();
+ if(s.provider==='copilot')return;  // Read-only for now: these buttons press keys in Claude Code's terminal.
  // A button for each answer on Claude Code's menu, for permissions and questions alike.
  // Until the menu has been read, or if it can't be, permissions get Yes and No and other prompts the keys.
  if(options.length){
@@ -8628,11 +9516,11 @@ function renderBtw(list,commands){
  });
  const items=[...list.filter(q=>q.kind!=='panel').map(q=>({...q,kind:q.kind||'btw'})),...panels,...ran].sort((a,b)=>b.at-a.at);
  btwCount=items.length;
- const rows=[el('h3','',null,'Commands ('+items.length+')'),el('div','reqnote',null,'Newest first. Side questions (/btw) are answered while Claude carries on: they aren’t part of the main chat, and Claude won’t remember them later.')];
+ const rows=[el('h3','',null,'Commands ('+items.length+')'),el('div','reqnote',null,(cards.get(histSession)||{session:{}}).session.provider==='copilot'?'Newest first. Side questions (/ask) are answered while Copilot carries on, and aren’t part of the main chat.':'Newest first. Side questions (/btw) are answered while Claude carries on: they aren’t part of the main chat, and Claude won’t remember them later.')];
  const when=at=>new Date(at*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
  for(const q of items){
   const d=el('details','btw'+(q.kind==='btw'?'':' cmdrun'));d.dataset.id=q.id;
-  const s=el('summary','',d,q.kind==='btw'?'/btw '+q.question:q.kind==='panel'?(q.command||'Panel: '+q.title):q.command);
+  const s=el('summary','',d,q.kind==='btw'?(q.verb||'/btw')+' '+q.question:q.kind==='panel'?(q.command||'Panel: '+q.title):q.command);
   el('span','btwtime',s,when(q.at));
   if(q.kind==='btw'){
    d.open=!shut.has(q.id);
@@ -9010,6 +9898,7 @@ $('histRefresh').addEventListener('click',async()=>{
 $('histEnd').addEventListener('click',async()=>{
  if(await ask('End this session? Anything it is doing stops. The conversation is kept.',{yes:'End session',danger:true})&&await act('end',{id:histSession}))$('hist').close();
 });
+for(const [id,text] of [['histAllow','/allow-all'],['histAuto','/autopilot']])$(id).addEventListener('click',()=>act('send',{id:histSession,text}));
 $('replyForm').addEventListener('submit',async e=>{
  e.preventDefault();
  const text=$('replyText').value,images=pendingImages.map(p=>p.name),pasted=pastedTexts.filter(p=>text.includes(p));
@@ -9354,6 +10243,18 @@ $('replyText').addEventListener('keydown',e=>{
  }
  if(e.key==='Enter'&&!e.shiftKey&&!e.isComposing){e.preventDefault();closeCommands();$('replyForm').requestSubmit()}
 });
+const NEW_MODES={
+ claude:[['manual','Ask me first'],['acceptEdits','Accept file edits automatically'],['plan','Plan only'],['auto','Auto (Claude Code decides what needs asking)']],
+ copilot:[['manual','Ask me first'],['allow-all','Allow everything (all tools, paths and URLs)'],['autopilot','Autopilot (works on its own, with everything allowed)']]
+};
+// The model and Chrome choices are Claude Code's, and each program has its own permission choices.
+function setProgram(){
+ const p=$('newProg').value,was=$('newMode').value;
+ $('newMode').replaceChildren(...NEW_MODES[p].map(([value,text])=>{const o=document.createElement('option');o.value=value;o.textContent=text;return o}));
+ if(NEW_MODES[p].some(m=>m[0]===was))$('newMode').value=was;
+ $('newModelRow').hidden=$('newChromeRow').hidden=p==='copilot';
+}
+$('newProg').addEventListener('change',setProgram);
 let trustAsked=null;
 function askTrust(cwd){
  trustAsked=cwd;
@@ -9366,18 +10267,20 @@ async function startNew(trust){
  start.disabled=yes.disabled=true;start.textContent=yes.textContent='Starting…';$('newErr').textContent='';
  try{
   const r=await fetch('/api/sessions/new',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({cwd:$('newCwd').value,prompt:$('newPrompt').value,name:$('newName').value,mode:$('newMode').value,model:$('newModel').value,chrome:$('newChrome').checked,trust})});
+   body:JSON.stringify({provider:$('newProg').value,cwd:$('newCwd').value,prompt:$('newPrompt').value,name:$('newName').value,mode:$('newMode').value,model:$('newModel').value,chrome:$('newChrome').checked,trust})});
   const d=await r.json().catch(()=>({error:'Unexpected response (HTTP '+r.status+').'}));
   if(d.needsTrust){askTrust(d.cwd);return}
   askTrust(null);
   if(!r.ok){$('newErr').textContent=d.error||'Could not start the session.';return}
-  try{localStorage.setItem('newModel',$('newModel').value);localStorage.setItem('newChrome',$('newChrome').checked?'1':'')}catch(e){}  // Offered again next time.
+  try{localStorage.setItem('newProg',$('newProg').value);if($('newProg').value==='claude'){localStorage.setItem('newModel',$('newModel').value);localStorage.setItem('newChrome',$('newChrome').checked?'1':'')}}catch(e){}  // Offered again next time.
   $('newPrompt').value='';$('newName').value='';$('newDlg').close();
   refresh();
  }catch(err){$('newErr').textContent='Lost connection to claude-monitor.'}
  finally{start.disabled=yes.disabled=false;start.textContent='Start session';yes.textContent='Trust and start session'}
 }
 $('new').addEventListener('click',()=>{$('newErr').textContent='';
+ try{const p=localStorage.getItem('newProg');if(p&&NEW_MODES[p])$('newProg').value=p}catch(e){}
+ setProgram();
  try{$('newChrome').checked=localStorage.getItem('newChrome')==='1';const m=localStorage.getItem('newModel');if(m!==null&&[...$('newModel').options].some(o=>o.value===m))$('newModel').value=m}catch(e){}askTrust(null);loadFolders();$('newDlg').showModal();$('newCwd').focus()});
 $('newCancel').addEventListener('click',()=>$('newDlg').close());
 // An approval is for the path it named, so changing the path takes it back.
