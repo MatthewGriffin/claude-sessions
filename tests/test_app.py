@@ -4588,3 +4588,105 @@ class AppLifetimeTests(unittest.TestCase):
             self.runner.join(20)
         self.assertFalse(self.runner.is_alive(), "the app should end with its window when there is no icon")
         self.assertIsNone(app.active_tray)
+
+
+class PreviousSessionPagingTests(unittest.TestCase):
+    """Every earlier Copilot session is listed, and the page shows them ten at a time."""
+
+    def setUp(self):
+        self.inner = CopilotPreviousSessionTests("test_named_recent_sessions_are_offered_newest_first")
+        self.inner.setUp()
+        self.addCleanup(self.inner.doCleanups)
+
+    def many(self, count):
+        ids = [f"{n:08d}-0000-0000-0000-000000000000" for n in range(count)]
+        for n, session_id in enumerate(ids):
+            self.inner.session(session_id, f"session {n}", ago=60 + n * 60)  # The first is the newest.
+        return ids
+
+    def test_all_of_them_are_listed_and_not_just_the_newest_fifteen(self):
+        ids = self.many(40)
+        listed = [p["id"] for p in self.inner.previous()]
+        self.assertEqual(listed, ids)  # Newest first, every one.
+
+    def test_forgetting_one_does_not_let_another_take_its_place(self):
+        ids = self.many(40)
+        before = {p["id"] for p in self.inner.previous()}
+        app.forget_session(app.Monitor(), {"id": ids[0]})
+        after = {p["id"] for p in self.inner.previous()}
+        self.assertEqual(before - after, {ids[0]})
+        self.assertEqual(after - before, set())  # Nothing new appeared in the gap.
+        self.assertEqual(len(after), 39)
+
+    def test_the_list_is_bounded_for_the_pages_sake(self):
+        self.many(12)
+        with mock.patch.object(app, "COPILOT_PREVIOUS_MAX", 5):
+            self.assertEqual(len(self.inner.previous()), 5)
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class PreviousSessionPageTests(unittest.TestCase):
+    """The page's list of previous sessions, run in node with a small stand-in for the page."""
+
+    STUB = """
+class Node{constructor(tag){this.tag=tag;this.children=[];this.className='';this.hidden=false;this.disabled=false;this.textContent='';this.listeners={}}
+ append(...xs){this.children.push(...xs)}appendChild(x){this.children.push(x);return x}replaceChildren(...xs){this.children=xs}
+ addEventListener(t,f){this.listeners[t]=f}setAttribute(){}}
+const document={createElement:t=>new Node(t)};
+const nodes={};const $=id=>nodes[id]||(nodes[id]=new Node('x'));
+const flat=n=>typeof n==='string'?n:[n.textContent,...n.children.map(flat)].join('');
+const provBadge=()=>{},ageText=()=>'now',post=async()=>({}),resumeSession=async()=>'',runPrevious=async f=>{await f()};
+let asked=[];const ask=async(m,o)=>{asked.push([m,o.yes]);return false};
+const names=()=>$('prevList').children.map(r=>flat(r.children[0].children[0]).trim());
+const state=()=>({title:$('prevTitle').textContent,all:$('prevAll').hidden?null:$('prevAll').textContent,rows:names(),
+  pager:$('prevPager').hidden?null:$('prevPager').children.map(c=>c.tag==='span'?flat(c):[c.textContent,c.disabled])});
+const sessions=n=>Array.from({length:n},(_,i)=>({id:'id'+i,name:'session '+i,cwd:'/work',title:'',seen:1000-i}));
+const click=(label)=>{const b=$('prevPager').children.find(c=>c.tag==='button'&&c.textContent.includes(label));b.listeners.click()};
+"""
+
+    def run_js(self, body):
+        page = app.PAGE
+        start = page.index("let prevKey=null")
+        code = page[page.index("function el("):].split("\n", 1)[0] + "\n" + page[start:page.index("\n", page.index("const PREV_PAGE"))] + "\n"
+        begin = page.index("function renderPrevious(")
+        code += page[begin:page.index("\nfunction ", begin + 10)] + "\n"
+        result = subprocess.run(["node", "-e", self.STUB + code + body], capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_a_short_list_has_no_pager(self):
+        out = self.run_js("renderPrevious(sessions(8),true);console.log(JSON.stringify(state()))")
+        self.assertEqual((out["title"], out["all"], out["pager"], len(out["rows"])), ("Previous sessions (8)", "Resume all", None, 8))
+
+    def test_a_long_list_is_shown_ten_at_a_time(self):
+        out = self.run_js("""
+renderPrevious(sessions(25),true);const one=state();click('Older');const two=state();click('Older');const three=state();click('Newer');const back=state();
+console.log(JSON.stringify({one,two,three,back}))""")
+        self.assertEqual(out["one"]["title"], "Previous sessions (25)")
+        self.assertEqual(out["one"]["rows"], [f"session {n}" for n in range(10)])
+        self.assertEqual(out["one"]["pager"], [["‹ Newer", True], "1–10 of 25", ["Older ›", False]])
+        self.assertEqual(out["two"]["rows"], [f"session {n}" for n in range(10, 20)])
+        self.assertEqual(out["two"]["pager"][1], "11–20 of 25")
+        self.assertEqual((out["three"]["rows"], out["three"]["pager"]), ([f"session {n}" for n in range(20, 25)], [["‹ Newer", False], "21–25 of 25", ["Older ›", True]]))
+        self.assertEqual(out["back"]["rows"], out["two"]["rows"])
+
+    def test_forgetting_the_last_one_on_a_page_moves_back_a_page(self):
+        out = self.run_js("renderPrevious(sessions(21),true);click('Older');click('Older');const last=state();renderPrevious(sessions(20),true);console.log(JSON.stringify({last,now:state()}))")
+        self.assertEqual(out["last"]["rows"], ["session 20"])
+        self.assertEqual(out["now"]["rows"], [f"session {n}" for n in range(10, 20)])  # Not an empty page.
+        self.assertEqual(out["now"]["pager"][1], "11–20 of 20")
+
+    def test_the_page_stays_put_while_the_same_list_is_sent_again(self):
+        out = self.run_js("renderPrevious(sessions(25),true);click('Older');renderPrevious(sessions(25),true);console.log(JSON.stringify(state()))")
+        self.assertEqual(out["rows"][0], "session 10")  # Each poll sends the list again.
+
+    def test_resuming_all_means_the_page_you_are_looking_at(self):
+        out = self.run_js("""
+renderPrevious(sessions(25),true);const label=$('prevAll').textContent;$('prevAll').onclick().then(()=>{
+ console.log(JSON.stringify({label,asked}))})""")
+        self.assertEqual(out["label"], "Resume this page")
+        self.assertEqual(out["asked"], [["Resume these 10 sessions? They stay idle until you message them.", "Resume this page"]])
+
+    def test_a_list_that_fits_on_one_page_asks_about_all_of_it(self):
+        out = self.run_js("renderPrevious(sessions(7),true);$('prevAll').onclick().then(()=>console.log(JSON.stringify(asked)))")
+        self.assertEqual(out, [["Resume all 7 sessions? They stay idle until you message them.", "Resume all"]])
