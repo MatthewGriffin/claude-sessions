@@ -3475,10 +3475,12 @@ class HistoryReader:
         shell = text.lstrip().startswith("<bash-input>") and BASH_INPUT.search(text)
         if shell:
             text = "!" + html.unescape(shell.group(1)).strip()
+            self._command_run(text, entry)  # Listed with the slash commands, in the Commands tab.
         elif text.lstrip().startswith(("<bash-stdout>", "<bash-stderr>")):
             found = BASH_OUTPUT.match(text.lstrip())
             if found:  # What the "!" command printed: output, not something the user said.
                 out, err = found.group(1) or "", found.group(2) or found.group(3) or ""
+                self._command_output("\n".join(part for part in (html.unescape(out).strip("\n"), html.unescape(err).strip("\n")) if part.strip()))
                 self.add({"role": "shell", "text": history_text(ANSI_CODES.sub("", html.unescape(out)).strip("\n"), HISTORY_TEXT),
                           **({"error": history_text(ANSI_CODES.sub("", html.unescape(err)).strip("\n"), HISTORY_TEXT)} if err.strip() else {})})
                 return

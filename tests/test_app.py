@@ -4794,6 +4794,16 @@ class ShellCommandTests(unittest.TestCase):
         self.assertTrue(messages[0]["shell"])
         self.assertEqual((messages[1]["text"], messages[1]["error"]), ("hi\nred > ok", "oops"))
 
+    def test_listed_in_the_commands_tab(self):
+        path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "t.jsonl")
+        with open(path, "w") as handle:
+            for n, content in enumerate(["<bash-input>ls -l</bash-input>", "<bash-stdout>total 0</bash-stdout><bash-stderr>warn</bash-stderr>",
+                                         "<bash-input>true</bash-input>", "<bash-stdout></bash-stdout><bash-stderr></bash-stderr>"]):
+                handle.write(json.dumps({"type": "user", "uuid": str(n), "message": {"role": "user", "content": content}}) + "\n")
+        history = app.HistoryReader(path)
+        history.poll()
+        self.assertEqual([(c["command"], c["output"]) for c in history.commands], [("!ls -l", "total 0\nwarn"), ("!true", "")])
+
     def test_output_with_nothing_on_stderr(self):
         messages = self.read("<bash-stdout>done</bash-stdout><bash-stderr></bash-stderr>")
         self.assertEqual(messages[0]["role"], "shell")
