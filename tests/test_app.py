@@ -4772,3 +4772,30 @@ class StartMenuShortcutTests(unittest.TestCase):
         open(other, "w").close()
         app.start_menu_shortcut()
         self.assertTrue(os.path.exists(other))
+
+
+class ShellCommandTests(unittest.TestCase):
+    """A command typed after "!" reads as the command and its output, not as tags."""
+
+    def read(self, *contents):
+        path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "t.jsonl")
+        with open(path, "w") as handle:
+            for n, content in enumerate(contents):
+                handle.write(json.dumps({"type": "user", "uuid": str(n), "message": {"role": "user", "content": content}}) + "\n")
+        history = app.HistoryReader(path)
+        history.poll()
+        return history.messages
+
+    def test_command_and_output(self):
+        messages = self.read("<bash-input>ping -c1 192.168.1.1 &gt; /dev/null; echo hi</bash-input>",
+                             "<bash-stdout>hi\n\x1b[31mred\x1b[0m &gt; ok</bash-stdout><bash-stderr>oops</bash-stderr>")
+        self.assertEqual([m["role"] for m in messages], ["you", "shell"])
+        self.assertEqual(messages[0]["text"], "!ping -c1 192.168.1.1 > /dev/null; echo hi")
+        self.assertTrue(messages[0]["shell"])
+        self.assertEqual((messages[1]["text"], messages[1]["error"]), ("hi\nred > ok", "oops"))
+
+    def test_output_with_nothing_on_stderr(self):
+        messages = self.read("<bash-stdout>done</bash-stdout><bash-stderr></bash-stderr>")
+        self.assertEqual(messages[0]["role"], "shell")
+        self.assertNotIn("error", messages[0])
+

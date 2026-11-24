@@ -273,6 +273,9 @@ BROWSER_PORT_ARG = re.compile(rb"--remote-debugging-port=(\d{1,5})")
 # How a shell command names a browser's debugging port: in the flag, or in an address.
 # Claude Code tells a session a background task is over with one of these.
 TASK_NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
+# A command typed after "!" runs in the terminal, and Claude Code records it in these tags once it has finished.
+BASH_INPUT = re.compile(r"<bash-input>(.*?)</bash-input>", re.S)
+BASH_OUTPUT = re.compile(r"<bash-stdout>(.*?)</bash-stdout>\s*(?:<bash-stderr>(.*?)</bash-stderr>)?|<bash-stderr>(.*?)</bash-stderr>", re.S)
 TASK_SUMMARY = re.compile(r"<summary>(.*?)</summary>", re.S)
 TASK_OUTPUT_PATH = re.compile(r"<output-file>(.*?)</output-file>", re.S)
 TASK_ID = re.compile(r"<task-id>([A-Za-z0-9_-]{1,40})</task-id>")
@@ -3469,6 +3472,16 @@ class HistoryReader:
         if self.is_subagent and self.instructions is None:
             self.instructions = history_text(text, HISTORY_TEXT)
             return
+        shell = text.lstrip().startswith("<bash-input>") and BASH_INPUT.search(text)
+        if shell:
+            text = "!" + html.unescape(shell.group(1)).strip()
+        elif text.lstrip().startswith(("<bash-stdout>", "<bash-stderr>")):
+            found = BASH_OUTPUT.match(text.lstrip())
+            if found:  # What the "!" command printed: output, not something the user said.
+                out, err = found.group(1) or "", found.group(2) or found.group(3) or ""
+                self.add({"role": "shell", "text": history_text(ANSI_CODES.sub("", html.unescape(out)).strip("\n"), HISTORY_TEXT),
+                          **({"error": history_text(ANSI_CODES.sub("", html.unescape(err)).strip("\n"), HISTORY_TEXT)} if err.strip() else {})})
+                return
         output = COMMAND_OUTPUT.fullmatch(text.strip())
         if output:  # A slash command's output is recorded as a user message, but the user didn't write it.
             self._add_note(ANSI_CODES.sub("", output.group(1)))
@@ -3486,7 +3499,7 @@ class HistoryReader:
         last = next((m for m in reversed(self.messages) if m["role"] != "tool" and not m.get("note")), None)
         if last and last["role"] == "you" and last["text"] == text:
             return
-        self.add({"role": "you", "text": text, **({"parts": parts} if parts else {})})
+        self.add({"role": "you", "text": text, **({"parts": parts} if parts else {}), **({"shell": True} if shell else {})})
         if self.turn["files"]:
             self.changed_turn = self.turn
         at = entry_time(entry)
@@ -8762,6 +8775,10 @@ button.deny{color:var(--bad)}
 .tpics a.picture,.msg a.picture,.timages img{cursor:zoom-in}
 .msg.you{background:#23304a;border-radius:4px;padding:8px 10px}
 .msg.you.pending{opacity:.65}
+.msg.you.shell{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;white-space:pre-wrap}
+.msg.shell:not(.you){background:#161b24;border-radius:4px;padding:6px 10px;margin-left:12px;font-size:12px}
+.msg.shell pre{margin:0;white-space:pre-wrap;word-break:break-word;max-height:24em;overflow:auto}
+.msg.shell pre.err{color:#f0a0a0;margin-top:4px}
 .msg.you.pending small{display:block;margin-top:4px;color:#9aa4b5}
 .qa{display:grid;gap:8px}.qitem+.qitem{margin-top:8px}.qtext{white-space:pre-wrap}
 .qopts,.qwait{color:var(--dim);font-size:12px;margin-top:2px}.qhead{color:var(--dim)}
@@ -10145,6 +10162,14 @@ function messageRow(m,open,agent,openSet){
   const d=el('details','thinking');d.dataset.seq=m.seq;d.open=open;
   el('summary','',d,'Thinking');markdown(m.text,el('div','md',d));return d;
  }
+ if(m.role==='shell'){
+  // What a command typed after "!" printed.
+  const r=el('div','msg shell'),lines=m.text.split('\n');
+  if(lines.length>30){const d=el('details','',r);d.dataset.seq=m.seq;d.open=open;el('summary','',d,lines.length+' lines of output');el('pre','',d,m.text)}
+  else el('pre','',r,m.text||'(no output)');
+  if(m.error)el('pre','err',r,m.error);
+  return r;
+ }
  if(m.role==='detail'){
   const d=el('details','thinking detail');d.dataset.seq=m.seq;d.open=open;
   el('summary','',d,m.title);el('pre','',d,m.text);return d;
@@ -10161,6 +10186,7 @@ function messageRow(m,open,agent,openSet){
   const i=el('img','',a);i.src=uploadUrl(m.picture);i.alt='Picture you sent';i.loading='lazy';
   return r;
  }
+ if(m.shell)r.classList.add('shell');
  addStamp(el('b','',r,{you:agent?'Sent to it':'You',claude:agent?'Subagent':who(),system:'System'}[m.role]),m,m.role==='claude'&&m.at&&youAt?m.at-youAt:0);
  if(!m.parts){if(m.role==='claude'){r.classList.add('md');markdown(m.text,r)}else r.append(m.text);return r}
  // A long paste starts folded, as logs can run to thousands of lines.
@@ -10660,12 +10686,14 @@ function showEcho(){
  if(old)old.remove();
  if(!sentEcho||sentEcho.id!==histSession)return;
  const arrived=sentEcho.text?youMatches(sentEcho.text)>sentEcho.seen:histRev!==sentEcho.rev&&youRows().length>sentEcho.seen;
- if(arrived||Date.now()-sentEcho.at>120000){sentEcho=null;return}
+ if(arrived||Date.now()-sentEcho.at>(/^\s*!/.test(sentEcho.text||'')?1800000:120000)){sentEcho=null;return}
  const r=el('div','msg you pending',body);r.id='sentEcho';
  el('b','',r,'You');
  if(sentEcho.text)r.append(sentEcho.text);
  if(sentEcho.images)el('div','',r,sentEcho.images+' picture'+(sentEcho.images>1?'s':''));
- el('small','',r,sentEcho.posting?'Sending\u2026':Date.now()-sentEcho.at>15000?'Sent. '+whoCode()+' hasn\u2019t recorded it yet.':'Sent. Waiting for '+whoCode()+'\u2026');
+ const shell=/^\s*!/.test(sentEcho.text||'');  // A "!" command runs in the terminal; its progress shows below.
+ if(shell)r.classList.add('shell');
+ el('small','',r,sentEcho.posting?'Sending\u2026':shell?'Running in the terminal\u2026 its output shows below, and here once it has finished.':Date.now()-sentEcho.at>15000?'Sent. '+whoCode()+' hasn\u2019t recorded it yet.':'Sent. Waiting for '+whoCode()+'\u2026');
  if(histFollow)body.scrollTop=body.scrollHeight;
 }
 // Look every half second for a while after sending, rather than every two.
