@@ -2492,6 +2492,19 @@ class TaskNotificationTextTests(unittest.TestCase):
         self.assertIn("Output: /tmp/x/tasks/b33.output", messages[1]["text"])
         self.assertFalse(any("task-notification" in m["text"] for m in messages))
 
+    def test_a_notification_from_the_system_is_a_note_too(self):
+        note = ("<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>x:inner</tool-use-id>\n<status>completed</status>\n"
+                "<summary>Background command \"sleep 1 &amp;&amp; echo hi\" completed (exit code 0)</summary>\n</task-notification>")
+        path = os.path.join(tempfile.mkdtemp(dir=CONFIG), "t.jsonl")
+        with open(path, "w") as handle:  # As Claude Code records one: a user entry whose origin is the task, and as a queued command.
+            handle.write(json.dumps({"type": "user", "uuid": "1", "origin": {"kind": "task-notification"}, "message": {"role": "user", "content": note}}) + "\n")
+            handle.write(json.dumps({"type": "attachment", "attachment": {"type": "queued_command", "prompt": note.replace("b1", "b2"), "origin": {"kind": "task-notification"}}}) + "\n")
+        history = app.HistoryReader(path)
+        history.poll()
+        self.assertEqual([(m["role"], m.get("note")) for m in history.messages], [("system", True), ("system", True)])
+        self.assertFalse(any("<" in m["text"].replace("&&", "") for m in history.messages))
+        self.assertIn("sleep 1 && echo hi", history.messages[0]["text"])
+
     def test_text_beside_a_notification_is_still_a_message(self):
         note = "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n<summary>Done</summary>\n</task-notification>"
         messages = self.read(note + "\n\nand then stop")

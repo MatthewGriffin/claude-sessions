@@ -3465,6 +3465,8 @@ class HistoryReader:
         return TASK_NOTIFICATION.sub("", text).strip()
 
     def _human_message(self, text, entry):
+        if not isinstance(text, str):  # A prompt recorded as blocks.
+            text = " ".join(b.get("text", "") for b in text if isinstance(b, dict) and b.get("type") == "text") if isinstance(text, list) else str(text or "")
         if "<task-notification>" in text:
             text = self._task_notices(text)
             if not text:
@@ -3549,7 +3551,7 @@ class HistoryReader:
                 origin = attachment.get("origin") if isinstance(attachment.get("origin"), dict) else {}
                 if origin.get("kind", "human") == "human":
                     self._human_message(attachment["prompt"], entry)
-                elif "<task-notification>" in attachment["prompt"]:
+                elif "<task-notification>" in str(attachment["prompt"]):
                     rest = self._task_notices(attachment["prompt"])
                     if rest:
                         self.add({"role": "system", "text": history_text(rest, HISTORY_TEXT)})
@@ -3609,7 +3611,9 @@ class HistoryReader:
                 elif human and not str(block["text"]).startswith("[Request interrupted"):
                     self._human_message(block["text"], entry)
                 else:
-                    self.add({"role": "system", "text": history_text(block["text"], HISTORY_TEXT)})
+                    rest = self._task_notices(block["text"]) if "<task-notification>" in str(block["text"]) else block["text"]
+                    if str(rest).strip():
+                        self.add({"role": "system", "text": history_text(rest, HISTORY_TEXT)})
             elif block_kind == "thinking" and str(block.get("thinking", "")).strip():
                 self.add({"role": "thinking", "text": history_text(block["thinking"], HISTORY_TEXT)})
             elif block_kind == "image" and kind == "user":
