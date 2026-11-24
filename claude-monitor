@@ -6248,7 +6248,9 @@ def send_tracked(monitor, session, text, state, images=(), pasted=(), replaces="
         note_btw(session, text)
         if text.startswith("/") and not side_question(session, text):
             sent_commands[session["id"]] = (text.split()[0][:60], time.time())
-        if not text.startswith("/"):  # Slash commands aren't recorded as messages.
+        # Slash commands aren't recorded as messages. A "!" command is recorded only once it has finished,
+        # which can be long after the arrival check would give up, and it shows on the terminal as it runs.
+        if not text.startswith(("/", "!")):
             state["checks"][session["id"]] = {"text": text, "images": list(images), "pasted": list(pasted), "count": before, "at": time.time()}
     return succeeded, message
 

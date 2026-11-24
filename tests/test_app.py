@@ -4799,3 +4799,23 @@ class ShellCommandTests(unittest.TestCase):
         self.assertEqual(messages[0]["role"], "shell")
         self.assertNotIn("error", messages[0])
 
+
+
+class ShellCommandArrivalTests(unittest.TestCase):
+    """A "!" command is recorded only when it ends, so it must not be called unsent while it runs."""
+
+    def send(self, text):
+        state = {"sent": {}, "checks": {}}
+        session = {"id": "s1", "status": "idle"}
+        monitor = mock.Mock()
+        monitor.human_messages.return_value = 3
+        with mock.patch.object(app, "type_message", return_value=(True, "Sent.")), mock.patch.object(app, "note_btw"):
+            self.assertEqual(app.send_tracked(monitor, session, text, state), (True, "Sent."))
+        return state
+
+    def test_an_ordinary_message_is_checked(self):
+        self.assertIn("s1", self.send("hello")["checks"])
+
+    def test_a_shell_command_is_not(self):
+        self.assertNotIn("s1", self.send("! distrobox enter networking -- bash -c 'dotnet run'")["checks"])
+        self.assertNotIn("s1", self.send("!ls")["checks"])
